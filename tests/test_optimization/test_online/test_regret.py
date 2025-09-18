@@ -13,7 +13,7 @@ from skfolio.optimization.online._regret import compute_regret_curve
 )
 @pytest.mark.parametrize("regret_type", [RegretType.STATIC, RegretType.DYNAMIC])
 def test_shapes_and_finiteness(X_small, avg_flag, regret_type):
-    est = OPS(method=OnlineMethod.HEDGE, eta0=0.05, warm_start=False)
+    est = OPS(method=OnlineMethod.EG, eta0=0.05, warm_start=False)
     r = compute_regret_curve(
         estimator=est,
         X=X_small,
@@ -28,7 +28,7 @@ def test_shapes_and_finiteness(X_small, avg_flag, regret_type):
 
 
 def test_running_vs_final_average_agreement_at_T(X_small):
-    est = OPS(method=OnlineMethod.HEDGE, eta0=0.05, warm_start=False)
+    est = OPS(method=OnlineMethod.EG, eta0=0.05, warm_start=False)
     # cumulative
     r_cum = compute_regret_curve(est, X_small, comparator=BCRP(), average=False)
     # running average (R_t / t)
@@ -42,7 +42,7 @@ def test_running_vs_final_average_agreement_at_T(X_small):
 
 
 def test_windowed_running_and_final_average(X_small):
-    est = OPS(method=OnlineMethod.HEDGE, eta0=0.05, warm_start=False)
+    est = OPS(method=OnlineMethod.EG, eta0=0.05, warm_start=False)
     w = 10
     r_win = compute_regret_curve(
         est, X_small, comparator=BCRP(), average=False, window=w
@@ -64,7 +64,7 @@ def test_windowed_running_and_final_average(X_small):
 
 
 def test_comparator_instance_required(X_small):
-    est = OPS(method=OnlineMethod.HEDGE, eta0=0.05, warm_start=False)
+    est = OPS(method=OnlineMethod.EG, eta0=0.05, warm_start=False)
     # Should accept instance or None (defaults to BCRP())
     r1 = compute_regret_curve(est, X_small, comparator=BCRP())
     r2 = compute_regret_curve(est, X_small, comparator=None)
@@ -72,7 +72,7 @@ def test_comparator_instance_required(X_small):
 
 
 def test_invalid_window_raises(X_small):
-    est = OPS(method=OnlineMethod.HEDGE, eta0=0.05, warm_start=False)
+    est = OPS(method=OnlineMethod.EG, eta0=0.05, warm_start=False)
     with pytest.raises(ValueError):
         compute_regret_curve(est, X_small, comparator=BCRP(), window=0)
     with pytest.raises(ValueError):
@@ -87,7 +87,7 @@ def test_dynamic_without_fit_dynamic_raises(X_small):
 
     # Build a simple dummy instance with no fit_dynamic attribute
     comp = object()
-    est = OPS(method=OnlineMethod.HEDGE, eta0=0.05, warm_start=False)
+    est = OPS(method=OnlineMethod.EG, eta0=0.05, warm_start=False)
     with pytest.raises(ValueError):
         compute_regret_curve(
             est, X_small, comparator=comp, regret_type=RegretType.DYNAMIC

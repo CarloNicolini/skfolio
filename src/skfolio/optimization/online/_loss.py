@@ -166,6 +166,163 @@ class CORNLoss(Loss, OnlineMixin, CORNMixin):
         return 0.0
 
 
+class SwordVariationLoss(Loss, OnlineMixin):
+    """
+    Sword (Smoothness-aware online learning with dynamic regret) loss with gradient variation tracking.
+
+    Implements the Sword_var algorithm from Zhao et al. (2020) that achieves
+    O(√((1+P_T+V_T)(1+P_T))) dynamic regret by exploiting smoothness and tracking
+    gradient variation V_T = Σ ||∇f_{t-1}(x) - ∇f_t(x)||².
+
+    This is fundamentally an EMD-based algorithm but with adaptive step sizes
+    based on the accumulated gradient variation.
+
+    References
+    ----------
+    - Zhao, P., Zhang, Y.J., Zhang, L., & Zhou, Z.H. (2020). Dynamic Regret of Convex
+      and Smooth Functions. NeurIPS 2020.
+    """
+
+    def __init__(self, estimator):
+        super().__init__(estimator)
+        self._previous_gradient: np.ndarray | None = None
+        self._gradient_variation: float = 0.0
+        self._t = 0
+
+    def gradient(self, w: np.ndarray, x_gross: np.ndarray, **kwargs) -> np.ndarray:
+        """Compute Kelly gradient and track gradient variation."""
+        # Standard Kelly gradient for portfolio optimization
+        portfolio_return = np.dot(w, x_gross)
+        if portfolio_return <= CLIP_EPSILON:
+            portfolio_return = CLIP_EPSILON
+
+        kelly_grad = -x_gross / portfolio_return
+
+        # Track gradient variation V_t = Σ ||∇f_{t-1} - ∇f_t||²
+        if self._previous_gradient is not None and len(self._previous_gradient) == len(
+            kelly_grad
+        ):
+            grad_diff = kelly_grad - self._previous_gradient
+            self._gradient_variation += np.dot(grad_diff, grad_diff)
+
+        self._previous_gradient = kelly_grad.copy()
+        self._t += 1
+
+        # Store current variation for adaptive step size (accessed by descent method)
+        self._current_variation = self._gradient_variation
+
+        return kelly_grad
+
+    def loss(self, w: np.ndarray, x_gross: np.ndarray, **kwargs) -> float:
+        """Compute Kelly loss (negative log return)."""
+        portfolio_return = np.dot(w, x_gross)
+        if portfolio_return <= CLIP_EPSILON:
+            portfolio_return = CLIP_EPSILON
+        return -np.log(portfolio_return)
+
+
+class SwordSmallLossLoss(Loss, OnlineMixin):
+    """
+    Sword small-loss variant that tracks cumulative loss of comparator sequence.
+
+    Achieves O(√((1+P_T+F_T)(1+P_T))) dynamic regret where F_T is the
+    cumulative loss of the comparator sequence. This is useful when the
+    optimal strategy has low cumulative loss.
+    """
+
+    def __init__(self, estimator):
+        super().__init__(estimator)
+        self._previous_gradient: np.ndarray | None = None
+        self._cumulative_comparator_loss: float = 0.0
+        self._t = 0
+
+    def gradient(self, w: np.ndarray, x_gross: np.ndarray, **kwargs) -> np.ndarray:
+        """Compute Kelly gradient and track comparator loss."""
+        # Standard Kelly gradient
+        portfolio_return = np.dot(w, x_gross)
+        if portfolio_return <= CLIP_EPSILON:
+            portfolio_return = CLIP_EPSILON
+
+        kelly_grad = -x_gross / portfolio_return
+
+        # Estimate cumulative comparator loss F_T
+        # In practice, we approximate this as the loss of a simple strategy
+        # Here we use uniform portfolio as a reasonable comparator
+        uniform_weights = np.ones(len(x_gross)) / len(x_gross)
+        uniform_return = np.dot(uniform_weights, x_gross)
+        comparator_loss = -np.log(max(uniform_return, CLIP_EPSILON))
+        self._cumulative_comparator_loss += comparator_loss
+
+        self._t += 1
+
+        # Store current cumulative loss for adaptive step size
+        self._current_cumulative_loss = self._cumulative_comparator_loss
+
+        return kelly_grad
+
+    def loss(self, w: np.ndarray, x_gross: np.ndarray, **kwargs) -> float:
+        """Compute Kelly loss (negative log return)."""
+        portfolio_return = np.dot(w, x_gross)
+        if portfolio_return <= CLIP_EPSILON:
+            portfolio_return = CLIP_EPSILON
+        return -np.log(portfolio_return)
+
+
+class SwordBestLoss(Loss, OnlineMixin):
+    """
+    Sword best-of-both-worlds variant that tracks both gradient variation and comparator loss.
+
+    Achieves O(√((1+P_T+min{V_T,F_T})(1+P_T))) dynamic regret by automatically
+    adapting to whichever quantity is smaller: gradient variation or comparator loss.
+    """
+
+    def __init__(self, estimator):
+        super().__init__(estimator)
+        self._previous_gradient: np.ndarray | None = None
+        self._gradient_variation: float = 0.0
+        self._cumulative_comparator_loss: float = 0.0
+        self._t = 0
+
+    def gradient(self, w: np.ndarray, x_gross: np.ndarray, **kwargs) -> np.ndarray:
+        """Compute Kelly gradient and track both variation and comparator loss."""
+        # Standard Kelly gradient
+        portfolio_return = np.dot(w, x_gross)
+        if portfolio_return <= CLIP_EPSILON:
+            portfolio_return = CLIP_EPSILON
+
+        kelly_grad = -x_gross / portfolio_return
+
+        # Track gradient variation V_t
+        if self._previous_gradient is not None and len(self._previous_gradient) == len(
+            kelly_grad
+        ):
+            grad_diff = kelly_grad - self._previous_gradient
+            self._gradient_variation += np.dot(grad_diff, grad_diff)
+
+        self._previous_gradient = kelly_grad.copy()
+
+        # Track cumulative comparator loss F_T
+        uniform_weights = np.ones(len(x_gross)) / len(x_gross)
+        uniform_return = np.dot(uniform_weights, x_gross)
+        comparator_loss = -np.log(max(uniform_return, CLIP_EPSILON))
+        self._cumulative_comparator_loss += comparator_loss
+
+        self._t += 1
+
+        # Store both quantities - descent method will take minimum
+        self._current_variation = self._gradient_variation
+        self._current_cumulative_loss = self._cumulative_comparator_loss
+
+        return kelly_grad
+
+    def loss(self, w: np.ndarray, x_gross: np.ndarray, **kwargs) -> float:
+        """Compute Kelly loss (negative log return)."""
+        portfolio_return = np.dot(w, x_gross)
+        if portfolio_return <= CLIP_EPSILON:
+            portfolio_return = CLIP_EPSILON
+        return -np.log(portfolio_return)
+
+
 class SmoothPredictionLoss(Loss, OnlineMixin):
     """Smooth Prediction loss with log-barrier regularization.
 
@@ -386,7 +543,7 @@ class UniversalLoss(Loss):
 
 losses_map = {
     OnlineMethod.BUY_AND_HOLD: BuyAndHoldLoss,
-    OnlineMethod.HEDGE: KellyLoss,
+    OnlineMethod.EG: KellyLoss,
     OnlineMethod.EG_TILDE: EGTildeLoss,
     OnlineMethod.FOLLOW_THE_LEADER: FollowTheLeaderLoss,
     OnlineMethod.FOLLOW_THE_LOSER: FollowTheLoserLoss,
@@ -394,4 +551,8 @@ losses_map = {
     OnlineMethod.CORN: CORNLoss,
     OnlineMethod.SMOOTH_PRED: SmoothPredictionLoss,
     OnlineMethod.UNIVERSAL: UniversalLoss,
+    # Sword algorithms - smoothness-aware dynamic regret optimization
+    OnlineMethod.SWORD_VAR: SwordVariationLoss,
+    OnlineMethod.SWORD_SMALL: SwordSmallLossLoss,
+    OnlineMethod.SWORD_BEST: SwordBestLoss,
 }

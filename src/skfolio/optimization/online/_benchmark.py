@@ -69,15 +69,16 @@ class CRP(BaseOptimization, _OnceFittable):
     ) -> None:
         super().__init__(portfolio_params=portfolio_params)
         self.weights = weights
+        self.portfolio_params = portfolio_params
 
     def partial_fit(self, X: npt.ArrayLike, y: npt.ArrayLike | None = None):
         if self.weights is None:
             n = X.shape[1]
             self.weights_ = np.ones(n) / n
-            self.set_portfolio_params(name="UCRP")
+            self.portfolio_params["name"] = "UCRP"
         else:
             self.weights_ = self.weights
-            self.set_portfolio_params(name="CRP")
+            self.portfolio_params["name"] = "CRP"
         return self
 
     def fit(self, X: npt.ArrayLike, y: npt.ArrayLike | None = None):  # type: ignore[override]

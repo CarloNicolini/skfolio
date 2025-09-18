@@ -8,15 +8,19 @@ from sklearn.utils.validation import _check_sample_weight, validate_data
 import skfolio.typing as skt
 from skfolio.optimization._base import BaseOptimization
 from skfolio.optimization.online._descent import (
+    AdaGrad,
+    AdaBARRONS,
     BaseDescent,
     EGTildeEntropicMirrorDescent,
     EntropicMirrorDescent,
     OnlineFrankWolfe,
     OnlineGradientDescent,
     OnlineNewtonStep,
+    SwordEntropicMirrorDescent,
 )
 from skfolio.optimization.online._loss import CLIP_EPSILON, Loss, losses_map
 from skfolio.optimization.online._mixins import (
+    ALGORITHM_SPECIFIC_METHODS,
     OnlineMethod,
     OnlineMixin,
     OnlineParameterConstraintsMixin,
@@ -37,14 +41,26 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
     - ONS: Online Newton Step (Sherman-Morrison inverse update).
 
     Methods (loss/gradient providers):
+
+    **Generic methods** (work with any update_rule):
     - BUY_AND_HOLD: no update
-    - HEDGE (EG): Kelly gradient on current gross returns
-    - EG_TILDE: Exponentiated Gradient with tilting - time-varying regularization and portfolio mixing
-    - FTL/FTRL: cumulative Kelly gradients (entropy geometry)
+    - EG: Kelly gradient on current gross returns (standard Hedge/EG)
+    - FOLLOW_THE_LEADER: cumulative Kelly gradients (entropy geometry)
     - FOLLOW_THE_LOSER: Kelly + PA hinge toward a reversion feature
     - OLMAR: Kelly gradient on a moving-average prediction
     - CORN: scenario-based Kelly gradient over correlation-selected neighbors
     - SMOOTH_PRED: Kelly gradient + log-barrier regularization (FTRL variant)
+
+    **Algorithm-specific methods** (use integrated descent, ignore update_rule):
+    - EG_TILDE: Exponentiated Gradient with tilting - uses specialized EMD with
+      time-varying parameters and portfolio mixing
+    - UNIVERSAL: Expert aggregation - bypasses gradient-based updates entirely
+    - SWORD_VAR: Sword with gradient variation tracking - adaptive EMD using
+      accumulated gradient variation V_T for O(√((1+P_T+V_T)(1+P_T))) dynamic regret
+    - SWORD_SMALL: Sword with small-loss tracking - adaptive EMD using cumulative
+      comparator loss F_T for O(√((1+P_T+F_T)(1+P_T))) dynamic regret
+    - SWORD_BEST: Sword best-of-both-worlds - adaptive EMD using min{V_T,F_T}
+      for O(√((1+P_T+min{V_T,F_T})(1+P_T))) dynamic regret
 
 
     Projection:
@@ -66,7 +82,7 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
 
     def __init__(
         self,
-        method: OnlineMethod = OnlineMethod.HEDGE,
+        method: OnlineMethod = OnlineMethod.EG,
         update_rule: UpdateRule = UpdateRule.EMD,
         *,
         initial_weights: npt.ArrayLike | None = None,
@@ -90,6 +106,9 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
         corn_k: int = 5,
         ## Smooth Prediction
         smooth_epsilon: float = 1.0,
+        ## AdaGrad
+        adagrad_D: float | npt.ArrayLike | None = None,
+        adagrad_eps: float = 1e-8,
         # Projection constraints (fast path)
         min_weights: skt.MultiInput | None = 0.0,
         max_weights: skt.MultiInput | None = 1.0,
@@ -196,6 +215,16 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
                 FTRL objective. Larger values provide more regularization (smoother weights).
                 Typical values: 1.0 (standard), 1/r for known return lower bound r.
                 Only used when method=OnlineMethod.SMOOTH_PRED.
+            adagrad_D: float or array-like, optional
+                Diameter bound(s) for AdaGrad algorithm. Controls the scaling of coordinate-wise
+                adaptive learning rates: η_{t,i} = D_i / (√(∑ g_{j,i}²) + ε).
+                If float, uses same bound for all coordinates. If array-like, should have
+                length equal to problem dimension. If None, defaults to √2 (simplex diameter).
+                Only used when update_rule=UpdateRule.ADAGRAD.
+            adagrad_eps: float
+                Small constant added to denominator for numerical stability.
+                Set to 0 for truly scale-free updates.
+                Only used when update_rule=UpdateRule.ADAGRAD.
             experts: np.ndarray
                 Optional expert matrix of shape ``(n_assets, n_experts)``. Each
                 column is a valid portfolio on the simplex (nonnegative, sums to 1).
@@ -351,6 +380,18 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
         """
         super().__init__(portfolio_params=portfolio_params)
 
+        # Validate method-descent compatibility
+        if method in ALGORITHM_SPECIFIC_METHODS and update_rule != UpdateRule.EMD:
+            import warnings
+
+            warnings.warn(
+                f"Method {method.value} uses its own integrated descent algorithm "
+                f"and ignores update_rule parameter (specified: {update_rule.value}). "
+                f"This is correct behavior - {method.value} requires specific update rules.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         # Public configuration
         self.method = method
         self.update_rule = update_rule
@@ -361,6 +402,8 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
         self.corn_window = int(corn_window)
         self.corn_k = int(corn_k)
         self.smooth_epsilon = float(smooth_epsilon)
+        self.adagrad_D = adagrad_D
+        self.adagrad_eps = float(adagrad_eps)
         self.experts = experts
         self.warm_start = bool(warm_start)
         self.initial_weights = (
@@ -500,6 +543,19 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
                 self._descent = EGTildeEntropicMirrorDescent(
                     self._projector, self, eta=self.eta0
                 )
+            # Special cases for Sword algorithms: always use specialized EMD with adaptive step sizes
+            elif self.method == OnlineMethod.SWORD_VAR:
+                self._descent = SwordEntropicMirrorDescent(
+                    self._projector, self, eta=self.eta0, sword_variant="var"
+                )
+            elif self.method == OnlineMethod.SWORD_SMALL:
+                self._descent = SwordEntropicMirrorDescent(
+                    self._projector, self, eta=self.eta0, sword_variant="small"
+                )
+            elif self.method == OnlineMethod.SWORD_BEST:
+                self._descent = SwordEntropicMirrorDescent(
+                    self._projector, self, eta=self.eta0, sword_variant="best"
+                )
             elif self.update_rule == UpdateRule.EMD:
                 self._descent = EntropicMirrorDescent(
                     self._projector, eta=self.eta0, use_schedule=True
@@ -520,6 +576,22 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
                     jitter=self.jitter,
                     recompute_every=self.recompute_every,
                     auto_eta=True,
+                )
+            elif self.update_rule == UpdateRule.ADAGRAD:
+                self._descent = AdaGrad(
+                    self._projector,
+                    D=self.adagrad_D,
+                    eps=self.adagrad_eps,
+                )
+            elif self.update_rule == UpdateRule.ADABARRONS:
+                self._descent = AdaBARRONS(
+                    self._projector,
+                    eta=self.eta0,
+                    eps=self.adagrad_eps,
+                    jitter=self.jitter,
+                    # lambda_init=self.lambda_init,
+                    # backtracking=self.backtracking,
+                    # max_backtrack=self.max_backtrack,
                 )
             else:
                 raise ValueError("Unknown update_rule provided.")

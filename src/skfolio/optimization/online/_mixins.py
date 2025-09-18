@@ -20,24 +20,46 @@ class UpdateRule(AutoEnum):
     - OGD: Projected (Euclidean) Gradient Descent.
     - OFW: Online Frank-Wolfe (projection-free on the simplex; projected if needed).
     - ONS: Online Newton Step (Sherman-Morrison inverse update).
+    - ADAGRAD: Adaptive Gradient with coordinate-wise adaptive learning rates.
+    - ADABARRONS: Adaptive Barrier-Regularized Online Newton Step.
     """
 
     EMD = auto()
     OGD = auto()
     OFW = auto()
     ONS = auto()
+    ADAGRAD = auto()
+    ADABARRONS = auto()
 
 
 class OnlineMethod(AutoEnum):
+    # Generic methods (work with any descent algorithm)
     BUY_AND_HOLD = auto()
-    HEDGE = auto()
-    EG_TILDE = auto()
+    EG = auto()  # Standard Hedge/EG - Kelly gradient
     FOLLOW_THE_LEADER = auto()
     FOLLOW_THE_LOSER = auto()
     OLMAR = auto()
     CORN = auto()
     SMOOTH_PRED = auto()
-    UNIVERSAL = auto()
+
+    # Specific algorithms (use integrated descent methods)
+    EG_TILDE = auto()  # EG with tilting - requires specialized EMD
+    UNIVERSAL = auto()  # Expert mixing - bypasses gradient descent
+
+    # Sword algorithms - smoothness-aware dynamic regret optimization
+    SWORD_VAR = auto()  # Sword with gradient variation tracking
+    SWORD_SMALL = auto()  # Sword with small-loss tracking
+    SWORD_BEST = auto()  # Sword best-of-both-worlds
+
+
+# Methods that ignore update_rule parameter (algorithm-specific)
+ALGORITHM_SPECIFIC_METHODS = {
+    OnlineMethod.EG_TILDE,
+    OnlineMethod.UNIVERSAL,
+    OnlineMethod.SWORD_VAR,
+    OnlineMethod.SWORD_SMALL,
+    OnlineMethod.SWORD_BEST,
+}
 
 
 class OnlineMixin:
@@ -94,6 +116,8 @@ class OnlineParameterConstraintsMixin:
         ],
         "universal_max_grid_points": [Interval(Integral, 1, None, closed="left")],
         "smooth_epsilon": [Interval(Real, 0, None, closed="neither")],
+        "adagrad_D": [Interval(Real, 0, None, closed="neither"), "array-like", None],
+        "adagrad_eps": [Interval(Real, 0, 1e-3, closed="both"), None],
     }
 
 

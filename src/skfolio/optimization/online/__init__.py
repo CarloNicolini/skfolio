@@ -1,16 +1,12 @@
-"""Online optimization algorithms."""
+"""Online optimization algorithms, benchmarks, and regret utilities."""
 
-from skfolio.optimization.online._adapter import OnlineConvexAdapter
-from skfolio.optimization.online._anticor import AntiCor
-from skfolio.optimization.online._ftl import FollowTheLeader, FollowTheRegularizedLeader
-from skfolio.optimization.online._hedge import ExponentialGradient
-from skfolio.optimization.online._universal import Universal
+from skfolio.optimization.online._base import OPS, OnlineMethod, UpdateRule
+from skfolio.optimization.online._benchmark import BCRP, CRP
 
 __all__ = [
-    "AntiCor",
-    "ExponentialGradient",
-    "FollowTheLeader",
-    "FollowTheRegularizedLeader",
-    "Universal",
-    "OnlineConvexAdapter",
+    "BCRP",
+    "CRP",
+    "OPS",
+    "OnlineMethod",
+    "UpdateRule",
 ]

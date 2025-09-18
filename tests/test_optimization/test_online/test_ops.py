@@ -40,7 +40,7 @@ def test_update_rules_constraints(rule, X_small_single):
     _check_box_budget(est.weights_, 0.0, 1.0, 1.0)
 
 
-@pytest.mark.parametrize("method", [OnlineMethod.HEDGE, OnlineMethod.BUY_AND_HOLD])
+@pytest.mark.parametrize("method", [OnlineMethod.EG, OnlineMethod.BUY_AND_HOLD])
 def test_methods_basic_validity(method, X_small_single):
     # Keep runtime low for heavier methods
     est = OPS(method=method, universal_n_samples=50)
@@ -71,7 +71,7 @@ def test_convex_fallback_groups_linear(X_small_single, groups, linear_constraint
     # Force convex path via groups/linear constraints
     budget = 0.9
     est = OPS(
-        method=OnlineMethod.HEDGE,
+        method=OnlineMethod.EG,
         min_weights=0.0,
         max_weights=0.8,
         budget=budget,
@@ -138,10 +138,10 @@ def test_warm_start_and_initial_weights_buy_and_hold(rule, X_small_single):
 
 
 def test_partial_fit_streaming_equivalence(X_small):
-    est_batch = OPS(method=OnlineMethod.HEDGE, update_rule=UpdateRule.EMD, eta0=0.3)
+    est_batch = OPS(method=OnlineMethod.EG, update_rule=UpdateRule.EMD, eta0=0.3)
     est_batch.fit(X_small)
 
-    est_stream = OPS(method=OnlineMethod.HEDGE, update_rule=UpdateRule.EMD, eta0=0.3)
+    est_stream = OPS(method=OnlineMethod.EG, update_rule=UpdateRule.EMD, eta0=0.3)
     for i in range(len(X_small)):
         est_stream.partial_fit(X_small.iloc[[i], :])
 
@@ -154,7 +154,7 @@ def test_convex_variance_bound(X_small):
     # Loose bound to ensure feasibility
     var_bound = float(np.trace(Sigma)) / Sigma.shape[0]
     est = OPS(
-        method=OnlineMethod.HEDGE,
+        method=OnlineMethod.EG,
         covariance=Sigma,
         variance_bound=var_bound * 2.0,
         min_weights=0.0,
