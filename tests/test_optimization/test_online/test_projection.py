@@ -74,3 +74,28 @@ def test_auto_projector_fast_path():
     # Projects [0.6, 0.6] to [0.5, 0.5] with default [0,1] and budget=1
     w = projector.project(np.array([0.6, 0.6]))
     assert np.allclose(w, np.array([0.5, 0.5]), atol=1e-12)
+
+
+def test_project_box_and_sum_basic_properties():
+    y = np.array([0.6, -0.1, 2.0], dtype=float)
+    w = project_box_and_sum(y=y, lower=0.0, upper=1.0, budget=1.0)
+    assert np.all(w >= -1e-12)
+    assert np.all(w <= 1.0 + 1e-12)
+    np.testing.assert_allclose(np.sum(w), 1.0, atol=1e-10)
+
+
+def test_project_with_turnover_cap_against_previous():
+    prev = np.array([0.3, 0.3, 0.4])
+    raw = np.array([1.0, 0.0, 0.0])
+    cap = 0.25
+    w = project_with_turnover(
+        w_raw=raw,
+        previous_weights=prev,
+        max_turnover=cap,
+        lower=0.0,
+        upper=1.0,
+        budget=1.0,
+    )
+    # L1 distance to previous must be within cap
+    l1 = float(np.sum(np.abs(w - prev)))
+    assert l1 <= cap + 1e-9

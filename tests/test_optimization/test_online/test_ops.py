@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from skfolio.optimization.online import OPS, OnlineMethod, UpdateRule
+from skfolio.optimization.online import OPS, OnlineFamily
 
 
 @pytest.fixture
@@ -33,28 +33,55 @@ def test_partial_fit(X_small_single):
     _check_box_budget(est.weights_, 0.0, 1.0, 1.0)
 
 
-@pytest.mark.parametrize("rule", list(UpdateRule))
-def test_update_rules_constraints(rule, X_small_single):
-    est = OPS(update_rule=rule)
-    est.partial_fit(X_small_single)
-    _check_box_budget(est.weights_, 0.0, 1.0, 1.0)
-
-
-@pytest.mark.parametrize("method", [OnlineMethod.EG, OnlineMethod.BUY_AND_HOLD])
-def test_methods_basic_validity(method, X_small_single):
+@pytest.mark.parametrize(
+    "method",
+    [
+        OnlineFamily.EG,
+        OnlineFamily.OGD,
+        OnlineFamily.ADAGRAD,
+        OnlineFamily.ADABARRONS,
+    ],
+)
+def test_methods_basic_validity_fit(method, X_small):
     # Keep runtime low for heavier methods
-    est = OPS(method=method, universal_n_samples=50)
+    est = OPS(objective=method)
+    est.fit(X_small)
+    _check_box_budget(est.weights_, 0.0, 1.0, 1.0)
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        OnlineFamily.EG,
+        OnlineFamily.OGD,
+        OnlineFamily.ADAGRAD,
+        OnlineFamily.ADABARRONS,
+    ],
+)
+def test_methods_basic_validity_partial_fit(method, X_small_single):
+    # Keep runtime low for heavier methods
+    est = OPS(objective=method)
     est.partial_fit(X_small_single)
     _check_box_budget(est.weights_, 0.0, 1.0, 1.0)
 
-    # UNIVERSAL internals sanity: w == M @ alpha (then projected)
-    if method == OnlineMethod.UNIVERSAL:
-        M = est._loss_method._experts
-        alpha = est._loss_method._alpha
-        w_raw = M @ alpha
-        # May be identical if only box+sum fast path is used
-        assert np.allclose(np.sum(w_raw), 1.0, atol=1e-6)
-        assert est.weights_.shape == w_raw.shape
+
+def test_smooth_prediction(X_small):
+    # Test that smooth prediction runs and produces different weights from vanilla
+    est_vanilla = OPS(objective=OnlineFamily.EG, learning_rate=0.1)
+    est_smooth = OPS(
+        objective=OnlineFamily.EG, learning_rate=0.1, smooth_prediction=True
+    )
+
+    est_vanilla.fit(X_small)
+    est_smooth.fit(X_small)
+
+    _check_box_budget(est_vanilla.weights_, 0.0, 1.0, 1.0)
+    _check_box_budget(est_smooth.weights_, 0.0, 1.0, 1.0)
+
+    # Weights should be different due to the optimistic term
+    assert not np.allclose(est_vanilla.weights_, est_smooth.weights_), (
+        "Smooth prediction weights are identical to vanilla"
+    )
 
 
 def test_turnover_projection(X_small):
@@ -71,7 +98,7 @@ def test_convex_fallback_groups_linear(X_small_single, groups, linear_constraint
     # Force convex path via groups/linear constraints
     budget = 0.9
     est = OPS(
-        method=OnlineMethod.EG,
+        objective=OnlineFamily.EG,
         min_weights=0.0,
         max_weights=0.8,
         budget=budget,
@@ -107,19 +134,28 @@ def test_bounds_and_budget(lower, upper, budget, X_small_single):
     _check_box_budget(est.weights_, lower, upper, budget)
 
 
-@pytest.mark.parametrize("rule", [UpdateRule.EMD, UpdateRule.OGD])
-def test_warm_start_and_initial_weights_buy_and_hold(rule, X_small_single):
+def test_warm_start_and_initial_weights(X_small_single):
     n = X_small_single.shape[1]
-    init = np.ones(n) / n
-    est = OPS(
-        method=OnlineMethod.BUY_AND_HOLD,
-        update_rule=rule,
-        initial_weights=init,
-        warm_start=False,
-    )
-    est.partial_fit(X_small_single)
-    # With zero gradients and EMD/OGD, Buy-and-Hold should keep weights
-    assert np.allclose(est.weights_, init, atol=1e-10)
+    init = np.random.rand(n)
+    init /= np.sum(init)
+
+    # With warm_start=False, weights should reset to a deterministic state
+    est_no_warm = OPS(objective=OnlineFamily.EG, initial_weights=init, warm_start=False)
+    est_no_warm.partial_fit(X_small_single)  # First fit uses init
+    first_weights = est_no_warm.weights_.copy()
+    est_no_warm.fit(X_small_single)  # Second fit should reset and give same result
+    assert np.allclose(first_weights, est_no_warm.weights_)
+
+    # With warm_start=True, weights should persist and continue updating
+    est_warm = OPS(objective=OnlineFamily.EG, initial_weights=init, warm_start=True)
+    est_warm.partial_fit(X_small_single)
+    first_weights_warm = est_warm.weights_.copy()
+    est_warm.partial_fit(X_small_single)
+    second_weights_warm = est_warm.weights_.copy()
+    assert not np.allclose(init, first_weights_warm)  # weights should have been updated
+    assert not np.allclose(
+        first_weights_warm, second_weights_warm
+    )  # second update should differ
 
 
 # def test_universal_custom_experts(X_small_single):
@@ -138,10 +174,10 @@ def test_warm_start_and_initial_weights_buy_and_hold(rule, X_small_single):
 
 
 def test_partial_fit_streaming_equivalence(X_small):
-    est_batch = OPS(method=OnlineMethod.EG, update_rule=UpdateRule.EMD, eta0=0.3)
+    est_batch = OPS(objective=OnlineFamily.EG, learning_rate=0.3)
     est_batch.fit(X_small)
 
-    est_stream = OPS(method=OnlineMethod.EG, update_rule=UpdateRule.EMD, eta0=0.3)
+    est_stream = OPS(objective=OnlineFamily.EG, learning_rate=0.3)
     for i in range(len(X_small)):
         est_stream.partial_fit(X_small.iloc[[i], :])
 
@@ -154,7 +190,7 @@ def test_convex_variance_bound(X_small):
     # Loose bound to ensure feasibility
     var_bound = float(np.trace(Sigma)) / Sigma.shape[0]
     est = OPS(
-        method=OnlineMethod.EG,
+        objective=OnlineFamily.EG,
         covariance=Sigma,
         variance_bound=var_bound * 2.0,
         min_weights=0.0,
@@ -166,3 +202,336 @@ def test_convex_variance_bound(X_small):
     _check_box_budget(w, 0.0, 0.5, 0.9)
     quad = float(w @ Sigma @ w)
     assert quad <= var_bound * 2.0 + 1e-6
+
+
+def test_eg_tilde_implementation(X_small):
+    """Test EG-Tilde mixing step."""
+    # With alpha=1, result should be uniform portfolio
+    est_uniform = OPS(objective=OnlineFamily.EG, eg_tilde=True, eg_tilde_alpha=1.0).fit(
+        X_small
+    )
+    n_assets = X_small.shape[1]
+    uniform = np.ones(n_assets) / n_assets
+    np.testing.assert_allclose(est_uniform.weights_, uniform, atol=1e-8)
+
+    # With alpha=0, result should be same as standard EG
+    est_eg = OPS(objective=OnlineFamily.EG, eg_tilde=False).fit(X_small)
+    est_no_mix = OPS(objective=OnlineFamily.EG, eg_tilde=True, eg_tilde_alpha=0.0).fit(
+        X_small
+    )
+    np.testing.assert_allclose(est_eg.weights_, est_no_mix.weights_, atol=1e-8)
+
+    # Test with a callable alpha
+    alpha_schedule = lambda t: 1.0 / t if t > 0 else 1.0
+    est_callable = OPS(
+        objective=OnlineFamily.EG, eg_tilde=True, eg_tilde_alpha=alpha_schedule
+    ).fit(X_small)
+    _check_box_budget(est_callable.weights_, 0.0, 1.0, 1.0)
+    assert not np.allclose(est_callable.weights_, est_eg.weights_)
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        OnlineFamily.EG,
+        OnlineFamily.OGD,
+        OnlineFamily.ADAGRAD,
+        OnlineFamily.ADABARRONS,
+    ],
+)
+def test_ftrl_vs_omd_mode(method, X_small):
+    """Test that FTRL and OMD modes run and produce different results."""
+    # OMD mode (default)
+    est_omd = OPS(objective=method, ftrl=False)
+    est_omd.fit(X_small)
+    _check_box_budget(est_omd.weights_, 0.0, 1.0, 1.0)
+
+    # FTRL mode
+    est_ftrl = OPS(objective=method, ftrl=True)
+    est_ftrl.fit(X_small)
+    _check_box_budget(est_ftrl.weights_, 0.0, 1.0, 1.0)
+
+    # The algorithms are different, so their weights should not be close
+    assert not np.allclose(est_omd.weights_, est_ftrl.weights_), (
+        f"FTRL and OMD weights are identical for method {method.value}"
+    )
+
+
+def test_learning_rate_callable(X_small):
+    """Test that a callable learning_rate runs correctly."""
+    # Constant learning_rate
+    est_const = OPS(objective=OnlineFamily.EG, learning_rate=0.1).fit(X_small)
+    _check_box_budget(est_const.weights_, 0.0, 1.0, 1.0)
+
+    # Equivalent callable
+    est_callable_equiv = OPS(
+        objective=OnlineFamily.EG, learning_rate=lambda t: 0.1
+    ).fit(X_small)
+    np.testing.assert_allclose(
+        est_const.weights_, est_callable_equiv.weights_, atol=1e-8
+    )
+
+    # Time-varying callable
+    lr_fn = lambda t: 1.0 / (t + 10)
+    est_callable_varied = OPS(objective=OnlineFamily.EG, learning_rate=lr_fn).fit(
+        X_small
+    )
+    _check_box_budget(est_callable_varied.weights_, 0.0, 1.0, 1.0)
+
+    # Result should be different from constant regularization
+    assert not np.allclose(est_const.weights_, est_callable_varied.weights_)
+
+
+import numpy as np
+import pytest
+
+from skfolio.optimization.online._base import OPS
+from skfolio.optimization.online._mixins import OnlineFamily
+from skfolio.optimization.online._regret import regret, RegretType
+from skfolio.optimization.online._benchmark import CRP
+from skfolio.optimization.online._utils import CLIP_EPSILON
+
+
+def make_stationary_returns(T=200, gap=0.01, n=2):
+    # Asset 0 dominates: r=[gap, 0, 0, ...]
+    X = np.zeros((T, n), dtype=float)
+    X[:, 0] = gap
+    return X
+
+
+def assert_simplex_trajectory(W: np.ndarray, atol=1e-9):
+    s = np.sum(W, axis=1)
+    assert np.all(W >= -1e-12)
+    assert np.all(W <= 1 + 1e-12)
+    assert np.all(np.abs(s - 1.0) <= atol)
+
+
+@pytest.mark.parametrize(
+    "objective, ftrl_flag, min_final_weight",
+    [
+        (OnlineFamily.EG, False, 0.95),
+        (OnlineFamily.EG, True, 0.95),
+        (OnlineFamily.OGD, False, 0.80),
+        (OnlineFamily.ADAGRAD, False, 0.85),
+        (OnlineFamily.ADABARRONS, True, 0.85),
+    ],
+)
+def test_convergence_to_best_asset_under_stationary_env(
+    objective, ftrl_flag, min_final_weight
+):
+    # In a stationary environment with one dominant asset, OPS should converge most mass to it.
+    X = make_stationary_returns(T=250, gap=0.01, n=2)
+    est = OPS(
+        objective=objective,
+        ftrl=ftrl_flag,
+        learning_rate=0.2,
+        warm_start=False,
+    )
+    est.fit(X)
+    W = est.all_weights_
+    assert_simplex_trajectory(W)
+    # last weights put most mass on the dominant asset
+    assert W[-1, 0] >= min_final_weight
+
+
+def test_static_regret_against_best_crp():
+    # Compare against a fixed CRP comparator [1, 0] instead of solving BCRP (avoids cvxpy solver here)
+    X = make_stationary_returns(T=200, gap=0.01, n=2)
+    est = OPS(objective=OnlineFamily.EG, ftrl=True, learning_rate=0.2, warm_start=False)
+    comp = CRP(weights=np.array([1.0, 0.0]))
+    r = regret(
+        estimator=est,
+        X=X,
+        comparator=comp,
+        regret_type=RegretType.STATIC,
+        average="final",
+    )
+    # Final average regret should be small in this easy environment
+    assert r[-1] <= 0.01  # 1% average regret is a conservative bound
+
+
+def test_smooth_prediction_accelerates_initial_adaptation():
+    # Optimistic (last-gradient) prediction should speed up the initial allocation shift
+    T = 12
+    X = make_stationary_returns(T=T, gap=0.02, n=2)
+    base = OPS(
+        objective=OnlineFamily.EG,
+        ftrl=False,
+        learning_rate=0.3,
+        smooth_prediction=False,
+        warm_start=False,
+    )
+    opti = OPS(
+        objective=OnlineFamily.EG,
+        ftrl=False,
+        learning_rate=0.3,
+        smooth_prediction=True,
+        warm_start=False,
+    )
+
+    base.fit(X)
+    opti.fit(X)
+    # Compare weight on asset 0 at an early time (e.g., t=3). Optimistic should be larger or equal.
+    assert opti.all_weights_[2, 0] >= base.all_weights_[2, 0] - 1e-12
+
+
+def test_eg_tilde_mixing_with_uniform():
+    # EG-tilde mixes the EG step with the uniform portfolio
+    X = make_stationary_returns(T=1, gap=0.01, n=3)
+    pure = OPS(
+        objective=OnlineFamily.EG,
+        ftrl=False,
+        learning_rate=0.5,
+        eg_tilde=False,
+        warm_start=False,
+    )
+    mix = OPS(
+        objective=OnlineFamily.EG,
+        ftrl=False,
+        learning_rate=0.5,
+        eg_tilde=True,
+        eg_tilde_alpha=0.5,
+        warm_start=False,
+    )
+
+    pure.fit(X)
+    mix.fit(X)
+
+    w_pure = pure.all_weights_[-1]
+    w_mix = mix.all_weights_[-1]
+    uniform = np.ones_like(w_pure) / w_pure.size
+    w_expected = 0.5 * w_pure + 0.5 * uniform
+    # Projection preserves the simplex so we expect exact match up to numerical error
+    np.testing.assert_allclose(w_mix, w_expected, atol=1e-12, rtol=0)
+
+
+def test_management_fees_flip_preference():
+    # High management fee on asset 0 can flip the preference to asset 1
+    T = 150
+    X = make_stationary_returns(T=T, gap=0.01, n=2)
+    # apply 2% fee on asset 0 every period -> effective 1.01 * (1 - 0.02) ~ 0.9898 < 1.0
+    est = OPS(
+        objective=OnlineFamily.EG,
+        ftrl=False,
+        learning_rate=0.2,
+        warm_start=False,
+        management_fees=np.array([0.02, 0.0]),
+    )
+    est.fit(X)
+    W = est.all_weights_
+    assert_simplex_trajectory(W)
+    # Now asset 1 is more attractive net-of-fees
+    assert W[-1, 1] >= 0.8
+
+
+def test_partial_fit_input_and_warnings_on_sample_weight_and_nonpositive_return():
+    # partial_fit must accept a single row; multiple rows should raise
+    X = make_stationary_returns(T=5, gap=0.01, n=2)
+    est = OPS(
+        objective=OnlineFamily.EG, ftrl=False, learning_rate=0.2, warm_start=False
+    )
+
+    # sample_weight warning
+    with pytest.warns(UserWarning, match="sample_weight is ignored"):
+        est.partial_fit(X[0:1, :], sample_weight=np.ones(1))
+
+    # Multi-row to partial_fit should error
+    with pytest.raises(ValueError, match="expects a single row"):
+        est.partial_fit(X[0:2, :])
+
+    # Non-positive portfolio return: all -100% returns trigger a warning and skip update
+    X_bad = np.full((1, 2), -1.0, dtype=float)  # relatives=0 -> denominator<=0
+    est2 = OPS(
+        objective=OnlineFamily.EG, ftrl=False, learning_rate=0.2, warm_start=False
+    )
+    # first call: uniform init -> after skip, should remain uniform
+    with pytest.warns(
+        UserWarning, match="Non-positive portfolio return, skipping update"
+    ):
+        est2.partial_fit(X_bad)
+    np.testing.assert_allclose(est2.weights_, np.array([0.5, 0.5]), atol=1e-12, rtol=0)
+
+
+def test_objective_not_implemented_raises_value_error():
+    # Objective enums include values not yet wired in _ensure_initialized; they should raise.
+    from skfolio.optimization.online._mixins import OnlineFamily
+
+    X = make_stationary_returns(T=5, gap=0.01, n=2)
+    est = OPS(
+        objective=OnlineFamily.FOLLOW_THE_LEADER,
+        ftrl=False,
+        learning_rate=0.2,
+        warm_start=False,
+    )
+    with pytest.raises(ValueError, match="Unknown objective"):
+        est.fit(X)
+
+
+@pytest.mark.xfail(
+    reason="AutoProjector configuration captures previous_weights only at init and does not update per round."
+)
+def test_turnover_cap_enforced_each_round():
+    # Expect L1 distance between consecutive weights to be capped by max_turnover.
+    # Current implementation passes previous_weights to ProjectionConfig only once;
+    # if not updated each round inside AutoProjector, this constraint may not be enforced.
+    T = 20
+    X = make_stationary_returns(T=T, gap=0.02, n=3)
+    prev = np.array([1 / 3, 1 / 3, 1 / 3], dtype=float)
+    est = OPS(
+        objective=OnlineFamily.EG,
+        ftrl=False,
+        learning_rate=0.5,
+        warm_start=False,
+        previous_weights=prev,
+        max_turnover=0.10,  # cap L1 change per round
+    )
+    est.fit(X)
+    W = est.all_weights_
+    l1_changes = np.sum(np.abs(W[1:] - W[:-1]), axis=1)
+    assert np.all(l1_changes <= 0.10 + 1e-9)
+
+
+def test_weights_respect_min_max_and_budget_constraints():
+    # Enforce min/max weights using projector; all weights must lie in [min, max] and sum==budget
+    T = 50
+    X = make_stationary_returns(T=T, gap=0.01, n=3)
+    est = OPS(
+        objective=OnlineFamily.EG,
+        ftrl=True,
+        learning_rate=0.2,
+        warm_start=False,
+        min_weights=np.array([0.20, 0.0, 0.0]),
+        max_weights=np.array([0.8, 0.8, 0.8]),
+        budget=1.0,
+    )
+    est.fit(X)
+    W = est.all_weights_
+    sums = np.sum(W, axis=1)
+    assert np.allclose(sums, 1.0, atol=1e-9)
+    assert np.all(W[:, 0] >= 0.20 - 1e-12)
+    assert np.all(W <= 0.8 + 1e-12)
+
+
+def test_warm_start_reset_vs_non_warm_behavior():
+    # When warm_start=False, calling fit twice should not accumulate state
+    X = make_stationary_returns(T=30, gap=0.02, n=2)
+
+    est_cold = OPS(
+        objective=OnlineFamily.EG, ftrl=False, learning_rate=0.2, warm_start=False
+    )
+    est_cold.fit(X)
+    W1 = est_cold.all_weights_.copy()
+    est_cold.fit(X)  # re-fit from scratch
+    W2 = est_cold.all_weights_.copy()
+    np.testing.assert_allclose(W1, W2, atol=1e-12, rtol=0)
+
+    # With warm_start=True, second fit continues from previous state, yielding different path
+    est_warm = OPS(
+        objective=OnlineFamily.EG, ftrl=False, learning_rate=0.2, warm_start=True
+    )
+    est_warm.fit(X)
+    W3 = est_warm.all_weights_.copy()
+    est_warm.fit(X)
+    W4 = est_warm.all_weights_.copy()
+    # Paths differ since state carries over
+    assert not np.allclose(W3, W4, atol=1e-12, rtol=0)

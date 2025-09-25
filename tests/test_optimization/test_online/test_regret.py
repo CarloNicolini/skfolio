@@ -2,9 +2,9 @@
 import numpy as np
 import pytest
 
-from skfolio.optimization.online import BCRP, OPS, OnlineMethod
+from skfolio.optimization.online import BCRP, OPS, OnlineFamily
 from skfolio.optimization.online._mixins import RegretType
-from skfolio.optimization.online._regret import compute_regret_curve
+from skfolio.optimization.online._regret import regret
 
 
 @pytest.mark.parametrize(
@@ -13,8 +13,8 @@ from skfolio.optimization.online._regret import compute_regret_curve
 )
 @pytest.mark.parametrize("regret_type", [RegretType.STATIC, RegretType.DYNAMIC])
 def test_shapes_and_finiteness(X_small, avg_flag, regret_type):
-    est = OPS(method=OnlineMethod.EG, eta0=0.05, warm_start=False)
-    r = compute_regret_curve(
+    est = OPS(objective=OnlineFamily.EG, eta=0.05, warm_start=False)
+    r = regret(
         estimator=est,
         X=X_small,
         comparator=BCRP(),
@@ -28,13 +28,13 @@ def test_shapes_and_finiteness(X_small, avg_flag, regret_type):
 
 
 def test_running_vs_final_average_agreement_at_T(X_small):
-    est = OPS(method=OnlineMethod.EG, eta0=0.05, warm_start=False)
+    est = OPS(objective=OnlineFamily.EG, eta=0.05, warm_start=False)
     # cumulative
-    r_cum = compute_regret_curve(est, X_small, comparator=BCRP(), average=False)
+    r_cum = regret(est, X_small, comparator=BCRP(), average=False)
     # running average (R_t / t)
-    r_run = compute_regret_curve(est, X_small, comparator=BCRP(), average="running")
+    r_run = regret(est, X_small, comparator=BCRP(), average="running")
     # final average constant curve
-    r_final = compute_regret_curve(est, X_small, comparator=BCRP(), average="final")
+    r_final = regret(est, X_small, comparator=BCRP(), average="final")
 
     T = X_small.shape[0]
     assert np.isclose(r_run[-1], r_cum[-1] / T, atol=1e-9)
@@ -42,17 +42,11 @@ def test_running_vs_final_average_agreement_at_T(X_small):
 
 
 def test_windowed_running_and_final_average(X_small):
-    est = OPS(method=OnlineMethod.EG, eta0=0.05, warm_start=False)
+    est = OPS(objective=OnlineFamily.EG, eta=0.05, warm_start=False)
     w = 10
-    r_win = compute_regret_curve(
-        est, X_small, comparator=BCRP(), average=False, window=w
-    )
-    r_win_run = compute_regret_curve(
-        est, X_small, comparator=BCRP(), average="running", window=w
-    )
-    r_win_final = compute_regret_curve(
-        est, X_small, comparator=BCRP(), average="final", window=w
-    )
+    r_win = regret(est, X_small, comparator=BCRP(), average=False, window=w)
+    r_win_run = regret(est, X_small, comparator=BCRP(), average="running", window=w)
+    r_win_final = regret(est, X_small, comparator=BCRP(), average="final", window=w)
 
     # Before window-1, the windowed curve should be zero (by construction in our implementation)
     assert np.allclose(r_win[: w - 1], 0.0)
@@ -64,21 +58,19 @@ def test_windowed_running_and_final_average(X_small):
 
 
 def test_comparator_instance_required(X_small):
-    est = OPS(method=OnlineMethod.EG, eta0=0.05, warm_start=False)
+    est = OPS(objective=OnlineFamily.EG, eta=0.05, warm_start=False)
     # Should accept instance or None (defaults to BCRP())
-    r1 = compute_regret_curve(est, X_small, comparator=BCRP())
-    r2 = compute_regret_curve(est, X_small, comparator=None)
+    r1 = regret(est, X_small, comparator=BCRP())
+    r2 = regret(est, X_small, comparator=None)
     assert r1.shape == r2.shape
 
 
 def test_invalid_window_raises(X_small):
-    est = OPS(method=OnlineMethod.EG, eta0=0.05, warm_start=False)
+    est = OPS(objective=OnlineFamily.EG, eta=0.05, warm_start=False)
     with pytest.raises(ValueError):
-        compute_regret_curve(est, X_small, comparator=BCRP(), window=0)
+        regret(est, X_small, comparator=BCRP(), window=0)
     with pytest.raises(ValueError):
-        compute_regret_curve(
-            est, X_small, comparator=BCRP(), window=X_small.shape[0] + 1
-        )
+        regret(est, X_small, comparator=BCRP(), window=X_small.shape[0] + 1)
 
 
 def test_dynamic_without_fit_dynamic_raises(X_small):
@@ -87,8 +79,6 @@ def test_dynamic_without_fit_dynamic_raises(X_small):
 
     # Build a simple dummy instance with no fit_dynamic attribute
     comp = object()
-    est = OPS(method=OnlineMethod.EG, eta0=0.05, warm_start=False)
+    est = OPS(objective=OnlineFamily.EG, eta=0.05, warm_start=False)
     with pytest.raises(ValueError):
-        compute_regret_curve(
-            est, X_small, comparator=comp, regret_type=RegretType.DYNAMIC
-        )
+        regret(est, X_small, comparator=comp, regret_type=RegretType.DYNAMIC)
