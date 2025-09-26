@@ -6,6 +6,8 @@ from numpy.typing import ArrayLike
 from skfolio.utils.equations import equations_to_matrix
 from skfolio.utils.tools import input_to_array
 
+CLIP_EPSILON = 1e-12
+
 
 def net_to_relatives(X: ArrayLike) -> np.ndarray:
     """Convert net returns to price relatives robustly.
@@ -15,7 +17,7 @@ def net_to_relatives(X: ArrayLike) -> np.ndarray:
     X_arr = np.asarray(X, dtype=float)
     if X_arr.ndim == 1:
         X_arr = X_arr.reshape(1, -1)
-    return np.maximum(1.0 + X_arr, 1e-12)
+    return np.maximum(1.0 + X_arr, CLIP_EPSILON)
 
 
 def validate_weights(

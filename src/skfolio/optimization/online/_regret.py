@@ -1,18 +1,24 @@
-from enum import Enum, StrEnum, auto
+from enum import StrEnum, auto
 from typing import Any
 
 import numpy as np
+import cvxpy as cp
 from numpy.typing import ArrayLike
 
 from skfolio.optimization._base import BaseOptimization
 from skfolio.optimization.online._benchmark import BCRP
-from skfolio.optimization.online._loss import CLIP_EPSILON
-from skfolio.optimization.online._utils import net_to_relatives
+from skfolio.optimization.online._utils import CLIP_EPSILON, net_to_relatives
 
 
 class RegretType(StrEnum):
     STATIC = auto()
+    # Legacy dynamic mode (prefix BCRP). Kept for backward compatibility.
     DYNAMIC = auto()
+    DYNAMIC_UNIVERSAL = (
+        auto()
+    )  # universal dynamic regret with path-length budget or penalty
+    DYNAMIC_WORST_CASE = auto()  # per-round minimizers (one-hot on argmax relative)
+    DYNAMIC_LEGACY = auto()  # explicit alias for legacy
 
 
 def plot_regret_curve(
@@ -56,32 +62,14 @@ def plot_regret_curve(
     return fig
 
 
-def _log_wealth_loss(relatives_row: np.ndarray, weights: np.ndarray) -> float:
-    """Negative log-wealth loss for a single period.
-
-    Computes: -log(max(w^T x, eps)) with numerical clipping.
-    """
-    dot = float(np.dot(weights, relatives_row))
-    return -np.log(max(dot, CLIP_EPSILON))
-
-
 def _losses_from_weights(
     relatives: np.ndarray,
     weights: np.ndarray,
 ) -> np.ndarray:
-    """Vectorized per-period losses from weights.
+    """Vectorized per-period negative log-wealth losses.
 
-    Parameters
-    ----------
-    relatives : ndarray of shape (T, n)
-        Price relatives per period.
-    weights : ndarray of shape (T, n) or (n,)
-        Sequence of weights per period or a single static weight vector.
-
-    Returns
-    -------
-    ndarray of shape (T,)
-        Per-period negative log-wealth losses.
+    relatives : (T, n), weights : (T, n) or (n,)
+    Returns: (T,)
     """
     R = np.asarray(relatives, dtype=float)
     if weights.ndim == 1:
@@ -141,7 +129,112 @@ def _running_regret(
     return rr_raw
 
 
-def compute_regret_curve(
+def _worst_case_dynamic_weights(relatives: np.ndarray) -> np.ndarray:
+    """One-hot comparators on argmax asset per round for log-wealth loss.
+
+    relatives: (T, n) strictly positive gross relatives.
+    Return W*: (T, n) with one-hot rows. Ensures per-round minimal loss.
+    """
+    R = np.asarray(relatives, dtype=float)
+    if R.ndim != 2:
+        raise ValueError("relatives must be (T, n)")
+    idx = np.argmax(R, axis=1)
+    T, n = R.shape
+    W = np.zeros((T, n), dtype=float)
+    W[np.arange(T), idx] = 1.0
+    return W
+
+
+def _universal_dynamic_weights(
+    relatives: np.ndarray,
+    *,
+    path_length: float | None = None,
+    path_penalty: float | None = None,
+    norm: str = "l1",
+    solver: str | None = "CLARABEL",
+    solver_params: dict | None = None,
+) -> np.ndarray:
+    r"""
+    Solve universal dynamic comparator sequence u_1..u_T on the simplex:
+
+        maximize     sum_t log( r_t^T u_t )
+        subject to   u_t >= 0, sum_i u_{t,i} = 1  for each t
+                     sum_{t=2}^T ||u_t - u_{t-1}||_p <= path_length    (constraint)
+                     or penalized with path_penalty * sum ||u_t - u_{t-1}||_p
+
+    - Use norm='l1' (default) or 'l2'. L1 matches many path-length results in the literature.
+    - If path_length=0, this reduces to STATIC BCRP (one u_t constant), which we can detect.
+
+    This implements the canonical universal dynamic regret comparator used in OCO,
+    where non-stationarity is captured by the path-length PT, a key regularity in
+    dynamic regret bounds for OGD and SWORD families 【dynamic-regret.pdf】.
+    """
+    R = np.asarray(relatives, dtype=float)
+    if R.ndim != 2:
+        raise ValueError("relatives must be (T, n) gross relatives")
+    T, n = R.shape
+    if T == 0:
+        return np.zeros((0, n), dtype=float)
+    if norm not in ("l1", "l2"):
+        raise ValueError("norm must be 'l1' or 'l2'")
+    if path_length is None and path_penalty is None:
+        raise ValueError(
+            "Provide either path_length or path_penalty for universal dynamic comparator."
+        )
+    if path_length is not None and path_length < 0:
+        raise ValueError("path_length must be nonnegative.")
+    if path_penalty is not None and path_penalty < 0:
+        raise ValueError("path_penalty must be nonnegative.")
+
+    # Special case: path_length == 0 -> STATIC comparator (one constant u) = BCRP
+    if path_length is not None and path_length <= 1e-18:
+        # Equivalent to maximizing sum_t log(R[t]^T u) with u constant
+        # Solve with a single vector u via BCRP on the whole sample
+        # But here we return constant weights across time (project BCRP to all rows).
+        # We reuse BCRP for exactness and robustness.
+        # Note: fits on net returns, so we convert back to net here
+        X_net = R - 1.0
+        bcrp = BCRP().fit(X_net)
+        w = np.asarray(bcrp.weights_, dtype=float)
+        return np.repeat(w[None, :], T, axis=0)
+
+    # Decision variable: one weight vector per t
+    W = cp.Variable((T, n))
+    constraints: list[Any] = [W >= 0, cp.sum(W, axis=1) == 1]
+
+    diffs = W[1:, :] - W[:-1, :] if T >= 2 else None
+    if diffs is not None:
+        if norm == "l1":
+            path_expr = cp.sum(cp.norm1(diffs, axis=1))
+        else:
+            path_expr = cp.sum(cp.norm2(diffs, axis=1))
+    else:
+        path_expr = 0.0
+
+    # Objective: maximize sum log(R[t]^T W_t). This is concave; maximizing is DCP-valid.
+    # R is strictly positive (CLIP_EPSILON), so we don't need extra positivity constraints for the affine inner product.
+    obj_terms = [cp.log(R[t, :] @ W[t, :]) for t in range(T)]
+    if path_length is not None:
+        constraints.append(path_expr <= float(path_length))
+        objective = cp.Maximize(cp.sum(obj_terms))
+    else:
+        objective = cp.Maximize(cp.sum(obj_terms) - float(path_penalty) * path_expr)
+
+    prob = cp.Problem(objective, constraints)
+    try:
+        prob.solve(solver=solver, **(solver_params or {}))
+    except Exception:
+        prob.solve(**(solver_params or {}))
+
+    if W.value is None:
+        raise RuntimeError(
+            "Universal dynamic comparator optimization failed to converge."
+        )
+
+    return np.asarray(W.value, dtype=float)
+
+
+def regret(
     estimator: BaseOptimization,
     X: ArrayLike,
     *,
@@ -149,22 +242,22 @@ def compute_regret_curve(
     regret_type: RegretType = RegretType.STATIC,
     average: bool | str = False,
     window: int | None = None,
+    dynamic_config: dict | None = None,
 ) -> np.ndarray:
-    """Compute the regret curve over time using log-wealth loss.
+    """Compute regret curves over time using the negative log-wealth loss: ft(w) = -log(w^T r_t).
 
     Parameters
     ----------
     estimator : BaseOptimization
-        Online estimator (e.g., OPS) providing ``.fit`` and producing
-        ``.all_weights_`` of shape (T, n).
+        Online estimator (e.g., OPS) providing `.fit(X)` and exposing `.all_weights_` of shape (T, n).
     X : array-like of shape (T, n)
-        Net returns per period (will be converted to price relatives internally).
+        Net returns per period. Internally converted to gross relatives via `1 + r`.
     comparator : BaseOptimization, optional
-        Comparator instance. If None, defaults to ``BCRP()``. For static regret we
-        call ``fit`` and use ``weights_``. For dynamic regret we call ``fit_dynamic``
-        and use ``all_weights_``.
-    regret_type : RegretType, default=RegretType.STATIC
-        Whether to compute static or dynamic regret.
+        - For STATIC: if None, defaults to BCRP() (best fixed in hindsight).
+        - For DYNAMIC_UNIVERSAL and DYNAMIC_WORST_CASE: ignored; comparator is defined by regret_type.
+        - For DYNAMIC_LEGACY or DYNAMIC: if None, defaults to BCRP().fit_dynamic(...) as before.
+    regret_type : RegretType
+        STATIC, DYNAMIC_UNIVERSAL, DYNAMIC_WORST_CASE, or DYNAMIC_LEGACY (DYNAMIC is an alias to LEGACY).
     average : {False, "none", True, "running", "final"}, default=False
         Averaging mode for the returned curve:
         - False or "none": return cumulative (or windowed) regret curve
@@ -172,11 +265,30 @@ def compute_regret_curve(
         - "final": return a constant array equal to final average (R_T/T, or last window average)
     window : int, optional
         If provided, compute sliding-window regret with the given window size.
+    dynamic_config : dict, optional
+        Additional options for universal dynamic regret comparator:
+            - path_length: float >= 0           (sum_t ||u_t - u_{t-1}||_p <= path_length)
+            - path_penalty: float >= 0          (Lagrangian penalty instead of constraint)
+            - norm: "l1" (default) or "l2"      (p in the path length)
+            - solver: str or None               (cvxpy solver; default "CLARABEL")
+            - solver_params: dict               (forwarded to cvxpy)
+
+    Notes
+    -----
+    - For path_length=0, DYNAMIC_UNIVERSAL reduces to STATIC comparator (BCRP).
+    - For L1 norm and sufficiently large path_length (≥ 2*(T-1)), the universal dynamic comparator approaches the worst-case dynamic comparator (can change fully every round).
 
     Returns
     -------
     ndarray of shape (T,)
-        Running regret values per time step.
+        Regret curve (cumulative or running-averaged, or windowed).
+
+    References
+    ----------
+    - Static regret, universal dynamic regret, and worst-case dynamic regret definitions are standard
+      in OCO (see, e.g., Zhao et al. 2024, Eqs. (1)-(3)) (https://jmlr.org/papers/volume25/21-0748/21-0748.pdf).
+    - Path length PT is the canonical non-stationarity measure in dynamic regret bounds; SWORD
+      algorithms achieve problem-dependent bounds in terms of PT and gradient variation VT (and small loss FT) under smoothness, within the universal dynamic regret framework.
     """
     # Fit the online estimator and collect per-period weights
     est = estimator.fit(X)
@@ -192,23 +304,34 @@ def compute_regret_curve(
             axis=0,
         )
 
-    # Use same data conversion as the online pipeline
     relatives = net_to_relatives(X)
-
-    # Online losses
     online_losses = _losses_from_weights(relatives, W_online)
 
     # Comparator weights and losses
-    comp = comparator if comparator is not None else BCRP()
-    if regret_type == RegretType.STATIC:
+    rt = regret_type
+    if rt == RegretType.DYNAMIC:
+        # Alias to legacy; warn to migrate
+        import warnings
+
+        warnings.warn(
+            "RegretType.DYNAMIC is legacy (prefix BCRP). Use DYNAMIC_UNIVERSAL or "
+            "DYNAMIC_WORST_CASE for literature-aligned dynamic regret.",
+            UserWarning,
+            stacklevel=2,
+        )
+        rt = RegretType.DYNAMIC_LEGACY
+
+    if rt == RegretType.STATIC:
+        comp = comparator if comparator is not None else BCRP()
         comp.fit(X)
         w_star = np.asarray(comp.weights_, dtype=float)
         comp_losses = _losses_from_weights(relatives, w_star)
-    elif regret_type == RegretType.DYNAMIC:
-        # Expect comparator to implement fit_dynamic(X) and expose all_weights_
+
+    elif rt == RegretType.DYNAMIC_LEGACY:
+        comp = comparator if comparator is not None else BCRP()
         if not hasattr(comp, "fit_dynamic"):
             raise ValueError(
-                "Dynamic regret requested but comparator has no fit_dynamic method"
+                "Legacy dynamic regret requested but comparator has no fit_dynamic method"
             )
         comp.fit_dynamic(X)
         if not hasattr(comp, "all_weights_"):
@@ -216,9 +339,27 @@ def compute_regret_curve(
         comp_losses = _losses_from_weights(
             relatives, np.asarray(comp.all_weights_, dtype=float)
         )
+
+    elif rt == RegretType.DYNAMIC_WORST_CASE:
+        W_wc = _worst_case_dynamic_weights(relatives)
+        comp_losses = _losses_from_weights(relatives, W_wc)
+
+    elif rt == RegretType.DYNAMIC_UNIVERSAL:
+        cfg = dynamic_config or {}
+        W_ud = _universal_dynamic_weights(
+            relatives,
+            path_length=cfg.get("path_length", None),
+            path_penalty=cfg.get("path_penalty", None),
+            norm=cfg.get("norm", "l1"),
+            solver=cfg.get("solver", "CLARABEL"),
+            solver_params=cfg.get("solver_params", None),
+        )
+        comp_losses = _losses_from_weights(relatives, W_ud)
+
     else:
         raise ValueError(
-            "Unknown regret_type. Use RegretType.STATIC or RegretType.DYNAMIC."
+            "Unknown regret_type. Use STATIC, DYNAMIC_UNIVERSAL, DYNAMIC_WORST_CASE, "
+            "or DYNAMIC_LEGACY (DYNAMIC aliases to legacy)."
         )
 
     # Running (or windowed) regret curve

@@ -1,5 +1,6 @@
 import warnings
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Literal, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -7,61 +8,154 @@ from sklearn.utils.validation import _check_sample_weight, validate_data
 
 import skfolio.typing as skt
 from skfolio.optimization._base import BaseOptimization
-from skfolio.optimization.online._descent import (
-    AdaGrad,
-    AdaBARRONS,
-    BaseDescent,
-    EGTildeEntropicMirrorDescent,
-    EntropicMirrorDescent,
-    OnlineFrankWolfe,
-    OnlineGradientDescent,
-    OnlineNewtonStep,
-    SwordEntropicMirrorDescent,
+from skfolio.optimization.online._ftrl import (
+    FTRL,
+    LastGradPredictor,
+    Predictor,
+    SwordMeta,
 )
-from skfolio.optimization.online._loss import CLIP_EPSILON, Loss, losses_map
+from skfolio.optimization.online._mirror_maps import (
+    AdaptiveLogBarrierMap,
+    AdaptiveMahalanobisMap,
+    AdaptiveVariationMap,
+    BaseMirrorMap,
+    EntropyMirrorMap,
+    EuclideanMirrorMap,
+    TsallisMirrorMap,
+)
 from skfolio.optimization.online._mixins import (
-    ALGORITHM_SPECIFIC_METHODS,
-    OnlineMethod,
+    OnlineFamily,
     OnlineMixin,
     OnlineParameterConstraintsMixin,
-    UpdateRule,
 )
-from skfolio.optimization.online._projection import AutoProjector, ProjectionConfig
-from skfolio.optimization.online._utils import net_to_relatives
+from skfolio.optimization.online._projection import (
+    AutoProjector,
+    ProjectionConfig,
+    IdentityProjector,
+)
+from skfolio.optimization.online._regularizers import Regularizer
+from skfolio.optimization.online._utils import CLIP_EPSILON, net_to_relatives
 from skfolio.utils.tools import input_to_array
 
 
-class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
-    """First-order Online Portfolio Selection with projection.
+class OnlinePortfolioSelection(
+    BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin
+):
+    """Online Portfolio Selection (OPS) base class.
 
-    This estimator implements standard online convex optimization updates:
-    - EMD: Entropic Mirror Descent (multiplicative weights) - default
-    - OGD: Projected (Euclidean) Gradient Descent
-    - OFW: Online Frank-Wolfe (projection-free on the simplex; projected if needed)
-    - ONS: Online Newton Step (Sherman-Morrison inverse update).
+    This class serves as a foundation for implementing various online portfolio
+    selection algorithms. It handles the common logic for fitting data sequentially,
+    managing weights, and applying projections. Subclasses should implement the
+    core update logic.
+    """
 
-    Methods (loss/gradient providers):
+    def __init__(
+        self,
+        *,
+        warm_start: bool = True,
+        initial_weights: npt.ArrayLike | None = None,
+        previous_weights: skt.MultiInput | None = None,
+        transaction_costs: skt.MultiInput = 0.0,
+        management_fees: skt.MultiInput = 0.0,
+        groups: skt.Groups | None = None,
+        linear_constraints: skt.LinearConstraints | None = None,
+        left_inequality: skt.Inequality | None = None,
+        right_inequality: skt.Inequality | None = None,
+        max_turnover: float | None = None,
+        min_weights: skt.MultiInput | None = 0.0,
+        max_weights: skt.MultiInput | None = 1.0,
+        budget: float | None = 1.0,
+        X_tracking: npt.ArrayLike | None = None,
+        tracking_error_benchmark: npt.ArrayLike | None = None,
+        max_tracking_error: float | None = None,
+        covariance: npt.ArrayLike | None = None,
+        variance_bound: float | None = None,
+        portfolio_params: dict | None = None,
+    ):
+        super().__init__(portfolio_params=portfolio_params)
+        self.warm_start = warm_start
+        self.initial_weights = initial_weights
+        self.previous_weights = previous_weights
+        self.transaction_costs = transaction_costs
+        self.management_fees = management_fees
+        self.groups = groups
+        self.linear_constraints = linear_constraints
+        self.left_inequality = left_inequality
+        self.right_inequality = right_inequality
+        self.max_turnover = max_turnover
+        self.min_weights = min_weights
+        self.max_weights = max_weights
+        self.budget = budget
+        self.X_tracking = X_tracking
+        self.tracking_error_benchmark = tracking_error_benchmark
+        self.max_tracking_error = max_tracking_error
+        self.covariance = covariance
+        self.variance_bound = variance_bound
 
-    **Generic methods** (work with any update_rule):
-    - BUY_AND_HOLD: no update
-    - EG: Kelly gradient on current gross returns (standard Hedge/EG)
-    - FOLLOW_THE_LEADER: cumulative Kelly gradients (entropy geometry)
-    - FOLLOW_THE_LOSER: Kelly + PA hinge toward a reversion feature
-    - OLMAR: Kelly gradient on a moving-average prediction
-    - CORN: scenario-based Kelly gradient over correlation-selected neighbors
-    - SMOOTH_PRED: Kelly gradient + log-barrier regularization (FTRL variant)
+        self._is_initialized: bool = False
+        self._weights_initialized: bool = False
+        self._projector: AutoProjector | None = None
 
-    **Algorithm-specific methods** (use integrated descent, ignore update_rule):
-    - EG_TILDE: Exponentiated Gradient with tilting - uses specialized EMD with
-      time-varying parameters and portfolio mixing
-    - UNIVERSAL: Expert aggregation - bypasses gradient-based updates entirely
-    - SWORD_VAR: Sword with gradient variation tracking - adaptive EMD using
-      accumulated gradient variation V_T for O(√((1+P_T+V_T)(1+P_T))) dynamic regret
-    - SWORD_SMALL: Sword with small-loss tracking - adaptive EMD using cumulative
-      comparator loss F_T for O(√((1+P_T+F_T)(1+P_T))) dynamic regret
-    - SWORD_BEST: Sword best-of-both-worlds - adaptive EMD using min{V_T,F_T}
-      for O(√((1+P_T+min{V_T,F_T})(1+P_T))) dynamic regret
+    def _initialize_projector(self):
+        projection_config = ProjectionConfig(
+            lower=self.min_weights,
+            upper=self.max_weights,
+            budget=self.budget,
+            groups=self.groups,
+            linear_constraints=self.linear_constraints,
+            left_inequality=self.left_inequality,
+            right_inequality=self.right_inequality,
+            X_tracking=self.X_tracking,
+            tracking_error_benchmark=self.tracking_error_benchmark,
+            max_tracking_error=self.max_tracking_error,
+            covariance=self.covariance,
+            variance_bound=self.variance_bound,
+            previous_weights=self.previous_weights,
+            max_turnover=self.max_turnover,
+        )
+        self._projector = AutoProjector(projection_config)
 
+    def _initialize_weights(self, num_assets: int):
+        if self.initial_weights is not None:
+            initial = np.asarray(self.initial_weights, dtype=float)
+            if initial.shape != (num_assets,):
+                raise ValueError("initial_weights has incompatible shape")
+            self.weights_ = initial
+        else:
+            self.weights_ = np.ones(num_assets, dtype=float) / float(num_assets)
+        self._weights_initialized = True
+
+    def _clean_input(
+        self,
+        value: float | dict | npt.ArrayLike | None,
+        n_assets: int,
+        fill_value: Any,
+        name: str,
+    ) -> float | np.ndarray:
+        """Convert input to cleaned float or ndarray."""
+        if value is None:
+            return fill_value
+        if np.isscalar(value):
+            return float(value)
+        return input_to_array(
+            items=value,
+            n_assets=n_assets,
+            fill_value=fill_value,
+            dim=1,
+            assets_names=(
+                self.feature_names_in_ if hasattr(self, "feature_names_in_") else None
+            ),
+            name=name,
+        )
+
+
+class OPS(OnlinePortfolioSelection):
+    """OPS: Online Portfolio Selection via Online Convex Optimization.
+
+    Implements standard first-order OCO methods:
+    - Mirror Descent family: OGD, EG
+    - Adaptive methods: AdaGrad, AdaBARRONS
+    - Optimistic methods: Smooth Prediction
 
     Projection:
     - Fast path: box + budget (+ turnover) via project_box_and_sum/project_with_turnover
@@ -70,10 +164,10 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
     Data conventions
     ----------------
     - Inputs ``X`` to :meth:`fit` and :meth:`partial_fit` must be NET returns
-      (i.e., arithmetic returns r_t in [-1, +inf)). Internally, the estimator
-      converts each row to gross returns via ``1.0 + r_t`` before computing
-      losses/gradients. This keeps interfaces consistent with most skfolio
-      preprocessing pipelines that output net returns.
+        (i.e., arithmetic returns r_t in [-1, +inf)). Internally, the estimator
+        converts each row to gross returns via ``1.0 + r_t`` before computing
+        losses/gradients. This keeps interfaces consistent with most skfolio
+        preprocessing pipelines that output net returns.
 
     Fitting
     -------
@@ -82,33 +176,29 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
 
     def __init__(
         self,
-        method: OnlineMethod = OnlineMethod.EG,
-        update_rule: UpdateRule = UpdateRule.EMD,
+        objective: OnlineFamily = OnlineFamily.EG,
         *,
-        initial_weights: npt.ArrayLike | None = None,
-        eta0: float = 0.05,
+        ftrl: bool = False,
         warm_start: bool = True,
-        gamma: float | None = None,
-        l2_coef: float = 0.0,
+        initial_weights: npt.ArrayLike | None = None,
+        learning_rate: float | Callable[[int], float] = 0.05,
+        smooth_prediction: bool = False,
+        previous_weights: skt.MultiInput | None = None,
+        regularizer: Regularizer | None = None,
         transaction_costs: skt.MultiInput = 0.0,
         management_fees: skt.MultiInput = 0.0,
-        previous_weights: skt.MultiInput | None = None,
         groups: skt.Groups | None = None,
         linear_constraints: skt.LinearConstraints | None = None,
         left_inequality: skt.Inequality | None = None,
         right_inequality: skt.Inequality | None = None,
         max_turnover: float | None = None,
-        # Algorihm specific parameters
-        ## Follow the loser
-        reversion_window: int = 5,
-        ## CORN
-        corn_window: int = 5,
-        corn_k: int = 5,
         ## Smooth Prediction
         smooth_epsilon: float = 1.0,
         ## AdaGrad
         adagrad_D: float | npt.ArrayLike | None = None,
         adagrad_eps: float = 1e-8,
+        eg_tilde: bool = False,
+        eg_tilde_alpha: float | Callable[[int], float] = 0.1,
         # Projection constraints (fast path)
         min_weights: skt.MultiInput | None = 0.0,
         max_weights: skt.MultiInput | None = 1.0,
@@ -120,37 +210,20 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
         covariance: npt.ArrayLike | None = None,
         variance_bound: float | None = None,
         portfolio_params: dict | None = None,
-        # Universal provider options
-        experts: np.ndarray | None = None,
-        universal_grid_step: float | None = None,
-        universal_n_samples: int = 10_000,
-        universal_dirichlet_alpha: float | npt.ArrayLike = 1.0,
-        universal_max_grid_points: int = 1_000_000,
     ):
         r"""
         The Online Portfolio Selection estimator.
 
         Parameters
         ----------
-            method: OnlineMethod
-                The online method to use.
-            update_rule: UpdateRule
-                The update rule to use.
-            eta0: float
-                Initial learning-rate.
-
-                - EMD/OGD: the actual step-size defaults to ``eta_t = eta_t / sqrt(t)``
-                  following Hazan's OGD/MD schedule (ensures ``O(\sqrt{T})`` regret for
-                  convex losses). For exp-concave losses you may keep a constant small
-                  ``eta``.
-                - ONS: the effective step-size is chosen automatically as
-                  ``eta_eff = 1 / gamma`` with ``gamma = 0.5 / (G D)`` where ``G`` is an
-                  online estimate of the gradient norm upper bound and ``D`` is the
-                  Euclidean diameter (default ``sqrt(2)`` for the simplex). This follows
-                  Hazan's guidance for logarithmic regret up to the unknown
-                  exp-concavity.
-                - UNIVERSAL: for expert mixtures (Hedge/EWOO), ``eta`` controls how fast
-                  expert weights adapt; ``eta=1`` approximates wealth weighting.
+            objective: OnlineObjective
+                The objective to use.
+            ftrl: bool, default=False
+                If `True`, use the Follow-the-regularized-leader (FTRL) update.
+                If `False` (default), use the Online Mirror Descent (OMD) update.
+            learning_rate: float, default=0.05
+                Step size :math:`\eta_t` scaling factor for the learning rate schedule.
+                Can be a float or a callable `lambda t: f(t)`.
             transaction_costs : float | dict[str, float] | array-like of shape (n_assets, ), default=0.0
                 Transaction costs of the assets. It is used to add linear transaction costs to
                 the optimization problem:
@@ -198,40 +271,6 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
                     be homogenous to the periodicity of :math:`\mu`. For example, if the input
                     `X` is composed of **daily** returns, the `management_fees` need to be
                     expressed in **daily** fees.
-
-            gamma: float
-                The gamma parameter to use for the Online Newton Step
-            l2_coef: float
-                The L2 regularization coefficient to use.
-            reversion_window: int
-                The reversion window to use. Applies only to FOLLOW_THE_LOSER method.
-            corn_window: int
-                The corn window to use. Applies only to CORN method.
-            corn_k: int
-                The corn k parameter to use. Applies only to CORN method.
-            smooth_epsilon: float
-                Log-barrier regularization parameter for Smooth Prediction method.
-                Controls the strength of the regularization term ε * ∑ log(w_i) in the
-                FTRL objective. Larger values provide more regularization (smoother weights).
-                Typical values: 1.0 (standard), 1/r for known return lower bound r.
-                Only used when method=OnlineMethod.SMOOTH_PRED.
-            adagrad_D: float or array-like, optional
-                Diameter bound(s) for AdaGrad algorithm. Controls the scaling of coordinate-wise
-                adaptive learning rates: η_{t,i} = D_i / (√(∑ g_{j,i}²) + ε).
-                If float, uses same bound for all coordinates. If array-like, should have
-                length equal to problem dimension. If None, defaults to √2 (simplex diameter).
-                Only used when update_rule=UpdateRule.ADAGRAD.
-            adagrad_eps: float
-                Small constant added to denominator for numerical stability.
-                Set to 0 for truly scale-free updates.
-                Only used when update_rule=UpdateRule.ADAGRAD.
-            experts: np.ndarray
-                Optional expert matrix of shape ``(n_assets, n_experts)``. Each
-                column is a valid portfolio on the simplex (nonnegative, sums to 1).
-                If ``None``, experts are generated automatically using either a
-                simplex grid (when small enough) or Dirichlet sampling (see
-                ``universal_grid_step``, ``universal_n_samples``,
-                ``universal_dirichlet_alpha``).
             warm_start: bool
                 Whether to warm start the estimator.
             initial_weights: np.ndarray
@@ -332,85 +371,64 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
                     * `"US == 0.7"` --> the sum of all US weights must be equal to 70%
                     * `"Equity == 3 * Bond"` --> the sum of all Equity weights must be equal to 3 times the sum of all Bond weights.
                     * `"2*SPX + 3*Europe <= Bond + 0.05"` --> mixing assets and group constraints
-
-            X_tracking: np.ndarray
-                The tracking error benchmark to use.
-            tracking_error_benchmark: np.ndarray
-                The tracking error benchmark to use.
-            max_tracking_error : float, optional
-                Upper bound constraint on the tracking error.
-                The tracking error is defined as the RMSE (root-mean-square error) of the
-                portfolio returns compared to a target returns. If `max_tracking_error` is
-                provided, the target returns `y` must be provided in the `fit` method.
+            l2_coef: float
+                The L2 regularization coefficient to use.
+            smooth_epsilon: float
+                Log-barrier regularization parameter for Smooth Prediction method.
+                Controls the strength of the regularization term ε * ∑ log(w_i) in the
+                FTRL objective. Larger values provide more regularization (smoother weights).
+                Typical values: 1.0 (standard), 1/r for known return lower bound r.
+                Only used when method=OnlineMethod.SMOOTH_PRED.
+            adagrad_D: float or array-like, optional
+                Diameter bound(s) for AdaGrad algorithm. Controls the scaling of coordinate-wise adaptive learning rates: η_{t,i} = D_i / (√(∑ g_{j,i}²) + ε). If float, uses same bound for all coordinates. If array-like, should have length equal to problem dimension. If None, defaults to √2 (simplex diameter).
+                Only used when objective=OnlineObjective.ADAGRAD.
+            adagrad_eps: float
+                Small constant added to denominator for numerical stability.
+                Set to 0 for truly scale-free updates.
+                Only used when objective=OnlineObjective.ADAGRAD.
             covariance: np.ndarray
                 The covariance to use.
             variance_bound: float
                 The variance bound to use.
             portfolio_params: dict
                 The portfolio parameters to use.
-            universal_grid_step: float
-                If provided, attempts to discretize the simplex with grid step
-                ``h`` such that the number of grid points is
-                ``comb(round(1/h)+n_assets-1, n_assets-1)``. If this count exceeds
-                ``universal_max_grid_points``, the implementation falls back to
-                Dirichlet sampling (see below). Use small ``h`` only for small
-                universes (few assets).
-            universal_n_samples: int
-                Number of Dirichlet samples used to generate experts when a grid is
-                not used. Increase to improve coverage of the simplex for larger
-                universes; trades off memory/compute.
-            universal_dirichlet_alpha: float
-                Dirichlet concentration. ``1.0`` draws are uniform over the simplex;
-                values < 1 concentrate mass near the corners (extreme allocations); values > 1
-                concentrate near the center (balanced allocations).
-            universal_max_grid_points: int
-                Maximum number of grid points allowed before falling back to
-                sampling when ``universal_grid_step`` is specified.
 
-        Notes
-        -----
-        - FTL vs MD: the provider for ``FTL`` returns the instantaneous gradient;
-            cumulative effects are produced by the mirror descent dynamics. This avoids
-            double-counting that would occur if cumulative gradients were fed to MD.
-        - OLMAR: this implementation uses a Kelly-style convex surrogate at the
-            forecast vector rather than the original PA constraint. Behavior is
-            similar in spirit but not identical to Li & Hoi (2012).
-        - Tracking error: the TE constraint in projection uses sample standard
-            deviation of active returns (centered residuals) divided by sqrt(T-1).
         """
-        super().__init__(portfolio_params=portfolio_params)
-
-        # Validate method-descent compatibility
-        if method in ALGORITHM_SPECIFIC_METHODS and update_rule != UpdateRule.EMD:
-            import warnings
-
-            warnings.warn(
-                f"Method {method.value} uses its own integrated descent algorithm "
-                f"and ignores update_rule parameter (specified: {update_rule.value}). "
-                f"This is correct behavior - {method.value} requires specific update rules.",
-                UserWarning,
-                stacklevel=2,
-            )
+        super().__init__(
+            warm_start=warm_start,
+            initial_weights=initial_weights,
+            previous_weights=previous_weights,
+            transaction_costs=transaction_costs,
+            management_fees=management_fees,
+            groups=groups,
+            linear_constraints=linear_constraints,
+            left_inequality=left_inequality,
+            right_inequality=right_inequality,
+            max_turnover=max_turnover,
+            min_weights=min_weights,
+            max_weights=max_weights,
+            budget=budget,
+            X_tracking=X_tracking,
+            tracking_error_benchmark=tracking_error_benchmark,
+            max_tracking_error=max_tracking_error,
+            covariance=covariance,
+            variance_bound=variance_bound,
+            portfolio_params=portfolio_params,
+        )
 
         # Public configuration
-        self.method = method
-        self.update_rule = update_rule
-        self.eta0 = float(eta0)
-        self.gamma = None if gamma is None else float(gamma)
-        self.l2_coef = float(l2_coef)
-        self.reversion_window = int(reversion_window)
-        self.corn_window = int(corn_window)
-        self.corn_k = int(corn_k)
+        self.objective = objective
+        self.learning_rate = learning_rate
+        self.regularizer = regularizer
+        self.ftrl = ftrl
         self.smooth_epsilon = float(smooth_epsilon)
         self.adagrad_D = adagrad_D
         self.adagrad_eps = float(adagrad_eps)
-        self.experts = experts
         self.warm_start = bool(warm_start)
-        self.initial_weights = (
-            None
-            if initial_weights is None
-            else np.asarray(initial_weights, dtype=float)
-        )
+        self.initial_weights = initial_weights
+        self.smooth_prediction = smooth_prediction
+        self.eg_tilde = eg_tilde
+        self.eg_tilde_alpha = eg_tilde_alpha
 
         # Costs and fees (public attributes preserved for predict())
         self.transaction_costs = transaction_costs
@@ -434,69 +452,9 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
         self.covariance = covariance
         self.variance_bound = variance_bound
 
-        # Universal options
-        self.universal_grid_step = universal_grid_step
-        self.universal_n_samples = int(universal_n_samples)
-        self.universal_dirichlet_alpha = universal_dirichlet_alpha
-        self.universal_max_grid_points = int(universal_max_grid_points)
-
         # Internal state (initialized deterministically)
-        self.t_: int = 0
-        self._history_gross_relatives: list[np.ndarray] = []
-        self._descent: BaseDescent | None = None
-        self._loss_method: Loss | None = None
-        self._projector: Any | None = None
-        # Initialization flags to avoid hasattr/getattr checks
-        self._is_initialized: bool = False
-        self._weights_initialized: bool = False
-        # ONS numerical parameters
-        self.eps = 1e-3
-        self.jitter = 1e-9
-        self.recompute_every = 1000
-
-    def _clean_input(
-        self,
-        value: float | dict | npt.ArrayLike | None,
-        n_assets: int,
-        fill_value: Any,
-        name: str,
-    ) -> float | np.ndarray:
-        """Convert input to cleaned float or ndarray.
-
-        Parameters
-        ----------
-        value : float, dict, array-like or None.
-            Input value to clean.
-
-        n_assets : int
-            Number of assets. Used to verify the shape of the converted array.
-
-        fill_value : Any
-            When `items` is a dictionary, elements that are not in `asset_names` are
-            filled with `fill_value` in the converted array.
-
-        name : str
-            Name used for error messages.
-
-        Returns
-        -------
-        value :  float or ndarray of shape (n_assets,)
-            The cleaned float or 1D array.
-        """
-        if value is None:
-            return fill_value
-        if np.isscalar(value):
-            return float(value)  # type: ignore[arg-type]
-        return input_to_array(
-            items=value,
-            n_assets=n_assets,
-            fill_value=fill_value,
-            dim=1,
-            assets_names=(
-                self.feature_names_in_ if hasattr(self, "feature_names_in_") else None
-            ),
-            name=name,
-        )
+        self._ftrl_engine: FTRL | None = None
+        self._cumulative_loss: float = 0.0
 
     def _ensure_initialized(self, gross_relatives: np.ndarray) -> None:
         num_assets = int(gross_relatives.shape[0])
@@ -519,98 +477,85 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
         )
 
         # Resolve transaction costs and management fees once number of assets is known
-        if (self._projector is None) or (self._descent is None):
-            projection_config = ProjectionConfig(
-                lower=self.min_weights,
-                upper=self.max_weights,
-                budget=self.budget,
-                groups=self.groups,
-                linear_constraints=self.linear_constraints,
-                left_inequality=self.left_inequality,
-                right_inequality=self.right_inequality,
-                X_tracking=self.X_tracking,
-                tracking_error_benchmark=self.tracking_error_benchmark,
-                max_tracking_error=self.max_tracking_error,
-                covariance=self.covariance,
-                variance_bound=self.variance_bound,
-                previous_weights=self.previous_weights,
-                max_turnover=self.max_turnover,
-            )
-            self._projector = AutoProjector(projection_config)
+        if self._projector is None:
+            self._initialize_projector()
 
-            # Special case for EG_TILDE: always use specialized EMD regardless of update_rule
-            if self.method == OnlineMethod.EG_TILDE:
-                self._descent = EGTildeEntropicMirrorDescent(
-                    self._projector, self, eta=self.eta0
+        if self._ftrl_engine is None:
+            mirror_map: BaseMirrorMap | None = None
+            predictor: Predictor | None = None
+
+            if self.smooth_prediction:
+                predictor = LastGradPredictor()
+
+            if self.objective == OnlineFamily.EG:
+                mirror_map = EntropyMirrorMap()
+            elif self.objective == OnlineFamily.OGD:
+                mirror_map = EuclideanMirrorMap()
+            elif self.objective == OnlineFamily.ADAGRAD:
+                mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
+            elif self.objective == OnlineFamily.ADABARRONS:
+                mirror_map = AdaptiveLogBarrierMap()
+            elif self.objective in (OnlineFamily.SWORD_VAR, OnlineFamily.SWORD):
+                # SWORD-Var: variation-adaptive OMD with optimistic gradients
+                predictor = LastGradPredictor()
+                mirror_map = AdaptiveVariationMap(eps=self.adagrad_eps)
+            elif self.objective == OnlineFamily.SWORD_SMALL:
+                # SWORD-Small: AdaGrad geometry with optimistic gradients
+                predictor = LastGradPredictor()
+                mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
+            elif self.objective in (OnlineFamily.SWORD_BEST, OnlineFamily.SWORD_PP):
+                # Meta-aggregator combining SWORD-Var and SWORD-Small, plus EG for ++
+                predictor_var = LastGradPredictor()
+                predictor_small = LastGradPredictor()
+                var_engine = FTRL(
+                    mirror_map=AdaptiveVariationMap(eps=self.adagrad_eps),
+                    projector=IdentityProjector(),  # inner unconstrained
+                    eta=self.learning_rate,
+                    predictor=predictor_var,
+                    mode="omd",
                 )
-            # Special cases for Sword algorithms: always use specialized EMD with adaptive step sizes
-            elif self.method == OnlineMethod.SWORD_VAR:
-                self._descent = SwordEntropicMirrorDescent(
-                    self._projector, self, eta=self.eta0, sword_variant="var"
+                small_engine = FTRL(
+                    mirror_map=AdaptiveMahalanobisMap(eps=self.adagrad_eps),
+                    projector=IdentityProjector(),
+                    eta=self.learning_rate,
+                    predictor=predictor_small,
+                    mode="omd",
                 )
-            elif self.method == OnlineMethod.SWORD_SMALL:
-                self._descent = SwordEntropicMirrorDescent(
-                    self._projector, self, eta=self.eta0, sword_variant="small"
-                )
-            elif self.method == OnlineMethod.SWORD_BEST:
-                self._descent = SwordEntropicMirrorDescent(
-                    self._projector, self, eta=self.eta0, sword_variant="best"
-                )
-            elif self.update_rule == UpdateRule.EMD:
-                self._descent = EntropicMirrorDescent(
-                    self._projector, eta=self.eta0, use_schedule=True
-                )
-            elif self.update_rule == UpdateRule.OGD:
-                self._descent = OnlineGradientDescent(
-                    self._projector, eta=self.eta0, use_schedule=True
-                )
-            elif self.update_rule == UpdateRule.OFW:
-                self._descent = OnlineFrankWolfe(
-                    self._projector, gamma=self.gamma if self.gamma is not None else 0.0
-                )
-            elif self.update_rule == UpdateRule.ONS:
-                self._descent = OnlineNewtonStep(
-                    self._projector,
-                    eta=self.eta0,
-                    eps=self.eps,
-                    jitter=self.jitter,
-                    recompute_every=self.recompute_every,
-                    auto_eta=True,
-                )
-            elif self.update_rule == UpdateRule.ADAGRAD:
-                self._descent = AdaGrad(
-                    self._projector,
-                    D=self.adagrad_D,
-                    eps=self.adagrad_eps,
-                )
-            elif self.update_rule == UpdateRule.ADABARRONS:
-                self._descent = AdaBARRONS(
-                    self._projector,
-                    eta=self.eta0,
-                    eps=self.adagrad_eps,
-                    jitter=self.jitter,
-                    # lambda_init=self.lambda_init,
-                    # backtracking=self.backtracking,
-                    # max_backtrack=self.max_backtrack,
+                experts: list[FTRL] = [var_engine, small_engine]
+                if self.objective == OnlineFamily.SWORD_PP:
+                    # add an entropy-geometry expert to stabilize/explore
+                    eg_engine = FTRL(
+                        mirror_map=EntropyMirrorMap(),
+                        projector=IdentityProjector(),
+                        eta=self.learning_rate,
+                        predictor=LastGradPredictor(),
+                        mode="omd",
+                    )
+                    experts.append(eg_engine)
+                assert self._projector is not None
+                self._ftrl_engine = SwordMeta(
+                    experts=experts,
+                    projector=self._projector,
+                    eta_meta=self.learning_rate,  # tie meta-eta to learning_rate
                 )
             else:
-                raise ValueError("Unknown update_rule provided.")
+                raise ValueError("Unknown objective provided.")
 
-        if self._loss_method is None:
-            if self.method not in losses_map:
-                raise ValueError("Unknown method provided.")
+            assert self._projector is not None
+            # For simple cases, create the vanilla FTRL engine after choosing mirror_map
+            if self._ftrl_engine is None:
+                assert mirror_map is not None
+                assert self._projector is not None
+                self._ftrl_engine = FTRL(
+                    mirror_map=mirror_map,
+                    projector=self._projector,
+                    eta=self.learning_rate,
+                    predictor=predictor,
+                    mode="ftrl" if self.ftrl else "omd",
+                )
 
-            self._loss_method = losses_map[self.method](self)  # type: ignore[abstract]
-
-        if (not self._weights_initialized) or (not self.warm_start):
-            if self.initial_weights is not None:
-                initial = np.asarray(self.initial_weights, dtype=float)
-                if initial.shape != (num_assets,):
-                    raise ValueError("initial_weights has incompatible shape")
-                self.weights_ = initial
-            else:
-                self.weights_ = np.ones(num_assets, dtype=float) / float(num_assets)
-            self._weights_initialized = True
+        if not self._weights_initialized or not self.warm_start:
+            self._initialize_weights(num_assets)
 
         # Mark overall init complete
         self._is_initialized = True
@@ -681,50 +626,67 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
 
         gross_relatives = net_to_relatives(net_returns).squeeze()
         self._ensure_initialized(gross_relatives)
-        self.t_ += 1
 
         # Apply management fees multiplicatively to gross relatives for Kelly-like gradients
         effective_relatives = np.maximum(
             gross_relatives * (1 - self._management_fees_arr), CLIP_EPSILON
         )
 
-        # Method-specific provider may directly update weights (e.g. UNIVERSAL)
-        if self._loss_method is None:
-            raise RuntimeError("Provider not initialized")
-
-        # UNIVERSAL method bypasses gradient-based updates
-        if self.method == OnlineMethod.UNIVERSAL:
-            if hasattr(self._loss_method, "update_weights"):
-                new_weights = self._loss_method.update_weights(
-                    self.weights_, effective_relatives
-                )
-                if new_weights is not None:
-                    self.weights_ = new_weights
+        # Gradient for log-wealth objective
+        denominator = np.dot(self.weights_, effective_relatives)
+        if denominator <= 0:
+            # Handle non-positive return, e.g. by using a small positive constant
+            # or by returning without updating, depending on desired behavior.
+            # For now, we skip the update to avoid division by zero.
+            warnings.warn(
+                "Non-positive portfolio return, skipping update.",
+                UserWarning,
+                stacklevel=2,
+            )
+            gradient = np.zeros_like(self.weights_)
         else:
-            gradient = self._loss_method.gradient(self.weights_, effective_relatives)
-            # Add L1 turnover subgradient for transaction costs: grad C_t(b) = c * sign(b - b_prev)
-            if not self.transaction_costs and self.previous_weights is not None:
-                prev = np.asarray(self.previous_weights, dtype=float)
-                if prev.shape == self.weights_.shape:
-                    delta = self.weights_ - prev
-                    gradient += self._transaction_costs_arr * np.sign(delta)
+            gradient = -effective_relatives / denominator
 
-            if self._descent:
-                y = self._descent.step(self.weights_, gradient)
-                self.weights_ = self._descent.project(y)
+        # Add L1 turnover subgradient for transaction costs: grad C_t(b) = c * sign(b - b_prev)
+        if self.transaction_costs and self.previous_weights is not None:
+            prev = np.asarray(self.previous_weights, dtype=float)
+            if prev.shape == self.weights_.shape:
+                delta = self.weights_ - prev
+                gradient += self._transaction_costs_arr * np.sign(delta)
+
+        if self._ftrl_engine:
+            w_ftrl = self._ftrl_engine.step(gradient)
+        else:
+            raise RuntimeError("FTRL Engine not initialized")
+
+        if self.eg_tilde and self.objective == OnlineFamily.EG:
+            if callable(self.eg_tilde_alpha):
+                alpha_t = self.eg_tilde_alpha(self._ftrl_engine._t)
             else:
-                raise RuntimeError("Descent not initialized")
+                alpha_t = self.eg_tilde_alpha
 
-        self._history_gross_relatives.append(gross_relatives)
+            if alpha_t > 0:
+                n = w_ftrl.shape[0]
+                uniform_weights = np.ones(n) / n
+                mixed = (1.0 - alpha_t) * w_ftrl + alpha_t * uniform_weights
+                assert self._projector is not None
+                self.weights_ = self._projector.project(mixed)
+            else:
+                self.weights_ = w_ftrl
+        else:
+            self.weights_ = w_ftrl
+
         self.previous_weights = self.weights_.copy()
-        self.loss_ = self._loss_method.loss(self.weights_, effective_relatives)
+        # Compute loss for inspection (optional, can be simplified)
+        final_return = np.dot(self.weights_, effective_relatives)
+        self.loss_ = -np.log(np.maximum(final_return, CLIP_EPSILON))
+        self._cumulative_loss += self.loss_
         return self
 
     def fit(
         self,
         X: npt.ArrayLike,
         y: npt.ArrayLike | None = None,
-        sample_weight: npt.ArrayLike | None = None,
         **fit_params: Any,
     ) -> "OPS":
         """Iterate over rows and call :meth:`partial_fit` for each period.
@@ -738,8 +700,6 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
             Net returns per period.
         y : Ignored
             Present for API consistency.
-        sample_weight : array-like of shape (n_samples,), default=None
-            Sample weights. Currently ignored but present for API consistency.
         **fit_params : Any
             Additional parameters (unused).
 
@@ -752,24 +712,13 @@ class OPS(BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin):
         self._validate_params()
 
         if not self.warm_start:
-            # Reset online state when warm_start=False
-            self.t_ = 0
-            self._history_gross_relatives = []
             # Do not assign None to typed attributes; just mark flags and reset internals
             self._weights_initialized = False
             self._is_initialized = False
-            self._descent = None
+            self._ftrl_engine = None
             self._projector = None
-            self._loss_method = None
+            self._cumulative_loss = 0.0
 
-        # Handle sample_weight if provided (though it's ignored)
-        if sample_weight is not None:
-            sample_weight = _check_sample_weight(sample_weight, X)
-            warnings.warn(
-                "sample_weight is ignored in OPS.fit (online convex optimization).",
-                UserWarning,
-                stacklevel=2,
-            )
         self.all_weights_ = np.vstack(
             [
                 self.partial_fit(

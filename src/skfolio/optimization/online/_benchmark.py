@@ -85,6 +85,11 @@ class CRP(BaseOptimization, _OnceFittable):
         return self.partial_fit(X, y)
 
 
+# utility class for UCRP
+class UCRP(CRP):
+    pass
+
+
 class BestStock(BaseOptimization, _OnceFittable):
     def __init__(self, portfolio_params: dict | None = None):
         super().__init__(portfolio_params=portfolio_params)
@@ -113,7 +118,7 @@ class BCRP(MeanRisk, OnlineMixin):
     n_features_in_: int
 
     @staticmethod
-    def _log_wealth_expr(w: cp.Variable, estimator: "BCRP") -> cp.Expression:
+    def _log_wealth_expr(w: cp.Variable, estimator: BCRP) -> cp.Expression:
         # Use returns estimated by the prior to build price relatives
         rd = estimator.prior_estimator_.return_distribution_
         relatives = 1.0 + rd.returns  # TODO use the _to_relatives method here
@@ -212,7 +217,6 @@ class BCRP(MeanRisk, OnlineMixin):
 if __name__ == "__main__":
     from skfolio.datasets import load_sp500_dataset
     from skfolio.preprocessing import prices_to_returns
-    from skfolio.optimization.online._regret import compute_regret_curve
 
     prices = load_sp500_dataset()
     X = prices_to_returns(prices)

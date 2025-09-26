@@ -26,31 +26,28 @@ class L1Regularizer(Regularizer):
 
 
 class L2Regularizer(Regularizer):
-    def __init__(self, l2_coef: float):
+    def __init__(self, l2_coef: float, regularize_turnover: bool = False):
         self.l2_coef = l2_coef
+        self.regularize_turnover = regularize_turnover
 
-    def __call__(self, w: np.ndarray, w_prev: np.ndarray) -> np.ndarray:
-        return self.l2_coef * np.sum(np.square(w - w_prev))
+    def __call__(self, w: np.ndarray, w_prev: np.ndarray | None = None) -> np.ndarray:
+        if self.regularize_turnover:
+            if w_prev is None:
+                raise ValueError("w_prev must be provided for turnover regularization")
+            return self.l2_coef * np.sum(np.square(w - w_prev))
+        else:
+            return self.l2_coef * np.sum(np.square(w))
 
-    def gradient(self, w: np.ndarray, w_prev: np.ndarray) -> np.ndarray:
-        return 2 * self.l2_coef * (w - w_prev)
-
-
-class ElasticNetRegularizer(Regularizer):
-    def __init__(self, l1_coef: float, l2_coef: float):
-        self.l1_coef = l1_coef
-        self.l2_coef = l2_coef
-
-    def __call__(self, w: np.ndarray, w_prev: np.ndarray) -> np.ndarray:
-        return self.l1_coef * np.sum(np.abs(w - w_prev)) + self.l2_coef * np.sum(
-            np.square(w - w_prev)
-        )
-
-    def gradient(self, w: np.ndarray, w_prev: np.ndarray) -> np.ndarray:
-        return self.l1_coef * np.sign(w - w_prev) + 2 * self.l2_coef * (w - w_prev)
+    def gradient(self, w: np.ndarray, w_prev: np.ndarray | None = None) -> np.ndarray:
+        if self.regularize_turnover:
+            if w_prev is None:
+                raise ValueError("w_prev must be provided for turnover regularization")
+            return 2 * self.l2_coef * (w - w_prev)
+        else:
+            return 2 * self.l2_coef * w
 
 
-class EntropyRegularizer(Regularizer):
+class NegEntropyRegularizer(Regularizer):
     def __call__(self, w: np.ndarray, w_prev: np.ndarray) -> np.ndarray:
         return entropy(w)
 

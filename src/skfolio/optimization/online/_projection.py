@@ -10,7 +10,6 @@ from typing import Any
 import cvxpy as cp
 import numpy as np
 from numpy.typing import ArrayLike
-from scipy.special import softmax
 
 import skfolio.typing as skt
 from skfolio.utils.equations import equations_to_matrix
@@ -67,6 +66,13 @@ class ProjectionConfig:
 class BaseProjector:
     def project(self, y: np.ndarray) -> np.ndarray:
         raise NotImplementedError
+
+
+class IdentityProjector(BaseProjector):
+    """Projector that returns the input unchanged. Useful to test pure mirror updates."""
+
+    def project(self, y: np.ndarray) -> np.ndarray:
+        return np.asarray(y, dtype=float)
 
 
 class FastProjector(BaseProjector):
@@ -203,14 +209,14 @@ def project_box_and_sum(
     if lower is None:
         lo_arr = np.full(n, 0.0, dtype=float)
     elif np.isscalar(lower):
-        lo_arr = np.full(n, float(lower), dtype=float)
+        lo_arr = np.full(n, lower)
     else:
         lo_arr = input_to_array(lower, n, 0.0, 1, None, "lower_bounds")
 
     if upper is None:
         up_arr = np.full(n, 1.0, dtype=float)
     elif np.isscalar(upper):
-        up_arr = np.full(n, float(upper), dtype=float)
+        up_arr = np.full(n, upper)
     else:
         up_arr = input_to_array(upper, n, 1.0, 1, None, "upper_bounds")
 
@@ -270,14 +276,14 @@ def project_with_turnover(
     if lower is None:
         lower_bounds = np.full(n, 0.0, dtype=float)
     elif np.isscalar(lower):
-        lower_bounds = np.full(n, float(lower), dtype=float)
+        lower_bounds = np.full(n, lower)
     else:
         lower_bounds = input_to_array(lower, n, 0.0, 1, None, "lower_bounds")
 
     if upper is None:
         u = np.full(n, 1.0, dtype=float)
     elif np.isscalar(upper):
-        u = np.full(n, float(upper), dtype=float)
+        u = np.full(n, upper)
     else:
         u = input_to_array(upper, n, 1.0, 1, None, "upper_bounds")
 
@@ -317,7 +323,7 @@ def project_convex(
     max_short: float | None = None,
     max_long: float | None = None,
     # group/linear constraints
-    groups: skt.Groups | None = None,
+    groups: skt.Groups | ArrayLike | None = None,
     linear_constraints: skt.LinearConstraints | None = None,
     left_inequality: skt.Inequality | None = None,
     right_inequality: skt.Inequality | None = None,
@@ -348,14 +354,14 @@ def project_convex(
     if lower is None:
         lower_bounds = np.full(n, 0.0, dtype=float)
     elif np.isscalar(lower):
-        lower_bounds = np.full(n, float(lower), dtype=float)
+        lower_bounds = np.full(n, lower)
     else:
         lower_bounds = input_to_array(lower, n, 0.0, 1, None, "lower_bounds")
 
     if upper is None:
-        u = np.full(n, 1.0, dtype=float)
+        u = np.full(n, 1.0)
     elif np.isscalar(upper):
-        u = np.full(n, float(upper), dtype=float)
+        u = np.full(n, upper)
     else:
         u = input_to_array(upper, n, 1.0, 1, None, "upper_bounds")
 
