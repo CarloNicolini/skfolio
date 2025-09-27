@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import auto
 from numbers import Integral, Real
 from typing import Any, Optional, Protocol
 
 import numpy as np
 import numpy.typing as npt
 from scipy.stats import norm
-from sklearn.utils._param_validation import Interval, StrOptions  # type: ignore
+from sklearn.utils._param_validation import (  # type: ignore
+    Interval,
+    StrOptions,
+)
 from sklearn.utils.validation import _check_sample_weight, validate_data
 
 from skfolio.optimization.online._base import OnlinePortfolioSelection
@@ -17,9 +21,10 @@ from skfolio.optimization.online._mirror_maps import (
     EntropyMirrorMap,
     EuclideanMirrorMap,
 )
+from skfolio.optimization.online._mixins import LoserStrategy, OLMARVariant
 from skfolio.optimization.online._projection import AutoProjector
 from skfolio.optimization.online._utils import CLIP_EPSILON, net_to_relatives
-from skfolio.optimization.online._mixins import LoserFamily
+from skfolio.utils.tools import AutoEnum
 
 
 class Surrogate(Protocol):
@@ -85,18 +90,27 @@ class BaseReversionPredictor:
 
 class OLMAR1Predictor(BaseReversionPredictor):
     """
-    OLMAR-1 reversion predictor φ_{t+1} with explicit variant:
+    OLMAR-1 reversion predictor φ_{t+1} with explicit variant.
+
+    Parameters
+    ----------
+    window : int, default=5
+        Window size for the predictor.
+    variant : OLMARVariant, default=OLMARVariant.OLPS
+        Variant of the predictor.
       - variant="olps":     average of [1, 1/x_T, 1/(x_T x_{T-1}), ..., W terms]
       - variant="cumprod":  average of [1/x_T, 1/(x_T x_{T-1}), ..., W terms] (no leading 1)
 
     Cold-start rule: if T < W+1, return last observed relative x_T (OLPS schedule).
     """
 
-    def __init__(self, window: int = 5, variant: str = "olps"):
+    def __init__(self, window: int = 5, variant: OLMARVariant = OLMARVariant.OLPS):
         if window < 1:
             raise ValueError("window must be >= 1.")
-        if variant not in ("olps", "cumprod"):
-            raise ValueError('variant must be one of {"olps","cumprod"}')
+        if variant not in (OLMARVariant.OLPS, OLMARVariant.CUMPROD):
+            raise ValueError(
+                "variant must be one of {OLMARVariant.OLPS, OLMARVariant.CUMPROD}"
+            )
         self.window = int(window)
         self.variant = variant
         self._history: list[np.ndarray] = []
@@ -114,7 +128,7 @@ class OLMAR1Predictor(BaseReversionPredictor):
         if T < W + 1:
             return self._history[-1].copy()
 
-        if self.variant == "olps":
+        if self.variant == OLMARVariant.OLPS:
             d = x_t.shape[0]
             tmp = np.ones(d, dtype=float)
             phi = np.zeros(d, dtype=float)
@@ -124,7 +138,7 @@ class OLMAR1Predictor(BaseReversionPredictor):
                 tmp = tmp * np.maximum(self._history[x_idx], CLIP_EPSILON)
             return phi * (1.0 / float(W))
 
-        # variant == "cumprod"
+        # variant == OLMARVariant.CUMPROD
         recent = np.stack(self._history[-W:], axis=0)[::-1, :]  # x_T, x_{T-1}, ...
         cumprods = np.cumprod(np.maximum(recent, CLIP_EPSILON), axis=0)
         inv = 1.0 / cumprods
@@ -133,7 +147,12 @@ class OLMAR1Predictor(BaseReversionPredictor):
 
 class OLMAR2Predictor(BaseReversionPredictor):
     """
-    φ_{t+1} = α·1 + (1−α) (φ_t ./ x_t),  φ_1 = 1.
+    OLMAR-2 reversion predictor φ_{t+1} = α·1 + (1−α) (φ_t ./ x_t),  φ_1 = 1.
+
+    Parameters
+    ----------
+    alpha : float, default=0.5
+        Alpha parameter for the predictor.
     """
 
     def __init__(self, alpha: float = 0.5):
@@ -162,18 +181,31 @@ class FTLoser(OnlinePortfolioSelection):
 
     Parameters
     ----------
-    strategy : {'olmar', 'olmar1', 'olmar2', 'pamr', 'cwmr'} or LoserFamily, default='olmar1'
-        Strategy identifier. Passing ``'olmar'`` allows ``strategy_params['order']`` to
-        choose between OLMAR-1 and OLMAR-2. Enum members from
-        :class:`~skfolio.optimization.online._mixins.LoserFamily` are also accepted.
-    strategy_params : dict, optional
-        Strategy-specific hyperparameters. Recognised keys are:
-
-        * ``olmar1`` – ``window`` (int ≥ 1) and ``variant`` in {``'olps'``, ``'cumprod'``}.
-        * ``olmar2`` – ``alpha`` in [0, 1].
-        * ``olmar`` – optional ``order`` in {1, 2} delegating to OLMAR-1/2.
-        * ``cwmr`` – ``eta`` in (0.5, 1), ``sigma0`` > 0, ``min_var`` ≥ 0 or ``None``,
-          ``max_var`` ≥ ``min_var`` or ``None``, ``mean_lr`` > 0, and ``var_lr`` ≥ 0.
+    strategy : {'olmar', 'pamr', 'cwmr'} or LoserStrategy, default='olmar'
+        Mean-reversion family to employ. Enum members from
+        :class:`~skfolio.optimization.online._mixins.LoserStrategy` are accepted.
+    olmar_order : {1, 2}, default=1
+        Selects OLMAR-1 (moving-average predictor) or OLMAR-2 (recursive
+        predictor) when ``strategy='olmar'``.
+    olmar_window : int, default=5
+        Window length for the OLMAR-1 predictor (used when ``olmar_order=1``).
+    olmar_variant : {'olps', 'cumprod'}, default='olps'
+        OLMAR-1 variant. ``'olps'`` reproduces the original OLPS Matlab
+        implementation; ``'cumprod'`` removes the leading unit term.
+    olmar_alpha : float, default=0.5
+        Exponential smoothing parameter of OLMAR-2 (used when ``olmar_order=2``).
+    cwmr_eta : float, default=0.95
+        Confidence level of CWMR. Must lie in the open interval (0.5, 1).
+    cwmr_sigma0 : float, default=1.0
+        Initial diagonal variance for CWMR.
+    cwmr_min_var : float or None, default=1e-12
+        Optional lower bound applied to the CWMR diagonal covariance.
+    cwmr_max_var : float or None, default=None
+        Optional upper bound applied to the CWMR diagonal covariance.
+    cwmr_mean_lr : float, default=1.0
+        Learning rate for the CWMR mean update when ``update_mode='md'``.
+    cwmr_var_lr : float, default=1.0
+        Learning rate for the CWMR variance update when ``update_mode='md'``.
     epsilon : float, default=2.0
         Margin parameter used by all strategies. It is the target prediction
         level for OLMAR, the tolerance for passive-aggressive PAMR, and the
@@ -210,8 +242,17 @@ class FTLoser(OnlinePortfolioSelection):
     """
 
     _parameter_constraints: dict = {
-        "strategy": [StrOptions({"olmar", "olmar1", "olmar2", "pamr", "cwmr"}), None],
-        "strategy_params": [dict, None],
+        "strategy": [StrOptions({m.value.lower() for m in LoserStrategy}), None],
+        "olmar_order": [Interval(Integral, 1, 2, closed="both")],
+        "olmar_window": [Interval(Integral, 1, None, closed="left")],
+        "olmar_variant": [StrOptions({m.value.lower() for m in OLMARVariant})],
+        "olmar_alpha": [Interval(Real, 0, 1, closed="both")],
+        "cwmr_eta": [Interval(Real, 0.5000001, 1.0, closed="neither")],
+        "cwmr_sigma0": [Interval(Real, 1e-14, None, closed="left")],
+        "cwmr_min_var": [Interval(Real, 0.0, None, closed="left"), None],
+        "cwmr_max_var": [Interval(Real, 0.0, None, closed="left"), None],
+        "cwmr_mean_lr": [Interval(Real, 0.0, None, closed="neither")],
+        "cwmr_var_lr": [Interval(Real, 0.0, None, closed="left")],
         "epsilon": [Interval(Real, 0, None, closed="left")],
         "loss": [StrOptions({"hinge", "squared_hinge", "softplus"})],
         "beta": [Interval(Real, 0, None, closed="neither")],
@@ -224,8 +265,17 @@ class FTLoser(OnlinePortfolioSelection):
     def __init__(
         self,
         *,
-        strategy: str | LoserFamily | None = "olmar1",
-        strategy_params: dict | None = None,
+        strategy: str | LoserStrategy | None = "olmar",
+        olmar_order: int = 1,
+        olmar_window: int = 5,
+        olmar_alpha: float = 0.5,
+        olmar_variant: str = "olps",
+        cwmr_eta: float = 0.95,
+        cwmr_sigma0: float = 1.0,
+        cwmr_min_var: float | None = 1e-12,
+        cwmr_max_var: float | None = None,
+        cwmr_mean_lr: float = 1.0,
+        cwmr_var_lr: float = 1.0,
         epsilon: float = 2.0,
         loss: str = "hinge",
         beta: float = 5.0,
@@ -275,9 +325,17 @@ class FTLoser(OnlinePortfolioSelection):
             portfolio_params=portfolio_params,
         )
 
-        self.strategy, self._strategy_params = self._canonicalize_strategy(
-            strategy, strategy_params
-        )
+        self.strategy = self._normalise_strategy(strategy)
+        self.olmar_order = int(olmar_order)
+        self.olmar_window = int(olmar_window)
+        self.olmar_variant = str(olmar_variant).lower()
+        self.olmar_alpha = float(olmar_alpha)
+        self.cwmr_eta = float(cwmr_eta)
+        self.cwmr_sigma0 = float(cwmr_sigma0)
+        self.cwmr_min_var = cwmr_min_var
+        self.cwmr_max_var = cwmr_max_var
+        self.cwmr_mean_lr = float(cwmr_mean_lr)
+        self.cwmr_var_lr = float(cwmr_var_lr)
         self.epsilon = float(epsilon)
         self.loss = loss
         self.beta = float(beta)
@@ -289,7 +347,7 @@ class FTLoser(OnlinePortfolioSelection):
         self._predictor: BaseReversionPredictor | None = None
         self._surrogate: Surrogate | None = None
         self._engine: FTRL | None = None
-
+        # status tracking variables
         self._t: int = 0
         self._last_trade_weights_: np.ndarray | None = None
 
@@ -297,141 +355,80 @@ class FTLoser(OnlinePortfolioSelection):
         self._cwmr_Sdiag: np.ndarray | None = None
         self._cwmr_quantile: float | None = None
 
-    def _canonicalize_strategy(
-        self, strategy: str | LoserFamily | None, overrides: dict | None
-    ) -> tuple[str, dict]:
-        if isinstance(strategy, LoserFamily):
-            strategy_str = strategy.value.lower()
-        elif strategy is None:
-            strategy_str = "olmar1"
-        else:
-            strategy_str = str(strategy).lower()
+    def _normalise_strategy(
+        self, strategy: str | LoserStrategy | None
+    ) -> str:
+        if isinstance(strategy, LoserStrategy):
+            return strategy.value.lower()
+        if strategy is None:
+            return "olmar"
+        return str(strategy).lower()
 
-        params = dict(overrides or {})
+    def _validate_strategy_combinations(self) -> None:
+        if self.strategy not in {"olmar", "pamr", "cwmr"}:
+            raise ValueError("strategy must be one of {'olmar', 'pamr', 'cwmr'}.")
 
-        if strategy_str == "olmar":
-            order = params.pop("order", 1)
-            if not isinstance(order, Integral):
-                raise ValueError(
-                    "`strategy_params['order']` must be an integer when strategy='olmar'."
-                )
-            order = int(order)
-            if order not in (1, 2):
-                raise ValueError(
-                    "`strategy_params['order']` must be 1 or 2 when strategy='olmar'."
-                )
-            strategy_str = f"olmar{order}"
+        if self.strategy == "olmar":
+            if self.olmar_order not in (1, 2):
+                raise ValueError("olmar_order must be 1 or 2 when strategy='olmar'.")
+            if self.olmar_order == 1 and self.olmar_window < 1:
+                raise ValueError("olmar_window must be >= 1 when olmar_order=1.")
+            valid_variants = {m.value.lower() for m in OLMARVariant}
+            if self.olmar_variant not in valid_variants:
+                raise ValueError("olmar_variant must be 'olps' or 'cumprod'.")
+            if not 0.0 <= self.olmar_alpha <= 1.0:
+                raise ValueError("olmar_alpha must lie in [0, 1].")
 
-        if strategy_str not in {"olmar1", "olmar2", "pamr", "cwmr"}:
-            raise ValueError(
-                "strategy must be one of {'olmar1', 'olmar2', 'pamr', 'cwmr', 'olmar'}."
-            )
-
-        defaults = self._default_strategy_params(strategy_str)
-        defaults.update(params)
-        self._validate_strategy_params(strategy_str, defaults)
-        return strategy_str, defaults
-
-    def _default_strategy_params(self, strategy: str) -> dict:
-        if strategy == "olmar1":
-            return {"window": 5, "variant": "olps"}
-        if strategy == "olmar2":
-            return {"alpha": 0.5}
-        if strategy == "pamr":
-            return {}
-        if strategy == "cwmr":
-            return {
-                "eta": 0.95,
-                "sigma0": 1.0,
-                "min_var": 1e-12,
-                "max_var": None,
-                "mean_lr": 1.0,
-                "var_lr": 1.0,
-            }
-        raise ValueError(f"Unsupported strategy '{strategy}'.")
-
-    def _validate_strategy_params(self, strategy: str, params: dict) -> None:
-        if strategy == "olmar1":
-            window = params.get("window", 5)
-            if not isinstance(window, Integral) or window < 1:
-                raise ValueError("OLMAR-1 requires `window` to be an integer ≥ 1.")
-            params["window"] = int(window)
-            variant = str(params.get("variant", "olps")).lower()
-            if variant not in {"olps", "cumprod"}:
-                raise ValueError("OLMAR-1 variant must be 'olps' or 'cumprod'.")
-            params["variant"] = variant
-        elif strategy == "olmar2":
-            alpha = float(params.get("alpha", 0.5))
-            if not 0.0 <= alpha <= 1.0:
-                raise ValueError("OLMAR-2 `alpha` must lie in [0, 1].")
-            params["alpha"] = alpha
-        elif strategy == "cwmr":
-            eta = float(params.get("eta", 0.95))
-            if not 0.5 < eta < 1.0:
-                raise ValueError("CWMR `eta` must belong to the open interval (0.5, 1).")
-            sigma0 = float(params.get("sigma0", 1.0))
-            if sigma0 <= 0.0:
-                raise ValueError("CWMR `sigma0` must be strictly positive.")
-            min_var = params.get("min_var", 1e-12)
-            if min_var is not None:
-                min_var = float(min_var)
-                if min_var < 0.0:
-                    raise ValueError("CWMR `min_var` cannot be negative.")
-            max_var = params.get("max_var", None)
-            if max_var is not None:
-                max_var = float(max_var)
-                if max_var < 0.0:
-                    raise ValueError("CWMR `max_var` cannot be negative.")
-                if min_var is not None and max_var < min_var:
-                    raise ValueError("CWMR `max_var` cannot be smaller than `min_var`.")
-            mean_lr = float(params.get("mean_lr", 1.0))
-            if mean_lr <= 0.0:
-                raise ValueError("CWMR `mean_lr` must be strictly positive.")
-            var_lr = float(params.get("var_lr", 1.0))
-            if var_lr < 0.0:
-                raise ValueError("CWMR `var_lr` cannot be negative.")
-            params["eta"] = eta
-            params["sigma0"] = sigma0
-            params["min_var"] = min_var
-            params["max_var"] = max_var
-            params["mean_lr"] = mean_lr
-            params["var_lr"] = var_lr
-            params["quantile"] = float(norm.ppf(eta))
+        if self.strategy == "cwmr":
+            if not 0.5 < self.cwmr_eta < 1.0:
+                raise ValueError("cwmr_eta must belong to the open interval (0.5, 1).")
+            if self.cwmr_sigma0 <= 0.0:
+                raise ValueError("cwmr_sigma0 must be strictly positive.")
+            if self.cwmr_min_var is not None and self.cwmr_min_var < 0.0:
+                raise ValueError("cwmr_min_var cannot be negative.")
+            if self.cwmr_max_var is not None and self.cwmr_max_var < 0.0:
+                raise ValueError("cwmr_max_var cannot be negative.")
+            if (
+                self.cwmr_min_var is not None
+                and self.cwmr_max_var is not None
+                and self.cwmr_max_var < self.cwmr_min_var
+            ):
+                raise ValueError("cwmr_max_var cannot be smaller than cwmr_min_var.")
+            if self.cwmr_mean_lr <= 0.0:
+                raise ValueError("cwmr_mean_lr must be strictly positive.")
+            if self.cwmr_var_lr < 0.0:
+                raise ValueError("cwmr_var_lr cannot be negative.")
 
     def _clip_cwmr_variances(self, diag: np.ndarray) -> np.ndarray:
         """Clip CWMR diagonal variances to the configured bounds."""
 
         out = np.array(diag, dtype=float, copy=True)
-        min_var = self._strategy_params.get("min_var")
-        max_var = self._strategy_params.get("max_var")
-        if min_var is not None:
-            out = np.maximum(out, float(min_var))
-        if max_var is not None:
-            out = np.minimum(out, float(max_var))
+        if self.cwmr_min_var is not None:
+            out = np.maximum(out, float(self.cwmr_min_var))
+        if self.cwmr_max_var is not None:
+            out = np.minimum(out, float(self.cwmr_max_var))
         return np.maximum(out, 1e-18)
 
     def _ensure_components(self, d: int) -> None:
         if self._projector is None:
             self._initialize_projector()
 
-        if self.strategy == "olmar1":
+        if self.strategy == "olmar" and self.olmar_order == 1:
             if self._predictor is None:
-                params = self._strategy_params
                 self._predictor = OLMAR1Predictor(
-                    window=params["window"], variant=params["variant"]
+                    window=self.olmar_window, variant=self.olmar_variant
                 )
                 self._predictor.reset(d)
             elif getattr(self._predictor, "_d", None) != d:
                 self._predictor.reset(d)
-        elif self.strategy == "olmar2":
+        elif self.strategy == "olmar" and self.olmar_order == 2:
             if self._predictor is None:
-                params = self._strategy_params
-                self._predictor = OLMAR2Predictor(alpha=params["alpha"])
+                self._predictor = OLMAR2Predictor(alpha=self.olmar_alpha)
                 self._predictor.reset(d)
             elif getattr(self._predictor, "_d", None) != d:
                 self._predictor.reset(d)
 
-        if self.strategy in {"olmar1", "olmar2"} and self._surrogate is None:
+        if self.strategy == "olmar" and self._surrogate is None:
             if self.loss == "hinge":
                 self._surrogate = HingeSurrogate(self.epsilon)
             elif self.loss == "squared_hinge":
@@ -441,7 +438,10 @@ class FTLoser(OnlinePortfolioSelection):
             else:
                 raise ValueError("Unknown surrogate loss.")
 
-        if self.update_mode == "md" and self.strategy in {"olmar1", "olmar2", "pamr"}:
+        if self.update_mode == "md" and (
+            self.strategy == "pamr"
+            or (self.strategy == "olmar" and self.olmar_order in {1, 2})
+        ):
             if self._engine is None:
                 if self.mirror == "euclidean":
                     mm: BaseMirrorMap = EuclideanMirrorMap()
@@ -459,18 +459,19 @@ class FTLoser(OnlinePortfolioSelection):
 
         if self.strategy == "cwmr":
             if self._cwmr_quantile is None:
-                self._cwmr_quantile = float(self._strategy_params["quantile"])
+                self._cwmr_quantile = float(norm.ppf(self.cwmr_eta))
             if not self._weights_initialized:
                 self._initialize_weights(d)
             if self._cwmr_mu is None:
                 self._cwmr_mu = self.weights_.copy()
             if self._cwmr_Sdiag is None:
-                sigma0 = float(self._strategy_params["sigma0"])
-                self._cwmr_Sdiag = np.full(d, sigma0, dtype=float)
+                self._cwmr_Sdiag = np.full(d, self.cwmr_sigma0, dtype=float)
             self._cwmr_Sdiag = self._clip_cwmr_variances(self._cwmr_Sdiag)
 
     def _should_update_today(self) -> bool:
-        return self.strategy != "olmar1" or self._t >= 1
+        if self.strategy == "olmar" and self.olmar_order == 1:
+            return self._t >= 1
+        return True
 
     @staticmethod
     def _stable_y(a: float, s: float) -> float:
@@ -559,8 +560,8 @@ class FTLoser(OnlinePortfolioSelection):
             self._cwmr_Sdiag = self._clip_cwmr_variances(diag)
             return trade_w.copy()
 
-        mean_lr = float(self._strategy_params["mean_lr"])
-        var_lr = float(self._strategy_params["var_lr"])
+        mean_lr = self.cwmr_mean_lr
+        var_lr = self.cwmr_var_lr
         sigma_x = diag * x_t
         mu_candidate = mu - mean_lr * sigma_x
         if isinstance(self._projector, AutoProjector):
@@ -569,7 +570,7 @@ class FTLoser(OnlinePortfolioSelection):
         self._cwmr_mu = w_next.copy()
 
         if var_lr > 0.0 and sqrt_s > 0.0:
-            grad_sigma = (phi / (2.0 * max(sqrt_s, 1e-18))) * (x_t ** 2)
+            grad_sigma = (phi / (2.0 * max(sqrt_s, 1e-18))) * (x_t**2)
             log_diag = np.log(np.maximum(diag, 1e-18))
             log_diag_new = log_diag - var_lr * grad_sigma
             diag_new = np.exp(log_diag_new)
@@ -584,10 +585,17 @@ class FTLoser(OnlinePortfolioSelection):
         y: npt.ArrayLike | None = None,
         sample_weight: npt.ArrayLike | None = None,
         **fit_params: Any,
-    ) -> "FTLoser":
+    ) -> FTLoser:
+        self._validate_params()
+        self._validate_strategy_combinations()
+
+        X_arr = np.asarray(X, dtype=float)
+        if X_arr.ndim == 1:
+            X_arr = X_arr.reshape(1, -1)
+
         first_call = not hasattr(self, "n_features_in_")
         X = validate_data(
-            self, X=X, y=None, reset=first_call, dtype=float, ensure_2d=True
+            self, X=X_arr, y=None, reset=first_call, dtype=float, ensure_2d=True
         )
         if sample_weight is not None:
             _ = _check_sample_weight(sample_weight, X)
@@ -604,7 +612,9 @@ class FTLoser(OnlinePortfolioSelection):
         trade_w = self.weights_.copy()
         self._last_trade_weights_ = trade_w
 
-        if self.strategy in {"olmar1", "olmar2"}:
+        is_olmar = self.strategy == "olmar"
+
+        if is_olmar:
             assert self._predictor is not None
             phi_raw = self._predictor.update_and_predict(x_t)
             if self.apply_fees_to_phi:
@@ -625,7 +635,7 @@ class FTLoser(OnlinePortfolioSelection):
         next_w = trade_w.copy()
         if self._should_update_today():
             if self.update_mode == "pa":
-                if self.strategy in {"olmar1", "olmar2"}:
+                if is_olmar:
                     margin = float(phi_eff @ trade_w)
                     ell = max(0.0, self.epsilon - margin)
                     if ell > 0.0:
@@ -654,7 +664,7 @@ class FTLoser(OnlinePortfolioSelection):
                     next_w = self._cwmr_oco_step(trade_w, x_t)
                 else:
                     assert self._engine is not None
-                    if self.strategy in {"olmar1", "olmar2"}:
+                    if is_olmar:
                         assert self._surrogate is not None
                         g = self._surrogate.grad(trade_w, phi_eff)
                     else:  # PAMR gradient

@@ -1,8 +1,10 @@
 import numpy as np
 import pytest
 
+from skfolio.moments import DenoiseCovariance
 from skfolio.optimization.online._benchmark import BCRP
 from skfolio.optimization.online._ftloser import FTLoser
+from skfolio.prior import EmpiricalPrior
 
 
 def build_market(pattern, n):
@@ -53,7 +55,8 @@ def test_bcrp_toy_markets(name, pattern, k, period):
     n = 10 * period
     R = build_market(pattern, n)
     X = to_net(R)
-    bcrp = BCRP().fit(X)
+
+    bcrp = BCRP(prior_estimator=EmpiricalPrior()).fit(X)
     w = np.asarray(bcrp.weights_, dtype=float)
     W = np.repeat(w[None, :], n, axis=0)
     wealth = cumulative_wealth_from_weights(R, W)
@@ -76,9 +79,11 @@ def test_olmar_toy_markets(name, pattern, k, period):
     R = build_market(pattern, n)
     X = to_net(R)
     model = FTLoser(
-        strategy="olmar1",
+        strategy="olmar",
+        olmar_order=1,
+        olmar_window=k,
+        olmar_variant="olps",
         epsilon=2.0,
-        strategy_params={"window": k, "variant": "olps"},
         update_mode="pa",
         warm_start=False,
     )

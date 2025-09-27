@@ -6,9 +6,10 @@ from skfolio.optimization.online._ftloser import FTLoser
 def test_olmar_pamr_cwmr_all_run_under_pa():
     X = np.array([[0.0, 0.0], [0.1, -0.1]], dtype=float)
     m_olmar = FTLoser(
-        strategy="olmar1",
+        strategy="olmar",
+        olmar_order=1,
+        olmar_window=2,
         epsilon=2.0,
-        strategy_params={"window": 2},
         update_mode="pa",
         warm_start=False,
     )
@@ -16,7 +17,8 @@ def test_olmar_pamr_cwmr_all_run_under_pa():
     m_cwmr = FTLoser(
         strategy="cwmr",
         epsilon=1.0,
-        strategy_params={"eta": 0.95, "sigma0": 0.5},
+        cwmr_eta=0.95,
+        cwmr_sigma0=0.5,
         update_mode="pa",
         warm_start=False,
     )
@@ -31,7 +33,8 @@ def test_cwmr_md_runs_and_produces_portfolios():
     m = FTLoser(
         strategy="cwmr",
         epsilon=1.0,
-        strategy_params={"eta": 0.95, "sigma0": 0.5},
+        cwmr_eta=0.95,
+        cwmr_sigma0=0.5,
         update_mode="md",
         warm_start=False,
     )

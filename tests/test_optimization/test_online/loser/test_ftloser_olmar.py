@@ -82,9 +82,10 @@ def test_olmar2_phi_recursion():
 
 def test_pa_step_equals_closed_form_projection():
     model = FTLoser(
-        strategy="olmar1",
+        strategy="olmar",
+        olmar_order=1,
+        olmar_window=2,
         epsilon=1.05,
-        strategy_params={"window": 2},
         update_mode="pa",
     )
     X = np.array([
@@ -115,9 +116,11 @@ def test_pa_step_equals_closed_form_projection():
 
 def test_pa_step_equals_closed_form_projection_variant_cumprod():
     model = FTLoser(
-        strategy="olmar1",
+        strategy="olmar",
+        olmar_order=1,
+        olmar_window=2,
+        olmar_variant="cumprod",
         epsilon=1.05,
-        strategy_params={"window": 2, "variant": "cumprod"},
         update_mode="pa",
         warm_start=False,
     )
@@ -149,9 +152,10 @@ def test_pa_step_equals_closed_form_projection_variant_cumprod():
 
 def test_turnover_constraint_enforced():
     model = FTLoser(
-        strategy="olmar2",
+        strategy="olmar",
+        olmar_order=2,
+        olmar_alpha=0.6,
         epsilon=1.02,
-        strategy_params={"alpha": 0.6},
         update_mode="pa",
         max_turnover=0.10,
     )
@@ -166,9 +170,10 @@ def test_turnover_constraint_enforced():
 def test_trading_vs_postupdate_weights_semantics():
     X_net = np.array([[0.0, 0.0], [0.1, -0.1]], dtype=float)
     model = FTLoser(
-        strategy="olmar1",
+        strategy="olmar",
+        olmar_order=1,
+        olmar_window=2,
         epsilon=2.0,
-        strategy_params={"window": 2},
         update_mode="pa",
         warm_start=False,
     )
@@ -181,9 +186,10 @@ def test_trading_vs_postupdate_weights_semantics():
 def test_olmar1_day3_is_non_uniform():
     X = np.array([[0.0, 0.0], [0.0, 0.0], [0.1, -0.1]], dtype=float)
     model = FTLoser(
-        strategy="olmar1",
+        strategy="olmar",
+        olmar_order=1,
+        olmar_window=2,
         epsilon=2.0,
-        strategy_params={"window": 2},
         update_mode="pa",
         warm_start=False,
     )
@@ -197,9 +203,10 @@ def test_olmar1_day3_is_non_uniform():
 def test_day3_uniform_when_history_flat():
     X = np.array([[0.0, 0.0], [0.0, 0.0], [0.1, -0.1]], dtype=float)
     model = FTLoser(
-        strategy="olmar1",
+        strategy="olmar",
+        olmar_order=1,
+        olmar_window=2,
         epsilon=2.0,
-        strategy_params={"window": 2},
         update_mode="pa",
         warm_start=False,
     )
@@ -213,9 +220,10 @@ def test_day3_uniform_when_history_flat():
 def test_day3_nonuniform_with_nonflat_day2():
     X = np.array([[0.0, 0.0], [0.2, -0.2], [0.1, -0.1]], dtype=float)
     model = FTLoser(
-        strategy="olmar1",
+        strategy="olmar",
+        olmar_order=1,
+        olmar_window=2,
         epsilon=2.0,
-        strategy_params={"window": 2},
         update_mode="pa",
         warm_start=False,
     )
@@ -227,16 +235,18 @@ def test_day3_nonuniform_with_nonflat_day2():
 def test_md_zero_move_when_margin_satisfied():
     X = np.array([[0.0, 0.0]], dtype=float)
     model_pa = FTLoser(
-        strategy="olmar1",
+        strategy="olmar",
+        olmar_order=1,
+        olmar_window=1,
         epsilon=0.5,
-        strategy_params={"window": 1},
         update_mode="pa",
         warm_start=False,
     )
     model_md = FTLoser(
-        strategy="olmar1",
+        strategy="olmar",
+        olmar_order=1,
+        olmar_window=1,
         epsilon=0.5,
-        strategy_params={"window": 1},
         update_mode="md",
         mirror="euclidean",
         learning_rate=0.5,

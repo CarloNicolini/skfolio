@@ -28,7 +28,7 @@ class OnlineFamily(AutoEnum):
     SWORD = SWORD_VAR
 
 
-class LoserFamily(AutoEnum):
+class LoserStrategy(AutoEnum):
     """
     Follow-the-Loser families (mean-reversion):
     - OLMAR: Online Moving Average Reversion (1/2)
@@ -39,6 +39,11 @@ class LoserFamily(AutoEnum):
     OLMAR = auto()
     PAMR = auto()
     CWMR = auto()
+
+
+class OLMARVariant(AutoEnum):
+    OLPS = auto()
+    CUMPROD = auto()
 
 
 class OnlineMixin:

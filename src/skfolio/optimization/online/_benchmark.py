@@ -117,6 +117,9 @@ class BCRP(MeanRisk, OnlineMixin):
     name: str = "BCRP"
     n_features_in_: int
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
     @staticmethod
     def _log_wealth_expr(w: cp.Variable, estimator: BCRP) -> cp.Expression:
         # Use returns estimated by the prior to build price relatives

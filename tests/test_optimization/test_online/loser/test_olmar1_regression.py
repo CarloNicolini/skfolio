@@ -67,9 +67,10 @@ def test_olmar1_phi_cold_start_uses_last_relative_until_W_plus_1():
 def test_all_weights_are_trading_weights():
     X = np.array([[0.0, 0.0], [0.1, -0.1]], dtype=float)  # net returns
     model = FTLoser(
-        strategy="olmar1",
+        strategy="olmar",
+        olmar_order=1,
+        olmar_window=2,
         epsilon=2.0,
-        strategy_params={"window": 2},
         update_mode="pa",
         warm_start=False,
     )

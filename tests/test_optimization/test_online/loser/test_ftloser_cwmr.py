@@ -10,17 +10,24 @@ def _make_cwmr(
     *,
     epsilon: float = 1.0,
     update_mode: str = "pa",
-    strategy_params: dict | None = None,
+    cwmr_eta: float = 0.95,
+    cwmr_sigma0: float = 0.5,
+    cwmr_min_var: float | None = 1e-12,
+    cwmr_max_var: float | None = None,
+    cwmr_mean_lr: float = 1.0,
+    cwmr_var_lr: float = 1.0,
     **kwargs,
 ) -> FTLoser:
-    params = {"eta": 0.95, "sigma0": 0.5}
-    if strategy_params is not None:
-        params.update(strategy_params)
     return FTLoser(
         strategy="cwmr",
         epsilon=epsilon,
-        strategy_params=params,
         update_mode=update_mode,
+        cwmr_eta=cwmr_eta,
+        cwmr_sigma0=cwmr_sigma0,
+        cwmr_min_var=cwmr_min_var,
+        cwmr_max_var=cwmr_max_var,
+        cwmr_mean_lr=cwmr_mean_lr,
+        cwmr_var_lr=cwmr_var_lr,
         warm_start=False,
         **kwargs,
     )
@@ -50,7 +57,7 @@ def _violation(mu: np.ndarray, sigma: np.ndarray, x: np.ndarray, eps: float, phi
 
 
 def test_cwmr_pa_runs_and_is_feasible():
-    model = _make_cwmr(strategy_params={"eta": 0.97, "sigma0": 0.3})
+    model = _make_cwmr(cwmr_eta=0.97, cwmr_sigma0=0.3)
     X = _simple_market()
     model.fit(X)
     W = model.all_weights_
@@ -67,7 +74,7 @@ def test_cwmr_pa_no_update_when_constraint_satisfied():
 
 def test_cwmr_pa_mean_reversion_directionality():
     X = np.array([[0.0, 0.0], [0.2, -0.1]], dtype=float)
-    model = _make_cwmr(strategy_params={"eta": 0.95, "sigma0": 0.4})
+    model = _make_cwmr(cwmr_eta=0.95, cwmr_sigma0=0.4)
     model.fit(X[:1])
     w_prev = model.weights_.copy()
     model.partial_fit(X[1:2])
@@ -77,7 +84,7 @@ def test_cwmr_pa_mean_reversion_directionality():
 
 def test_cwmr_pa_variance_shrinkage_matches_loading():
     X = np.array([[0.0, 0.0], [0.3, -0.1]], dtype=float)
-    model = _make_cwmr(strategy_params={"eta": 0.99, "sigma0": 1.0})
+    model = _make_cwmr(cwmr_eta=0.99, cwmr_sigma0=1.0)
     model.fit(X[:1])
     sigma_before = model._cwmr_Sdiag.copy()
     model.partial_fit(X[1:2])
@@ -88,8 +95,8 @@ def test_cwmr_pa_variance_shrinkage_matches_loading():
 
 def test_cwmr_pa_eta_controls_update_strength():
     X = np.array([[0.0, 0.0], [0.25, -0.2]], dtype=float)
-    slow = _make_cwmr(strategy_params={"eta": 0.90, "sigma0": 0.5})
-    fast = _make_cwmr(strategy_params={"eta": 0.99, "sigma0": 0.5})
+    slow = _make_cwmr(cwmr_eta=0.90, cwmr_sigma0=0.5)
+    fast = _make_cwmr(cwmr_eta=0.99, cwmr_sigma0=0.5)
     slow.fit(X[:1])
     baseline = slow.weights_.copy()
     slow.partial_fit(X[1:2])
@@ -101,14 +108,14 @@ def test_cwmr_pa_eta_controls_update_strength():
 
 
 def test_cwmr_param_validation_guardrails():
-    model = _make_cwmr(strategy_params={"eta": 0.5})
+    model = _make_cwmr(cwmr_eta=0.5)
     X = np.array([[0.0, 0.0]], dtype=float)
     with pytest.raises(ValueError):
         model.fit(X)
 
 
 def test_cwmr_md_runs_and_stays_in_simplex():
-    model = _make_cwmr(update_mode="md", strategy_params={"eta": 0.96, "sigma0": 0.4})
+    model = _make_cwmr(update_mode="md", cwmr_eta=0.96, cwmr_sigma0=0.4)
     X = _simple_market()
     model.fit(X)
     W = model.all_weights_
@@ -117,14 +124,19 @@ def test_cwmr_md_runs_and_stays_in_simplex():
 
 
 def test_cwmr_md_reduces_violation():
-    params = {"eta": 0.97, "sigma0": 0.6, "mean_lr": 0.8, "var_lr": 0.3}
-    model = _make_cwmr(update_mode="md", strategy_params=params)
+    model = _make_cwmr(
+        update_mode="md",
+        cwmr_eta=0.97,
+        cwmr_sigma0=0.6,
+        cwmr_mean_lr=0.8,
+        cwmr_var_lr=0.3,
+    )
     X = np.array([[0.0, 0.0], [0.2, -0.1]], dtype=float)
     model.fit(X[:1])
     mu_prev = model.weights_.copy()
     sigma_prev = model._cwmr_Sdiag.copy()
     x = 1.0 + X[1]
-    phi = norm.ppf(model._strategy_params["eta"])
+    phi = norm.ppf(model.cwmr_eta)
     violation_before = _violation(mu_prev, sigma_prev, x, model.epsilon, phi)
     model.partial_fit(X[1:2])
     mu_new = model.weights_.copy()
@@ -135,10 +147,10 @@ def test_cwmr_md_reduces_violation():
 
 def test_cwmr_md_learning_rates_control_update_and_variance():
     X = np.array([[0.0, 0.0], [0.25, -0.15]], dtype=float)
-    mean_slow = _make_cwmr(update_mode="md", strategy_params={"mean_lr": 0.2, "var_lr": 0.5})
-    mean_fast = _make_cwmr(update_mode="md", strategy_params={"mean_lr": 1.0, "var_lr": 0.5})
-    var_slow = _make_cwmr(update_mode="md", strategy_params={"mean_lr": 0.5, "var_lr": 0.1})
-    var_fast = _make_cwmr(update_mode="md", strategy_params={"mean_lr": 0.5, "var_lr": 0.8})
+    mean_slow = _make_cwmr(update_mode="md", cwmr_mean_lr=0.2, cwmr_var_lr=0.5)
+    mean_fast = _make_cwmr(update_mode="md", cwmr_mean_lr=1.0, cwmr_var_lr=0.5)
+    var_slow = _make_cwmr(update_mode="md", cwmr_mean_lr=0.5, cwmr_var_lr=0.1)
+    var_fast = _make_cwmr(update_mode="md", cwmr_mean_lr=0.5, cwmr_var_lr=0.8)
 
     mean_slow.fit(X[:1])
     baseline = mean_slow.weights_.copy()
@@ -159,8 +171,7 @@ def test_cwmr_md_learning_rates_control_update_and_variance():
 
 
 def test_cwmr_state_persists_between_modes():
-    params = {"eta": 0.96, "sigma0": 0.4}
-    model = _make_cwmr(update_mode="pa", strategy_params=params)
+    model = _make_cwmr(update_mode="pa", cwmr_eta=0.96, cwmr_sigma0=0.4)
     X = np.array([[0.0, 0.0], [0.18, -0.09]], dtype=float)
     model.fit(X[:1])
     mu_pa = model.weights_.copy()
