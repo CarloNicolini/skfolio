@@ -10,9 +10,9 @@ from skfolio.optimization.online._projection import (
     ProjectionConfig,
     AutoProjector,
 )
-from skfolio.optimization.online._ftrl import FTRL, SwordMeta, LastGradPredictor
-from skfolio.optimization.online._mixins import OnlineFamily
-from skfolio.optimization.online._base import OPS
+from skfolio.optimization.online._ftrl import _FTRLEngine, SwordMeta, LastGradPredictor
+from skfolio.optimization.online._mixins import FTRLStrategy
+from skfolio.optimization.online._base import FTRLProximal
 from skfolio.optimization.online._utils import net_to_relatives
 
 
@@ -50,8 +50,8 @@ def test_sword_var_simplex_and_zero_grad_stability():
         dtype=float,
     )
 
-    model = OPS(
-        objective=OnlineFamily.SWORD_VAR,
+    model = FTRLProximal(
+        objective=FTRLStrategy.SWORD_VAR,
         ftrl=False,  # OMD
         learning_rate=0.1,
         warm_start=False,
@@ -72,14 +72,14 @@ def test_sword_meta_weights_shift_to_better_expert():
     d = 3
     proj = IdentityProjector()
     # Use Euclidean maps; we'll manually set current iterations
-    e1 = FTRL(
+    e1 = _FTRLEngine(
         mirror_map=AdaptiveMahalanobisMap(eps=1e-8),
         projector=proj,
         eta=0.1,
         predictor=None,
         mode="omd",
     )
-    e2 = FTRL(
+    e2 = _FTRLEngine(
         mirror_map=AdaptiveMahalanobisMap(eps=1e-8),
         projector=proj,
         eta=0.1,
@@ -103,7 +103,7 @@ def test_sword_meta_weights_shift_to_better_expert():
     assert meta._alpha[0] > meta._alpha[1]
 
 
-@pytest.mark.parametrize("objective", [OnlineFamily.SWORD_BEST, OnlineFamily.SWORD_PP])
+@pytest.mark.parametrize("objective", [FTRLStrategy.SWORD_BEST, FTRLStrategy.SWORD_PP])
 def test_ops_integration_sword_best_and_pp(objective):
     rng = np.random.default_rng(0)
     T, n = 20, 5
@@ -112,7 +112,7 @@ def test_ops_integration_sword_best_and_pp(objective):
     trend = np.linspace(-0.01, 0.01, T)[:, None]
     X = base + np.concatenate([trend, -trend, np.zeros((T, n - 2))], axis=1)
 
-    model = OPS(
+    model = FTRLProximal(
         objective=objective,
         ftrl=False,
         learning_rate=0.1,

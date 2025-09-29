@@ -12,15 +12,12 @@ class RegretType(AutoEnum):
     STATIC = auto()
 
 
-class OnlineFamily(AutoEnum):
+class FTRLStrategy(AutoEnum):
     OGD = auto()
     EG = auto()
-    FOLLOW_THE_LEADER = auto()
-    FOLLOW_THE_LOSER = auto()
     SMOOTH_PRED = auto()
     ADAGRAD = auto()
-    ADABARRONS = auto()  # https://arxiv.org/pdf/2202.07574
-    # Sword algorithms - smoothness-aware dynamic regret optimization
+    ADABARRONS = auto()
     SWORD_SMALL = auto()
     SWORD_VAR = auto()
     SWORD_BEST = auto()
@@ -28,10 +25,11 @@ class OnlineFamily(AutoEnum):
     SWORD = SWORD_VAR
 
 
-class LoserStrategy(AutoEnum):
+class MeanReversionStrategy(AutoEnum):
     """
-    Follow-the-Loser families (mean-reversion):
-    - OLMAR: Online Moving Average Reversion (1/2)
+    Mean-reversion families (mean-reversion).
+
+    - OLMAR: Online Moving Average Reversion ("1" or "2" version based on "olmar_order")
     - PAMR: Passive-Aggressive Mean Reversion
     - CWMR: Confidence-Weighted Mean Reversion (distributional, second-order)
     """
@@ -52,7 +50,7 @@ class OnlineMixin:
 
 class OnlineParameterConstraintsMixin:
     _parameter_constraints: ClassVar[dict] = {
-        "objective": [StrOptions({m.value for m in OnlineFamily})],
+        "objective": [StrOptions({m.value for m in FTRLStrategy})],
         "ftrl": ["boolean"],
         "batch_size": [Interval(Integral, 1, None, closed="left")],
         "learning_rate": [Interval(Real, 0, None, closed="neither"), callable],

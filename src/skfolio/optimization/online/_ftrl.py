@@ -45,7 +45,7 @@ class SmoothPredictor:  # for implementing Optimistic Hedge (OHD)
         return np.clip(self.last_grad, -self.smoothness_L, self.smoothness_L)
 
 
-class FTRL:
+class _FTRLEngine:
     r"""Implements a unified engine for Online Mirror Descent (OMD) and
     Follow-the-Regularized-Leader (FTRL).
 
@@ -206,7 +206,7 @@ class FTRL:
 
 
 class SwordMeta:
-    """
+    r"""
     Meta-aggregator for SWORD experts using exponential weights.
 
     - Maintains K experts (FTRL engines), e.g., [SWORD-Var, SWORD-Small, (EG for SWORD++)].
@@ -215,14 +215,15 @@ class SwordMeta:
     - Advances each expert with .step(g_t) to get x_{t+1}^{(k)}.
     - Plays the projected mixture x_{t+1} = Proj( sum_k alpha_k x_{t+1}^{(k)} ).
 
-    Notes:
+    Notes
+    -----
     - Experts are created with IdentityProjector to avoid constraint duplication.
     - Final mixture is projected using the full AutoProjector to satisfy constraints.
     """
 
     def __init__(
         self,
-        experts: list[FTRL],
+        experts: list[_FTRLEngine],
         projector: BaseProjector,
         eta_meta: EtaSchedule = 1.0,
     ):

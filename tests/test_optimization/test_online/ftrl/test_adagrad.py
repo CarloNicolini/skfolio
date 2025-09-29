@@ -1,6 +1,6 @@
 import numpy as np
 
-from skfolio.optimization.online._ftrl import FTRL
+from skfolio.optimization.online._ftrl import _FTRLEngine
 from skfolio.optimization.online._mirror_maps import AdaptiveMahalanobisMap
 from skfolio.optimization.online._projection import IdentityProjector
 
@@ -33,7 +33,9 @@ def test_adagrad_off_by_one_accumulation_order_is_previous_only():
     # This test asserts that the per-round diagonal used BEFORE the update does not yet include g_t.
     d = 3
     spy = SpyMahalanobis(eps=1e-10)
-    eng = FTRL(mirror_map=spy, projector=IdentityProjector(), eta=1.0, mode="omd")
+    eng = _FTRLEngine(
+        mirror_map=spy, projector=IdentityProjector(), eta=1.0, mode="omd"
+    )
     grads = gen_repeated_single_coord_grads(d=d, T=2, coord=0, val=3.0)
 
     # Step 1: before update, h should be sqrt(eps) on all coords
@@ -58,14 +60,18 @@ def test_adagrad_scale_free_trajectory_under_scalar_rescaling():
 
     # Base run
     map_a = AdaptiveMahalanobisMap(eps=1e-10)
-    eng_a = FTRL(mirror_map=map_a, projector=IdentityProjector(), eta=0.5, mode="omd")
+    eng_a = _FTRLEngine(
+        mirror_map=map_a, projector=IdentityProjector(), eta=0.5, mode="omd"
+    )
     Wa = [eng_a.step(g).copy() for g in grads]
     Wa = np.vstack(Wa)
 
     # Scaled run: gradients * c, same eta
     c = 10.0
     map_b = AdaptiveMahalanobisMap(eps=1e-10)
-    eng_b = FTRL(mirror_map=map_b, projector=IdentityProjector(), eta=0.5, mode="omd")
+    eng_b = _FTRLEngine(
+        mirror_map=map_b, projector=IdentityProjector(), eta=0.5, mode="omd"
+    )
     Wb = [eng_b.step(c * g).copy() for g in grads]
     Wb = np.vstack(Wb)
     # Trajectories should be very close
@@ -77,7 +83,7 @@ def test_adagrad_extreme_coordinate_hits_do_not_numerically_blow_up():
     # without causing NaNs in the adaptive geometry.
     d, T = 4, 10
     grads = [np.array([1e6, 0.0, 0.0, 0.0])] + [np.zeros(d)] * (T - 1)
-    eng = FTRL(
+    eng = _FTRLEngine(
         mirror_map=AdaptiveMahalanobisMap(eps=1e-12),
         projector=IdentityProjector(),
         eta=1.0,

@@ -1,6 +1,6 @@
 import warnings
 from collections.abc import Callable
-from typing import Any, Literal, cast
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -9,7 +9,7 @@ from sklearn.utils.validation import _check_sample_weight, validate_data
 import skfolio.typing as skt
 from skfolio.optimization._base import BaseOptimization
 from skfolio.optimization.online._ftrl import (
-    FTRL,
+    _FTRLEngine,
     LastGradPredictor,
     Predictor,
     SwordMeta,
@@ -21,19 +21,17 @@ from skfolio.optimization.online._mirror_maps import (
     BaseMirrorMap,
     EntropyMirrorMap,
     EuclideanMirrorMap,
-    TsallisMirrorMap,
 )
 from skfolio.optimization.online._mixins import (
-    OnlineFamily,
+    FTRLStrategy,
     OnlineMixin,
     OnlineParameterConstraintsMixin,
 )
 from skfolio.optimization.online._projection import (
     AutoProjector,
-    ProjectionConfig,
     IdentityProjector,
+    ProjectionConfig,
 )
-from skfolio.optimization.online._regularizers import Regularizer
 from skfolio.optimization.online._utils import CLIP_EPSILON, net_to_relatives
 from skfolio.utils.tools import input_to_array
 
@@ -149,8 +147,10 @@ class OnlinePortfolioSelection(
         )
 
 
-class OPS(OnlinePortfolioSelection):
-    """OPS: Online Portfolio Selection via Online Convex Optimization.
+class FTRLProximal(OnlinePortfolioSelection):
+    """FTRLProximal: Online Portfolio Selection via Online Convex Optimization.
+
+    It unifies FTRL and OMD through the lens of FTRL-Proximal, which is a unified framework for FTRL and OMD.
 
     Implements standard first-order OCO methods:
     - Mirror Descent family: OGD, EG
@@ -176,15 +176,14 @@ class OPS(OnlinePortfolioSelection):
 
     def __init__(
         self,
-        objective: OnlineFamily = OnlineFamily.EG,
+        objective: FTRLStrategy = FTRLStrategy.EG,
         *,
         ftrl: bool = False,
         warm_start: bool = True,
         initial_weights: npt.ArrayLike | None = None,
+        previous_weights: skt.MultiInput | None = None,
         learning_rate: float | Callable[[int], float] = 0.05,
         smooth_prediction: bool = False,
-        previous_weights: skt.MultiInput | None = None,
-        regularizer: Regularizer | None = None,
         transaction_costs: skt.MultiInput = 0.0,
         management_fees: skt.MultiInput = 0.0,
         groups: skt.Groups | None = None,
@@ -419,7 +418,6 @@ class OPS(OnlinePortfolioSelection):
         # Public configuration
         self.objective = objective
         self.learning_rate = learning_rate
-        self.regularizer = regularizer
         self.ftrl = ftrl
         self.smooth_epsilon = float(smooth_epsilon)
         self.adagrad_D = adagrad_D
@@ -453,7 +451,7 @@ class OPS(OnlinePortfolioSelection):
         self.variance_bound = variance_bound
 
         # Internal state (initialized deterministically)
-        self._ftrl_engine: FTRL | None = None
+        self._ftrl_engine: _FTRLEngine | None = None
         self._cumulative_loss: float = 0.0
 
     def _ensure_initialized(self, gross_relatives: np.ndarray) -> None:
@@ -487,44 +485,44 @@ class OPS(OnlinePortfolioSelection):
             if self.smooth_prediction:
                 predictor = LastGradPredictor()
 
-            if self.objective == OnlineFamily.EG:
+            if self.objective == FTRLStrategy.EG:
                 mirror_map = EntropyMirrorMap()
-            elif self.objective == OnlineFamily.OGD:
+            elif self.objective == FTRLStrategy.OGD:
                 mirror_map = EuclideanMirrorMap()
-            elif self.objective == OnlineFamily.ADAGRAD:
+            elif self.objective == FTRLStrategy.ADAGRAD:
                 mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
-            elif self.objective == OnlineFamily.ADABARRONS:
+            elif self.objective == FTRLStrategy.ADABARRONS:
                 mirror_map = AdaptiveLogBarrierMap()
-            elif self.objective in (OnlineFamily.SWORD_VAR, OnlineFamily.SWORD):
+            elif self.objective in (FTRLStrategy.SWORD_VAR, FTRLStrategy.SWORD):
                 # SWORD-Var: variation-adaptive OMD with optimistic gradients
                 predictor = LastGradPredictor()
                 mirror_map = AdaptiveVariationMap(eps=self.adagrad_eps)
-            elif self.objective == OnlineFamily.SWORD_SMALL:
+            elif self.objective == FTRLStrategy.SWORD_SMALL:
                 # SWORD-Small: AdaGrad geometry with optimistic gradients
                 predictor = LastGradPredictor()
                 mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
-            elif self.objective in (OnlineFamily.SWORD_BEST, OnlineFamily.SWORD_PP):
+            elif self.objective in (FTRLStrategy.SWORD_BEST, FTRLStrategy.SWORD_PP):
                 # Meta-aggregator combining SWORD-Var and SWORD-Small, plus EG for ++
                 predictor_var = LastGradPredictor()
                 predictor_small = LastGradPredictor()
-                var_engine = FTRL(
+                var_engine = _FTRLEngine(
                     mirror_map=AdaptiveVariationMap(eps=self.adagrad_eps),
                     projector=IdentityProjector(),  # inner unconstrained
                     eta=self.learning_rate,
                     predictor=predictor_var,
                     mode="omd",
                 )
-                small_engine = FTRL(
+                small_engine = _FTRLEngine(
                     mirror_map=AdaptiveMahalanobisMap(eps=self.adagrad_eps),
                     projector=IdentityProjector(),
                     eta=self.learning_rate,
                     predictor=predictor_small,
                     mode="omd",
                 )
-                experts: list[FTRL] = [var_engine, small_engine]
-                if self.objective == OnlineFamily.SWORD_PP:
+                experts: list[_FTRLEngine] = [var_engine, small_engine]
+                if self.objective == FTRLStrategy.SWORD_PP:
                     # add an entropy-geometry expert to stabilize/explore
-                    eg_engine = FTRL(
+                    eg_engine = _FTRLEngine(
                         mirror_map=EntropyMirrorMap(),
                         projector=IdentityProjector(),
                         eta=self.learning_rate,
@@ -546,7 +544,7 @@ class OPS(OnlinePortfolioSelection):
             if self._ftrl_engine is None:
                 assert mirror_map is not None
                 assert self._projector is not None
-                self._ftrl_engine = FTRL(
+                self._ftrl_engine = _FTRLEngine(
                     mirror_map=mirror_map,
                     projector=self._projector,
                     eta=self.learning_rate,
@@ -566,7 +564,7 @@ class OPS(OnlinePortfolioSelection):
         y: npt.ArrayLike | None = None,
         sample_weight: npt.ArrayLike | None = None,
         **fit_params: Any,
-    ) -> "OPS":
+    ) -> "FTRLProximal":
         """Perform one online update with a single period of net returns.
 
         In OCO, ``partial_fit`` is the core update and must receive exactly one
@@ -659,7 +657,7 @@ class OPS(OnlinePortfolioSelection):
         else:
             raise RuntimeError("FTRL Engine not initialized")
 
-        if self.eg_tilde and self.objective == OnlineFamily.EG:
+        if self.eg_tilde and self.objective == FTRLStrategy.EG:
             if callable(self.eg_tilde_alpha):
                 alpha_t = self.eg_tilde_alpha(self._ftrl_engine._t)
             else:
@@ -688,7 +686,7 @@ class OPS(OnlinePortfolioSelection):
         X: npt.ArrayLike,
         y: npt.ArrayLike | None = None,
         **fit_params: Any,
-    ) -> "OPS":
+    ) -> "FTRLProximal":
         """Iterate over rows and call :meth:`partial_fit` for each period.
 
         In OCO, ``fit`` is a convenience wrapper. It does not aggregate gradients or

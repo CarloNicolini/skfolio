@@ -1,9 +1,9 @@
 import numpy as np
 import pytest
 
-from skfolio.optimization.online import OPS, RegretType, regret
+from skfolio.optimization.online import FTRLProximal, RegretType, regret
 from skfolio.optimization.online._benchmark import BCRP
-from skfolio.optimization.online._mixins import OnlineFamily
+from skfolio.optimization.online._mixins import FTRLStrategy
 from skfolio.optimization.online._utils import CLIP_EPSILON, net_to_relatives
 
 
@@ -32,7 +32,7 @@ def _iid_relatives(T: int, n: int, seed: int = 0, sigma: float = 0.02) -> np.nda
 
 
 @pytest.mark.parametrize(
-    "objective", [OnlineFamily.EG, OnlineFamily.OGD, OnlineFamily.ADAGRAD]
+    "objective", [FTRLStrategy.EG, FTRLStrategy.OGD, FTRLStrategy.ADAGRAD]
 )
 def test_static_regret_matches_manual(objective):
     """
@@ -44,7 +44,9 @@ def test_static_regret_matches_manual(objective):
     X_net = relatives - 1.0
 
     # Online estimator
-    est_for_regret = OPS(objective=objective, learning_rate=0.1, warm_start=False)
+    est_for_regret = FTRLProximal(
+        objective=objective, learning_rate=0.1, warm_start=False
+    )
 
     # Compute regret curve via public API
     r_curve = regret(
@@ -54,9 +56,9 @@ def test_static_regret_matches_manual(objective):
     assert np.all(np.isfinite(r_curve))
 
     # Manual recomputation using fresh estimators
-    est_manual = OPS(objective=objective, learning_rate=0.1, warm_start=False).fit(
-        X_net
-    )
+    est_manual = FTRLProximal(
+        objective=objective, learning_rate=0.1, warm_start=False
+    ).fit(X_net)
     W_online = est_manual.all_weights_
     R = net_to_relatives(X_net)
     online_losses = _manual_losses_from_weights(R, W_online)
@@ -83,19 +85,23 @@ def test_regret_average_modes_consistency_static():
     relatives = _iid_relatives(T, n, seed=2)
     X_net = relatives - 1.0
 
-    est = OPS(objective=OnlineFamily.EG, learning_rate=0.1, warm_start=False)
+    est = FTRLProximal(objective=FTRLStrategy.EG, learning_rate=0.1, warm_start=False)
 
     r_running = regret(
         estimator=est, X=X_net, regret_type=RegretType.STATIC, average=True
     )
     r_running_str = regret(
-        estimator=OPS(objective=OnlineFamily.EG, learning_rate=0.1, warm_start=False),
+        estimator=FTRLProximal(
+            objective=FTRLStrategy.EG, learning_rate=0.1, warm_start=False
+        ),
         X=X_net,
         regret_type=RegretType.STATIC,
         average="running",
     )
     r_final = regret(
-        estimator=OPS(objective=OnlineFamily.EG, learning_rate=0.1, warm_start=False),
+        estimator=FTRLProximal(
+            objective=FTRLStrategy.EG, learning_rate=0.1, warm_start=False
+        ),
         X=X_net,
         regret_type=RegretType.STATIC,
         average="final",
@@ -116,7 +122,7 @@ def test_windowed_regret_consistency():
     X_net = relatives - 1.0
     window = 10
 
-    est = OPS(objective=OnlineFamily.OGD, learning_rate=0.1, warm_start=False)
+    est = FTRLProximal(objective=FTRLStrategy.OGD, learning_rate=0.1, warm_start=False)
     # Library curve
     r_win = regret(
         estimator=est,
@@ -127,9 +133,9 @@ def test_windowed_regret_consistency():
     )
 
     # Manual computation
-    est_m = OPS(objective=OnlineFamily.OGD, learning_rate=0.1, warm_start=False).fit(
-        X_net
-    )
+    est_m = FTRLProximal(
+        objective=FTRLStrategy.OGD, learning_rate=0.1, warm_start=False
+    ).fit(X_net)
     W_online = est_m.all_weights_
     R = net_to_relatives(X_net)
     online_losses = _manual_losses_from_weights(R, W_online)
@@ -150,13 +156,13 @@ def test_windowed_regret_consistency():
 @pytest.mark.parametrize(
     "objective",
     [
-        OnlineFamily.EG,
-        OnlineFamily.OGD,
-        OnlineFamily.ADAGRAD,
-        OnlineFamily.SWORD_VAR,
-        OnlineFamily.SWORD_SMALL,
-        OnlineFamily.SWORD_BEST,
-        OnlineFamily.SWORD_PP,
+        FTRLStrategy.EG,
+        FTRLStrategy.OGD,
+        FTRLStrategy.ADAGRAD,
+        FTRLStrategy.SWORD_VAR,
+        FTRLStrategy.SWORD_SMALL,
+        FTRLStrategy.SWORD_BEST,
+        FTRLStrategy.SWORD_PP,
     ],
 )
 def test_random_relatives_static_and_dynamic_regret_curves(objective):
@@ -168,11 +174,13 @@ def test_random_relatives_static_and_dynamic_regret_curves(objective):
     relatives = _iid_relatives(T, n, seed=4)
     X_net = relatives - 1.0
 
-    model = OPS(objective=objective, learning_rate=0.1, warm_start=False)
+    model = FTRLProximal(objective=objective, learning_rate=0.1, warm_start=False)
 
     rs = regret(estimator=model, X=X_net, regret_type=RegretType.STATIC, average=False)
     rd = regret(
-        estimator=OPS(objective=objective, learning_rate=0.1, warm_start=False),
+        estimator=FTRLProximal(
+            objective=objective, learning_rate=0.1, warm_start=False
+        ),
         X=X_net,
         regret_type=RegretType.DYNAMIC,
         average=False,
@@ -197,7 +205,7 @@ def test_dynamic_regret_curve_matches_prefix_comparator_behavior():
     X_net = relatives - 1.0
 
     # Online EG
-    est = OPS(objective=OnlineFamily.EG, learning_rate=0.05, warm_start=False)
+    est = FTRLProximal(objective=FTRLStrategy.EG, learning_rate=0.05, warm_start=False)
     est_fit = est.fit(X_net)
     W_online = est_fit.all_weights_
     R = net_to_relatives(X_net)
@@ -211,7 +219,9 @@ def test_dynamic_regret_curve_matches_prefix_comparator_behavior():
 
     # Library computation
     rd = regret(
-        estimator=OPS(objective=OnlineFamily.EG, learning_rate=0.05, warm_start=False),
+        estimator=FTRLProximal(
+            objective=FTRLStrategy.EG, learning_rate=0.05, warm_start=False
+        ),
         X=X_net,
         regret_type=RegretType.DYNAMIC,
         average=False,

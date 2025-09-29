@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import auto
 from numbers import Integral, Real
-from typing import Any, Optional, Protocol
+from typing import Any, Protocol
 
 import numpy as np
 import numpy.typing as npt
@@ -15,25 +14,31 @@ from sklearn.utils._param_validation import (  # type: ignore
 from sklearn.utils.validation import _check_sample_weight, validate_data
 
 from skfolio.optimization.online._base import OnlinePortfolioSelection
-from skfolio.optimization.online._ftrl import FTRL, LastGradPredictor
+from skfolio.optimization.online._ftrl import _FTRLEngine, LastGradPredictor
 from skfolio.optimization.online._mirror_maps import (
     BaseMirrorMap,
     EntropyMirrorMap,
     EuclideanMirrorMap,
 )
-from skfolio.optimization.online._mixins import LoserStrategy, OLMARVariant
+from skfolio.optimization.online._mixins import MeanReversionStrategy, OLMARVariant
 from skfolio.optimization.online._projection import AutoProjector
 from skfolio.optimization.online._utils import CLIP_EPSILON, net_to_relatives
-from skfolio.utils.tools import AutoEnum
 
 
-class Surrogate(Protocol):
+class SurrogateLoss(Protocol):
     def value(self, w: np.ndarray, phi: np.ndarray) -> float: ...
     def grad(self, w: np.ndarray, phi: np.ndarray) -> np.ndarray: ...
 
 
 @dataclass
-class HingeSurrogate:
+class HingeSurrogateLoss:
+    """
+    Hinge surrogate loss.
+    It has a margin parameter :math:`\\epsilon`.
+    It is defined as:
+    :math:`L_{\\text{hinge}}(w; \\phi, \\epsilon) = \\max(0, \\epsilon - \\phi^T w)`
+    """
+
     epsilon: float
 
     def value(self, w, phi):
@@ -41,11 +46,36 @@ class HingeSurrogate:
         return max(0.0, self.epsilon - m)
 
     def grad(self, w, phi):
+        """
+        Subgradient of the hinge loss.
+        It is defined as:
+        :math:`\\nabla L_{\\text{hinge}}(w; \\phi, \\epsilon) = -\\phi` if :math:`\\epsilon - \\phi^T w > 0`,
+        :math:`\\nabla L_{\\text{hinge}}(w; \\phi, \\epsilon) = 0` otherwise.
+
+        Parameters
+        ----------
+        w : np.ndarray
+            Weights.
+        phi : np.ndarray
+            Predicted price relatives.
+
+        Returns
+        -------
+        np.ndarray
+            Subgradient of the hinge loss.
+        """
         return -phi if (self.epsilon - float(phi @ w) > 0.0) else np.zeros_like(phi)
 
 
 @dataclass
-class SquaredHingeSurrogate:
+class SquaredHingeSurrogateLoss:
+    """
+    Squared hinge surrogate loss.
+    It is a smooth approximation to the hinge loss with a temperature parameter :math:`\\beta`.
+    It is defined as:
+    :math:`L_{\\text{squared_hinge}}(w; \\phi, \\epsilon) = (\\max(0, \\epsilon - \\phi^T w))^2`
+    """
+
     epsilon: float
 
     def value(self, w, phi):
@@ -53,12 +83,36 @@ class SquaredHingeSurrogate:
         return (m * m) if m > 0.0 else 0.0
 
     def grad(self, w, phi):
+        """
+        Subgradient of the squared hinge loss.
+        It is defined as:
+        :math:`\\nabla L_{\\text{squared_hinge}}(w; \\phi, \\epsilon) = -2 \\cdot \\max(0, \\epsilon - \\phi^T w) \\cdot \\phi`
+
+        Parameters
+        ----------
+        w : np.ndarray
+            Weights.
+        phi : np.ndarray
+            Predicted price relatives.
+
+        Returns
+        -------
+        np.ndarray
+            Subgradient of the squared hinge loss.
+        """
         m = self.epsilon - float(phi @ w)
         return (-2.0 * m) * phi if m > 0.0 else np.zeros_like(phi)
 
 
 @dataclass
-class SoftplusSurrogate:
+class SoftplusSurrogateLoss:
+    """
+    Softplus surrogate loss.
+    It is a smooth approximation to the hinge loss with a temperature parameter :math:`\\beta`.
+    It is defined as:
+    :math:`L_{\\text{softplus}}(w; \\phi, \\epsilon) = (1/\\beta) \\log(1 + \\exp(\\beta (\\epsilon - \\phi^T w)))`
+    """
+
     epsilon: float
     beta: float = 5.0
 
@@ -71,6 +125,23 @@ class SoftplusSurrogate:
         return np.log1p(np.exp(z)) / self.beta
 
     def grad(self, w, phi):
+        """
+        Subgradient of the softplus loss.
+        It is defined as:
+        :math:`\\nabla L_{\\text{softplus}}(w; \\phi, \\epsilon) = -\\frac{1}{\\beta} \\cdot \\frac{1}{1 + \\exp(-\\beta (\\epsilon - \\phi^T w))} \\cdot \\phi`
+
+        Parameters
+        ----------
+        w : np.ndarray
+            Weights.
+        phi : np.ndarray
+            _description_
+
+        Returns
+        -------
+        np.ndarray
+            _description_
+        """
         z = self.beta * (self.epsilon - float(phi @ w))
         if z >= 0:
             s = 1.0 / (1.0 + np.exp(-z))
@@ -89,8 +160,11 @@ class BaseReversionPredictor:
 
 
 class OLMAR1Predictor(BaseReversionPredictor):
-    """
-    OLMAR-1 reversion predictor φ_{t+1} with explicit variant.
+    f"""
+    OLMAR-1 reversion predictor.
+    It computes the :math:`\\tilde{x}_{t + 1}` quantity described in the OLMAR paper 
+    by Li and Hoi (2013), Algorithm 1 that is needed to compute the reversion predictor.
+    It is basically a moving average of the inverse of the price relatives up to the window size.
 
     Parameters
     ----------
@@ -98,10 +172,15 @@ class OLMAR1Predictor(BaseReversionPredictor):
         Window size for the predictor.
     variant : OLMARVariant, default=OLMARVariant.OLPS
         Variant of the predictor.
-      - variant="olps":     average of [1, 1/x_T, 1/(x_T x_{T-1}), ..., W terms]
-      - variant="cumprod":  average of [1/x_T, 1/(x_T x_{T-1}), ..., W terms] (no leading 1)
+      - variant=OLMARVariant.OLPS:     average of :math:`[1, 1/x_T, 1/(x_T x_{T - 1}), ..., W terms]`
+      - variant=OLMARVariant.CUMPROD:  average of :math:`[1/x_T, 1/(x_T x_{T - 1}), ..., W terms]` (no leading 1)
 
-    Cold-start rule: if T < W+1, return last observed relative x_T (OLPS schedule).
+    Cold-start rule: if :math:`T < W+1`, return last observed relative :math:`x_T` (OLPS schedule).
+
+    See Also
+    --------
+    .. [1] Li, B., Hoi, S. C. H. (2013). *Online Portfolio Selection: A Survey*.
+           ACM Computing Surveys. Algorithm 11.1
     """
 
     def __init__(self, window: int = 5, variant: OLMARVariant = OLMARVariant.OLPS):
@@ -128,38 +207,49 @@ class OLMAR1Predictor(BaseReversionPredictor):
         if T < W + 1:
             return self._history[-1].copy()
 
-        if self.variant == OLMARVariant.OLPS:
-            d = x_t.shape[0]
-            tmp = np.ones(d, dtype=float)
-            phi = np.zeros(d, dtype=float)
-            for i in range(W):
-                phi += 1.0 / np.maximum(tmp, CLIP_EPSILON)
-                x_idx = T - i - 1  # x_{T - i}
-                tmp = tmp * np.maximum(self._history[x_idx], CLIP_EPSILON)
-            return phi * (1.0 / float(W))
+        match self.variant:
+            case OLMARVariant.OLPS:
+                d = x_t.shape[0]
+                tmp = np.ones(d, dtype=float)
+                phi = np.zeros(d, dtype=float)
+                for i in range(W):
+                    phi += 1.0 / np.maximum(tmp, CLIP_EPSILON)
+                    x_idx = T - i - 1  # x_{T - i}
+                    tmp = tmp * np.maximum(self._history[x_idx], CLIP_EPSILON)
+                return phi * (1.0 / float(W))
 
-        # variant == OLMARVariant.CUMPROD
-        recent = np.stack(self._history[-W:], axis=0)[::-1, :]  # x_T, x_{T-1}, ...
-        cumprods = np.cumprod(np.maximum(recent, CLIP_EPSILON), axis=0)
-        inv = 1.0 / cumprods
-        return inv.mean(axis=0)
+            case OLMARVariant.CUMPROD:
+                recent = np.stack(self._history[-W:], axis=0)[
+                    ::-1, :
+                ]  # x_T, x_{T-1}, ...
+                cumprods = np.cumprod(np.maximum(recent, CLIP_EPSILON), axis=0)
+                inv = 1.0 / cumprods
+                return inv.mean(axis=0)
+            case _:
+                raise ValueError("Unknown variant.")
 
 
 class OLMAR2Predictor(BaseReversionPredictor):
     """
-    OLMAR-2 reversion predictor φ_{t+1} = α·1 + (1−α) (φ_t ./ x_t),  φ_1 = 1.
+    OLMAR-2 reversion predictor :math:`\\varphi_{t+1} = \\alpha \\cdot 1 + (1 - \\alpha) \\cdot (\\varphi_t / x_t)`, :math:`\\varphi_1 = 1`.
+    It is basically an exponential moving average of the inverse of the price relatives.
 
     Parameters
     ----------
     alpha : float, default=0.5
         Alpha parameter for the predictor.
+
+    See Also
+    --------
+    .. [1] Li, B., Hoi, S. C. H. (2013). *Online Portfolio Selection: A Survey*.
+           ACM Computing Surveys. Algorithm 11.1
     """
 
     def __init__(self, alpha: float = 0.5):
         if not (0.0 <= alpha <= 1.0):
             raise ValueError("alpha must be in [0, 1].")
         self.alpha = float(alpha)
-        self._phi: Optional[np.ndarray] = None
+        self._phi: np.ndarray | None = None
 
     def reset(self, d: int) -> None:
         super().reset(d)
@@ -177,7 +267,8 @@ class OLMAR2Predictor(BaseReversionPredictor):
 
 class FTLoser(OnlinePortfolioSelection):
     r"""
-    Follow-the-Loser (FTL) estimator that unifies mean-reversion strategies.
+    Follow-the-Loser (FTL) estimator that unifies multiple mean-reversion strategies
+    under a single estimation pipeline.
 
     Parameters
     ----------
@@ -189,9 +280,9 @@ class FTLoser(OnlinePortfolioSelection):
         predictor) when ``strategy='olmar'``.
     olmar_window : int, default=5
         Window length for the OLMAR-1 predictor (used when ``olmar_order=1``).
-    olmar_variant : {'olps', 'cumprod'}, default='olps'
-        OLMAR-1 variant. ``'olps'`` reproduces the original OLPS Matlab
-        implementation; ``'cumprod'`` removes the leading unit term.
+    olmar_variant : OLMARVariant, default=OLMARVariant.OLPS
+        OLMAR-1 variant. ``OLMARVariant.OLPS`` reproduces the original OLPS Matlab for comparison purposes;
+        implementation; ``OLMARVariant.CUMPROD`` removes the leading unit term.
     olmar_alpha : float, default=0.5
         Exponential smoothing parameter of OLMAR-2 (used when ``olmar_order=2``).
     cwmr_eta : float, default=0.95
@@ -214,11 +305,11 @@ class FTLoser(OnlinePortfolioSelection):
         Surrogate loss used by mirror-descent updates (``update_mode='md'``) for
         OLMAR/PAMR strategies.
     beta : float, default=5.0
-        Sharpness parameter of the ``'softplus'`` surrogate loss.
+        Temperature parameter of the ``'softplus'`` surrogate loss.
     update_mode : {'pa', 'md'}, default='pa'
         Update regime. ``'pa'`` reproduces the classical passive-aggressive
-        closed forms; ``'md'`` activates mirror-descent/FTRL style updates. For
-        CWMR, ``'md'`` performs the OCO formulation introduced in this module.
+        closed forms; ``'md'`` activates mirror-descent/FTRL style updates.
+        For CWMR, ``'md'`` performs the OCO formulation introduced in this module.
     learning_rate : float or callable, default=1.0
         Learning-rate schedule for mirror-descent updates of OLMAR/PAMR. The
         callable signature must be ``learning_rate(t: int) -> float``.
@@ -239,10 +330,15 @@ class FTLoser(OnlinePortfolioSelection):
     .. [2] Li, B., Zhao, P., Hoi, S. C. H., & Gopalkrishnan, V. (2012).
            Confidence Weighted Mean Reversion Strategy for Online Portfolio Selection.
            ACM Transactions on Intelligent Systems and Technology.
+    .. [3] Li, B., Hoi, S. C. (2012) On-Line Portfolio Selection with Moving Average Reversion (2012).
+           https://arxiv.org/pdf/1206.4626
     """
 
     _parameter_constraints: dict = {
-        "strategy": [StrOptions({m.value.lower() for m in LoserStrategy}), None],
+        "strategy": [
+            StrOptions({m.value.lower() for m in MeanReversionStrategy}),
+            None,
+        ],
         "olmar_order": [Interval(Integral, 1, 2, closed="both")],
         "olmar_window": [Interval(Integral, 1, None, closed="left")],
         "olmar_variant": [StrOptions({m.value.lower() for m in OLMARVariant})],
@@ -265,7 +361,7 @@ class FTLoser(OnlinePortfolioSelection):
     def __init__(
         self,
         *,
-        strategy: str | LoserStrategy | None = "olmar",
+        strategy: str | MeanReversionStrategy | None = "olmar",
         olmar_order: int = 1,
         olmar_window: int = 5,
         olmar_alpha: float = 0.5,
@@ -325,10 +421,10 @@ class FTLoser(OnlinePortfolioSelection):
             portfolio_params=portfolio_params,
         )
 
-        self.strategy = self._normalise_strategy(strategy)
+        self.strategy = strategy
         self.olmar_order = int(olmar_order)
         self.olmar_window = int(olmar_window)
-        self.olmar_variant = str(olmar_variant).lower()
+        self.olmar_variant = olmar_variant
         self.olmar_alpha = float(olmar_alpha)
         self.cwmr_eta = float(cwmr_eta)
         self.cwmr_sigma0 = float(cwmr_sigma0)
@@ -345,8 +441,8 @@ class FTLoser(OnlinePortfolioSelection):
         self.mirror = mirror
 
         self._predictor: BaseReversionPredictor | None = None
-        self._surrogate: Surrogate | None = None
-        self._engine: FTRL | None = None
+        self._surrogate: SurrogateLoss | None = None
+        self._engine: _FTRLEngine | None = None
         # status tracking variables
         self._t: int = 0
         self._last_trade_weights_: np.ndarray | None = None
@@ -355,49 +451,39 @@ class FTLoser(OnlinePortfolioSelection):
         self._cwmr_Sdiag: np.ndarray | None = None
         self._cwmr_quantile: float | None = None
 
-    def _normalise_strategy(
-        self, strategy: str | LoserStrategy | None
-    ) -> str:
-        if isinstance(strategy, LoserStrategy):
+    def _normalise_strategy(self, strategy: str | MeanReversionStrategy | None) -> str:
+        if isinstance(strategy, MeanReversionStrategy):
             return strategy.value.lower()
         if strategy is None:
             return "olmar"
         return str(strategy).lower()
 
     def _validate_strategy_combinations(self) -> None:
-        if self.strategy not in {"olmar", "pamr", "cwmr"}:
+        if self.strategy not in list(MeanReversionStrategy):
             raise ValueError("strategy must be one of {'olmar', 'pamr', 'cwmr'}.")
 
-        if self.strategy == "olmar":
-            if self.olmar_order not in (1, 2):
-                raise ValueError("olmar_order must be 1 or 2 when strategy='olmar'.")
-            if self.olmar_order == 1 and self.olmar_window < 1:
-                raise ValueError("olmar_window must be >= 1 when olmar_order=1.")
-            valid_variants = {m.value.lower() for m in OLMARVariant}
-            if self.olmar_variant not in valid_variants:
-                raise ValueError("olmar_variant must be 'olps' or 'cumprod'.")
-            if not 0.0 <= self.olmar_alpha <= 1.0:
-                raise ValueError("olmar_alpha must lie in [0, 1].")
+        match self.strategy:
+            case MeanReversionStrategy.OLMAR:
+                if self.olmar_order == 1 and self.olmar_window < 1:
+                    raise ValueError("olmar_window must be >= 1 when olmar_order=1.")
 
-        if self.strategy == "cwmr":
-            if not 0.5 < self.cwmr_eta < 1.0:
-                raise ValueError("cwmr_eta must belong to the open interval (0.5, 1).")
-            if self.cwmr_sigma0 <= 0.0:
-                raise ValueError("cwmr_sigma0 must be strictly positive.")
-            if self.cwmr_min_var is not None and self.cwmr_min_var < 0.0:
-                raise ValueError("cwmr_min_var cannot be negative.")
-            if self.cwmr_max_var is not None and self.cwmr_max_var < 0.0:
-                raise ValueError("cwmr_max_var cannot be negative.")
-            if (
-                self.cwmr_min_var is not None
-                and self.cwmr_max_var is not None
-                and self.cwmr_max_var < self.cwmr_min_var
-            ):
-                raise ValueError("cwmr_max_var cannot be smaller than cwmr_min_var.")
-            if self.cwmr_mean_lr <= 0.0:
-                raise ValueError("cwmr_mean_lr must be strictly positive.")
-            if self.cwmr_var_lr < 0.0:
-                raise ValueError("cwmr_var_lr cannot be negative.")
+            case MeanReversionStrategy.CWMR:
+                if not 0.5 < self.cwmr_eta < 1.0:
+                    raise ValueError(
+                        "cwmr_eta must belong to the open interval (0.5, 1)."
+                    )
+                if (
+                    self.cwmr_min_var is not None
+                    and self.cwmr_max_var is not None
+                    and self.cwmr_max_var < self.cwmr_min_var
+                ):
+                    raise ValueError(
+                        "cwmr_max_var cannot be smaller than cwmr_min_var."
+                    )
+            case MeanReversionStrategy.PAMR:
+                pass
+            case _:
+                raise ValueError("Unknown strategy.")
 
     def _clip_cwmr_variances(self, diag: np.ndarray) -> np.ndarray:
         """Clip CWMR diagonal variances to the configured bounds."""
@@ -413,7 +499,7 @@ class FTLoser(OnlinePortfolioSelection):
         if self._projector is None:
             self._initialize_projector()
 
-        if self.strategy == "olmar" and self.olmar_order == 1:
+        if self.strategy == MeanReversionStrategy.OLMAR and self.olmar_order == 1:
             if self._predictor is None:
                 self._predictor = OLMAR1Predictor(
                     window=self.olmar_window, variant=self.olmar_variant
@@ -430,11 +516,11 @@ class FTLoser(OnlinePortfolioSelection):
 
         if self.strategy == "olmar" and self._surrogate is None:
             if self.loss == "hinge":
-                self._surrogate = HingeSurrogate(self.epsilon)
+                self._surrogate = HingeSurrogateLoss(self.epsilon)
             elif self.loss == "squared_hinge":
-                self._surrogate = SquaredHingeSurrogate(self.epsilon)
+                self._surrogate = SquaredHingeSurrogateLoss(self.epsilon)
             elif self.loss == "softplus":
-                self._surrogate = SoftplusSurrogate(self.epsilon, self.beta)
+                self._surrogate = SoftplusSurrogateLoss(self.epsilon, self.beta)
             else:
                 raise ValueError("Unknown surrogate loss.")
 
@@ -449,7 +535,7 @@ class FTLoser(OnlinePortfolioSelection):
                     mm = EntropyMirrorMap()
                 else:
                     raise ValueError("Unknown mirror map.")
-                self._engine = FTRL(
+                self._engine = _FTRLEngine(
                     mirror_map=mm,
                     projector=self._projector,
                     eta=self.learning_rate,

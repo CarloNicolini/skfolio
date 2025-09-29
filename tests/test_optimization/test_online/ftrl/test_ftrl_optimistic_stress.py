@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from scipy.special import softmax as softmax_stable
 
-from skfolio.optimization.online._ftrl import FTRL, LastGradPredictor
+from skfolio.optimization.online._ftrl import _FTRLEngine, LastGradPredictor
 from skfolio.optimization.online._mirror_maps import (
     EntropyMirrorMap,
 )
@@ -40,7 +40,9 @@ def gen_high_variation_grads(d=10, T=200, seed=1, mag=1.0):
     return seq
 
 
-def cumulative_post_update_linear_loss(engine: FTRL, grads: list[np.ndarray]) -> float:
+def cumulative_post_update_linear_loss(
+    engine: _FTRLEngine, grads: list[np.ndarray]
+) -> float:
     # We accumulate ⟨x_{t+1}, g_t⟩ after each update (same metric across methods).
     cum = 0.0
     for g in grads:
@@ -54,11 +56,11 @@ def assert_simplex(w: np.ndarray, atol=1e-12):
     assert np.allclose(np.sum(w), 1.0, atol=atol)
 
 
-def new_entropy_engine(eta, predictor=None, projector=None, mode="omd") -> FTRL:
+def new_entropy_engine(eta, predictor=None, projector=None, mode="omd") -> _FTRLEngine:
     proj = projector or AutoProjector(
         ProjectionConfig(lower=0.0, upper=1.0, budget=1.0)
     )
-    return FTRL(
+    return _FTRLEngine(
         mirror_map=EntropyMirrorMap(),
         projector=proj,
         eta=eta,
