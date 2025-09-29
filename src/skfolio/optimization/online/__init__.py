@@ -7,8 +7,8 @@ from skfolio.optimization.online._regret import RegretType, regret
 __all__ = [
     "BCRP",
     "CRP",
-    "FTRLProximal",
     "UCRP",
+    "FTRLProximal",
     "FTRLStrategy",
     "RegretType",
     "regret",

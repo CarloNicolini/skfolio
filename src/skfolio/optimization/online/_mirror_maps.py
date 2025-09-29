@@ -174,6 +174,9 @@ class AdaptiveMahalanobisMap(DynamicMirrorMap):
             self._Gsq = np.zeros(d, dtype=float)
             self._d = d
 
+    def ensure_dim(self, d: int) -> None:
+        self._ensure(d)
+
     def H_diag(self) -> np.ndarray:
         # Pre-geometry: keep absolute eps inside sqrt for numerical safety
         return np.sqrt(self._Gsq + self.eps)

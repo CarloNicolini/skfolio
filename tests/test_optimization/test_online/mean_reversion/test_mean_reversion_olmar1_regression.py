@@ -1,7 +1,7 @@
 # tests/test_optimization/test_online/test_olmar1_phi_regression.py
 import numpy as np
 
-from skfolio.optimization.online._ftloser import FTLoser, OLMAR1Predictor
+from skfolio.optimization.online._mean_reversion import MeanReversion, OLMAR1Predictor
 from skfolio.optimization.online._utils import CLIP_EPSILON
 
 
@@ -66,7 +66,7 @@ def test_olmar1_phi_cold_start_uses_last_relative_until_W_plus_1():
 
 def test_all_weights_are_trading_weights():
     X = np.array([[0.0, 0.0], [0.1, -0.1]], dtype=float)  # net returns
-    model = FTLoser(
+    model = MeanReversion(
         strategy="olmar",
         olmar_order=1,
         olmar_window=2,

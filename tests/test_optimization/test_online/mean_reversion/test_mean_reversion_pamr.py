@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from skfolio.optimization.online._ftloser import FTLoser
+from skfolio.optimization.online._mean_reversion import MeanReversion
 from skfolio.optimization.online._projection import project_box_and_sum
 
 
@@ -11,7 +11,9 @@ def test_pamr_pa_closed_form_projection():
     w_prev = np.array([0.5, 0.5], dtype=float)
     X = np.array([[0.00, 0.00], [0.2, -0.1]], dtype=float)  # second day triggers update
     # Build model but we will do a single PA step by hand for comparison
-    model = FTLoser(strategy="pamr", epsilon=1.0, update_mode="pa", warm_start=False)
+    model = MeanReversion(
+        strategy="pamr", epsilon=1.0, update_mode="pa", warm_start=False
+    )
     model.fit(X[:1])  # day-1: uniform
     model.partial_fit(X[1:2])  # update with day-2
     w_new = model.weights_.copy()
@@ -33,7 +35,7 @@ def test_pamr_pa_closed_form_projection():
 def test_pamr_md_gradient_direction_alignment():
     # Show that MD gradient points along +x when margin>ε; centered -> direction ~ -(x-mean x)
     X = np.array([[0.0, 0.0], [0.3, -0.2]], dtype=float)
-    base = FTLoser(
+    base = MeanReversion(
         strategy="pamr",
         epsilon=1.0,
         update_mode="md",
@@ -57,7 +59,9 @@ def test_pamr_md_gradient_direction_alignment():
 
 def test_pamr_param_validation_raises_on_negative_epsilon():
     # epsilon must be >= 0 by parameter constraints
-    model = FTLoser(strategy="pamr", epsilon=-1.0, update_mode="pa", warm_start=False)
+    model = MeanReversion(
+        strategy="pamr", epsilon=-1.0, update_mode="pa", warm_start=False
+    )
     X = np.array([[0.0, 0.0]], dtype=float)
     with pytest.raises(ValueError):
         # validation should occur during fit

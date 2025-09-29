@@ -274,7 +274,7 @@ class SwordMeta:
         X_next = [e.step(g) for e in self.experts]  # each is shape (d,)
 
         # Mixture and final projection
-        w_mix = np.sum(np.array([a * x for a, x in zip(self._alpha, X_next)]), axis=0)
+        w_mix = np.sum(np.array([a * x for a, x in zip(self._alpha, X_next, strict=False)]), axis=0)
         w_proj = self.projector.project(w_mix)
         self._t += 1
         return w_proj

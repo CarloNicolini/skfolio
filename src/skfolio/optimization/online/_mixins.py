@@ -44,6 +44,13 @@ class OLMARVariant(AutoEnum):
     CUMPROD = auto()
 
 
+class UpdateMode(AutoEnum):
+    """Update mode for mean-reversion strategies."""
+
+    PA = auto()  # Passive-Aggressive (closed-form)
+    MD = auto()  # Mirror Descent (OCO-style)
+
+
 class OnlineMixin:
     n_features_in_: int
 

@@ -1,8 +1,8 @@
 from enum import StrEnum, auto
 from typing import Any
 
-import numpy as np
 import cvxpy as cp
+import numpy as np
 from numpy.typing import ArrayLike
 
 from skfolio.optimization._base import BaseOptimization

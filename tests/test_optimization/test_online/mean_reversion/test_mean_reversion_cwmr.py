@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from scipy.stats import norm
 
-from skfolio.optimization.online._ftloser import FTLoser
+from skfolio.optimization.online._mean_reversion import MeanReversion
 
 
 def _make_cwmr(
@@ -17,8 +17,8 @@ def _make_cwmr(
     cwmr_mean_lr: float = 1.0,
     cwmr_var_lr: float = 1.0,
     **kwargs,
-) -> FTLoser:
-    return FTLoser(
+) -> MeanReversion:
+    return MeanReversion(
         strategy="cwmr",
         epsilon=epsilon,
         update_mode=update_mode,
@@ -51,7 +51,9 @@ def _assert_simplex(paths: np.ndarray) -> None:
     assert np.allclose(paths.sum(axis=1), 1.0, atol=1e-9)
 
 
-def _violation(mu: np.ndarray, sigma: np.ndarray, x: np.ndarray, eps: float, phi: float) -> float:
+def _violation(
+    mu: np.ndarray, sigma: np.ndarray, x: np.ndarray, eps: float, phi: float
+) -> float:
     s = float(np.dot(sigma * x, x))
     return float(np.dot(mu, x)) + phi * np.sqrt(max(s, 0.0)) - eps
 

@@ -9,10 +9,10 @@ from sklearn.utils.validation import _check_sample_weight, validate_data
 import skfolio.typing as skt
 from skfolio.optimization._base import BaseOptimization
 from skfolio.optimization.online._ftrl import (
-    _FTRLEngine,
     LastGradPredictor,
     Predictor,
     SwordMeta,
+    _FTRLEngine,
 )
 from skfolio.optimization.online._mirror_maps import (
     AdaptiveLogBarrierMap,
@@ -93,6 +93,8 @@ class OnlinePortfolioSelection(
         self._is_initialized: bool = False
         self._weights_initialized: bool = False
         self._projector: AutoProjector | None = None
+        self._t: int = 0
+        self._last_trade_weights_: np.ndarray | None = None
 
     def _initialize_projector(self):
         projection_config = ProjectionConfig(
@@ -122,6 +124,116 @@ class OnlinePortfolioSelection(
         else:
             self.weights_ = np.ones(num_assets, dtype=float) / float(num_assets)
         self._weights_initialized = True
+
+    def _validate_and_preprocess_partial_fit_input(
+        self,
+        X: npt.ArrayLike,
+        y: npt.ArrayLike | None = None,
+        sample_weight: npt.ArrayLike | None = None,
+    ) -> np.ndarray:
+        """Validate and preprocess input for partial_fit.
+
+        Returns
+        -------
+        np.ndarray
+            Gross relatives for a single period as 1D array.
+        """
+        # Validate parameters
+        self._validate_params()
+
+        # Check if this is the first call to partial_fit
+        first_call = not hasattr(self, "n_features_in_")
+
+        # Validate input data - reset=True only on first call
+        X = validate_data(
+            self,
+            X=X,
+            y=None,  # y is always ignored in OPS
+            reset=first_call,
+            dtype=float,
+            ensure_2d=False,
+            allow_nd=False,
+            accept_sparse=False,
+        )
+
+        # Handle sample_weight if provided (though it's ignored)
+        if sample_weight is not None:
+            sample_weight = _check_sample_weight(sample_weight, X)
+            warnings.warn(
+                "sample_weight is ignored in OPS.partial_fit (online convex optimization).",
+                UserWarning,
+                stacklevel=3,
+            )
+
+        # Convert to proper shape for partial_fit (single row)
+        net_returns = np.asarray(X, dtype=float)
+
+        # Ensure we have the right shape for partial_fit
+        if net_returns.ndim == 1:
+            # Single sample as 1D array - this is expected for partial_fit
+            pass
+        elif net_returns.ndim == 2:
+            if net_returns.shape[0] > 1:
+                raise ValueError(
+                    "partial_fit expects a single row (one period). Use fit for multiple rows."
+                )
+            # Single sample as 2D array (1, n_features) - squeeze to 1D
+            net_returns = net_returns.squeeze(0)
+        else:
+            raise ValueError("Input must be 1D or 2D array")
+
+        gross_relatives = net_to_relatives(net_returns).squeeze()
+        return gross_relatives
+
+    def _reset_state_for_fit(self) -> None:
+        """Reset internal state when warm_start=False. Subclasses override to add specific state."""
+        self._weights_initialized = False
+        self._is_initialized = False
+        self._projector = None
+        self._t = 0
+        self._last_trade_weights_ = None
+
+    def fit(
+        self,
+        X: npt.ArrayLike,
+        y: npt.ArrayLike | None = None,
+        **fit_params: Any,
+    ) -> "OnlinePortfolioSelection":
+        """Iterate over rows and call partial_fit for each period.
+
+        In OCO, ``fit`` is a convenience wrapper. It does not aggregate gradients or
+        perform multi-epoch training. Each row of ``X`` is processed once in order.
+
+        Parameters
+        ----------
+        X : array-like of shape (T, n_assets) or (n_assets,)
+            Net returns per period.
+        y : Ignored
+            Present for API consistency.
+        **fit_params : Any
+            Additional parameters (unused).
+
+        Returns
+        -------
+        self
+            The estimator instance.
+        """
+        # Validate parameters
+        self._validate_params()
+
+        if not self.warm_start:
+            self._reset_state_for_fit()
+
+        trade_list: list[np.ndarray] = []
+        X_arr = np.asarray(X, dtype=float)
+        for t in range(X_arr.shape[0]):
+            self.partial_fit(X_arr[t][None, :], y, sample_weight=None, **fit_params)
+            if self._last_trade_weights_ is not None:
+                trade_list.append(self._last_trade_weights_.copy())
+
+        if trade_list:
+            self.all_weights_ = np.vstack(trade_list)
+        return self
 
     def _clean_input(
         self,
@@ -558,6 +670,127 @@ class FTRLProximal(OnlinePortfolioSelection):
         # Mark overall init complete
         self._is_initialized = True
 
+    def _compute_effective_relatives(self, gross_relatives: np.ndarray) -> np.ndarray:
+        """Apply management fees to gross relatives.
+
+        Parameters
+        ----------
+        gross_relatives : np.ndarray
+            Gross price relatives for one period.
+
+        Returns
+        -------
+        np.ndarray
+            Effective relatives after applying management fees.
+        """
+        # Apply management fees multiplicatively to gross relatives for Kelly-like gradients
+        effective_relatives = np.maximum(
+            gross_relatives * (1 - self._management_fees_arr), CLIP_EPSILON
+        )
+        return effective_relatives
+
+    def _compute_portfolio_gradient(
+        self, effective_relatives: np.ndarray
+    ) -> np.ndarray:
+        """Compute the portfolio gradient including transaction costs.
+
+        Parameters
+        ----------
+        effective_relatives : np.ndarray
+            Effective price relatives after fees.
+
+        Returns
+        -------
+        np.ndarray
+            Gradient vector for the portfolio optimization.
+        """
+        # Gradient for log-wealth objective
+        denominator = np.dot(self.weights_, effective_relatives)
+        if float(denominator) <= 0:
+            # Handle non-positive return, e.g. by using a small positive constant
+            # or by returning without updating, depending on desired behavior.
+            # For now, we skip the update to avoid division by zero.
+            warnings.warn(
+                "Non-positive portfolio return, skipping update.",
+                UserWarning,
+                stacklevel=3,
+            )
+            gradient = np.zeros_like(self.weights_)
+        else:
+            gradient = -effective_relatives / denominator
+
+        # Add L1 turnover subgradient for transaction costs: grad C_t(b) = c * sign(b - b_prev)
+        if self.transaction_costs and self.previous_weights is not None:
+            prev = np.asarray(self.previous_weights, dtype=float)
+            if prev.shape == self.weights_.shape:
+                delta = self.weights_ - prev
+                gradient += self._transaction_costs_arr * np.sign(delta)
+
+        return gradient
+
+    def _execute_ftrl_step(self, gradient: np.ndarray) -> np.ndarray:
+        """Execute the FTRL optimization step.
+
+        Parameters
+        ----------
+        gradient : np.ndarray
+            Portfolio gradient vector.
+
+        Returns
+        -------
+        np.ndarray
+            New portfolio weights from FTRL step.
+        """
+        if self._ftrl_engine:
+            w_ftrl = self._ftrl_engine.step(gradient)
+        else:
+            raise RuntimeError("FTRL Engine not initialized")
+        return w_ftrl
+
+    def _apply_weights_mixing(self, w_ftrl: np.ndarray) -> np.ndarray:
+        """Apply weights mixing (only for EG-tilde mixing).
+
+        Parameters
+        ----------
+        w_ftrl : np.ndarray
+            Weights from FTRL step.
+
+        Returns
+        -------
+        np.ndarray
+            Final weights.
+        """
+        if not (self.eg_tilde and self.objective == FTRLStrategy.EG):
+            return w_ftrl
+
+        alpha_t = (
+            self.eg_tilde_alpha(self._ftrl_engine._t)
+            if callable(self.eg_tilde_alpha)
+            else self.eg_tilde_alpha
+        )
+
+        if alpha_t <= 0:
+            return w_ftrl
+
+        n = w_ftrl.shape[0]
+        mixed = (1.0 - alpha_t) * w_ftrl + alpha_t / n
+        return self._projector.project(mixed)
+
+    def _finalize_partial_fit_state(self, effective_relatives: np.ndarray) -> None:
+        """Update internal state and compute loss after weight update.
+
+        Parameters
+        ----------
+        effective_relatives : np.ndarray
+            Effective price relatives used for loss computation.
+        """
+        # Compute loss for inspection (optional, can be simplified)
+        final_return = np.dot(self.weights_, effective_relatives)
+        self.loss_ = -np.log(np.maximum(final_return, CLIP_EPSILON))
+        self._cumulative_loss += self.loss_
+        self.previous_weights = self.weights_.copy()
+        self._t += 1
+
     def partial_fit(
         self,
         X: npt.ArrayLike,
@@ -588,141 +821,36 @@ class FTRLProximal(OnlinePortfolioSelection):
         OPS
             The estimator instance.
         """
-        # Validate parameters
-        self._validate_params()
-
-        # Check if this is the first call to partial_fit
-        first_call = not hasattr(self, "n_features_in_")
-
-        # Validate input data - reset=True only on first call
-        X = validate_data(
-            self,
-            X=X,
-            y=None,  # y is always ignored in OPS
-            reset=first_call,
-            dtype=float,
-            ensure_2d=True,
-            allow_nd=False,
-            accept_sparse=False,
+        # Step 1: Validate input and preprocess to gross relatives
+        gross_relatives = self._validate_and_preprocess_partial_fit_input(
+            X, y, sample_weight
         )
 
-        # Handle sample_weight if provided (though it's ignored)
-        if sample_weight is not None:
-            sample_weight = _check_sample_weight(sample_weight, X)
-            warnings.warn(
-                "sample_weight is ignored in OPS.partial_fit (online convex optimization).",
-                UserWarning,
-                stacklevel=2,
-            )
-
-        # Convert to proper shape for partial_fit (single row)
-        net_returns = np.asarray(X, dtype=float)
-        if net_returns.ndim == 2 and net_returns.shape[0] > 1:
-            raise ValueError(
-                "partial_fit expects a single row (one period). Use fit for multiple rows."
-            )
-
-        gross_relatives = net_to_relatives(net_returns).squeeze()
+        # Step 2: Initialize engine and weights if needed
         self._ensure_initialized(gross_relatives)
 
-        # Apply management fees multiplicatively to gross relatives for Kelly-like gradients
-        effective_relatives = np.maximum(
-            gross_relatives * (1 - self._management_fees_arr), CLIP_EPSILON
-        )
+        # Step 3: Apply management fees to get effective relatives
+        effective_relatives = self._compute_effective_relatives(gross_relatives)
 
-        # Gradient for log-wealth objective
-        denominator = np.dot(self.weights_, effective_relatives)
-        if denominator <= 0:
-            # Handle non-positive return, e.g. by using a small positive constant
-            # or by returning without updating, depending on desired behavior.
-            # For now, we skip the update to avoid division by zero.
-            warnings.warn(
-                "Non-positive portfolio return, skipping update.",
-                UserWarning,
-                stacklevel=2,
-            )
-            gradient = np.zeros_like(self.weights_)
-        else:
-            gradient = -effective_relatives / denominator
+        # Step 4: Compute portfolio gradient (including transaction costs)
+        gradient = self._compute_portfolio_gradient(effective_relatives)
 
-        # Add L1 turnover subgradient for transaction costs: grad C_t(b) = c * sign(b - b_prev)
-        if self.transaction_costs and self.previous_weights is not None:
-            prev = np.asarray(self.previous_weights, dtype=float)
-            if prev.shape == self.weights_.shape:
-                delta = self.weights_ - prev
-                gradient += self._transaction_costs_arr * np.sign(delta)
+        # Step 5: Execute FTRL optimization step
+        w_ftrl = self._execute_ftrl_step(gradient)
 
-        if self._ftrl_engine:
-            w_ftrl = self._ftrl_engine.step(gradient)
-        else:
-            raise RuntimeError("FTRL Engine not initialized")
+        # Step 5.5: Store trading weights before update
+        self._last_trade_weights_ = self.weights_.copy()
 
-        if self.eg_tilde and self.objective == FTRLStrategy.EG:
-            if callable(self.eg_tilde_alpha):
-                alpha_t = self.eg_tilde_alpha(self._ftrl_engine._t)
-            else:
-                alpha_t = self.eg_tilde_alpha
+        # Step 6: Apply post-processing (e.g., EG-tilde mixing)
+        self.weights_ = self._apply_weights_mixing(w_ftrl)
 
-            if alpha_t > 0:
-                n = w_ftrl.shape[0]
-                uniform_weights = np.ones(n) / n
-                mixed = (1.0 - alpha_t) * w_ftrl + alpha_t * uniform_weights
-                assert self._projector is not None
-                self.weights_ = self._projector.project(mixed)
-            else:
-                self.weights_ = w_ftrl
-        else:
-            self.weights_ = w_ftrl
+        # Step 7: Update internal state and compute loss
+        self._finalize_partial_fit_state(effective_relatives)
 
-        self.previous_weights = self.weights_.copy()
-        # Compute loss for inspection (optional, can be simplified)
-        final_return = np.dot(self.weights_, effective_relatives)
-        self.loss_ = -np.log(np.maximum(final_return, CLIP_EPSILON))
-        self._cumulative_loss += self.loss_
         return self
 
-    def fit(
-        self,
-        X: npt.ArrayLike,
-        y: npt.ArrayLike | None = None,
-        **fit_params: Any,
-    ) -> "FTRLProximal":
-        """Iterate over rows and call :meth:`partial_fit` for each period.
-
-        In OCO, ``fit`` is a convenience wrapper. It does not aggregate gradients or
-        perform multi-epoch training. Each row of ``X`` is processed once in order.
-
-        Parameters
-        ----------
-        X : array-like of shape (T, n_assets) or (n_assets,)
-            Net returns per period.
-        y : Ignored
-            Present for API consistency.
-        **fit_params : Any
-            Additional parameters (unused).
-
-        Returns
-        -------
-        OPS
-            The estimator instance.
-        """
-        # Validate parameters
-        self._validate_params()
-
-        if not self.warm_start:
-            # Do not assign None to typed attributes; just mark flags and reset internals
-            self._weights_initialized = False
-            self._is_initialized = False
-            self._ftrl_engine = None
-            self._projector = None
-            self._cumulative_loss = 0.0
-
-        self.all_weights_ = np.vstack(
-            [
-                self.partial_fit(
-                    row[None, :], y, sample_weight=None, **fit_params
-                ).weights_
-                for row in np.asarray(X)
-            ]
-        )
-        return self
+    def _reset_state_for_fit(self) -> None:
+        """Reset internal state when warm_start=False."""
+        super()._reset_state_for_fit()
+        self._ftrl_engine = None
+        self._cumulative_loss = 0.0

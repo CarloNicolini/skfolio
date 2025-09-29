@@ -3,7 +3,7 @@ import pytest
 
 from skfolio.moments import DenoiseCovariance
 from skfolio.optimization.online._benchmark import BCRP
-from skfolio.optimization.online._ftloser import FTLoser
+from skfolio.optimization.online._mean_reversion import MeanReversion
 from skfolio.prior import EmpiricalPrior
 
 
@@ -78,7 +78,7 @@ def test_olmar_toy_markets(name, pattern, k, period):
     n = 10 * period
     R = build_market(pattern, n)
     X = to_net(R)
-    model = FTLoser(
+    model = MeanReversion(
         strategy="olmar",
         olmar_order=1,
         olmar_window=k,
