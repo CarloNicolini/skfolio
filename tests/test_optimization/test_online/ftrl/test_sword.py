@@ -1,41 +1,13 @@
 import numpy as np
 import pytest
 
+from skfolio.optimization.online._base import FTRLProximal
+from skfolio.optimization.online._ftrl import SwordMeta, _FTRLEngine
 from skfolio.optimization.online._mirror_maps import (
-    AdaptiveVariationMap,
     AdaptiveMahalanobisMap,
 )
-from skfolio.optimization.online._projection import (
-    IdentityProjector,
-    ProjectionConfig,
-    AutoProjector,
-)
-from skfolio.optimization.online._ftrl import _FTRLEngine, SwordMeta, LastGradPredictor
 from skfolio.optimization.online._mixins import FTRLStrategy
-from skfolio.optimization.online._base import FTRLProximal
-from skfolio.optimization.online._utils import net_to_relatives
-
-
-def test_adaptive_variation_map_invertibility_and_update():
-    d = 4
-    m = AdaptiveVariationMap(d=d, eps=1e-10)
-    w = np.array([0.2, 0.3, 0.1, 0.4])
-    # At init: g_last=None -> H = sqrt(eps)
-    z = m.grad_psi(w)
-    w_back = m.grad_psi_star(z)
-    assert np.allclose(w, w_back, atol=1e-10)
-
-    # Provide a gradient and update; ensure H increases where delta != 0
-    g1 = np.array([1.0, 0.0, 0.0, 0.0])
-    m.update_state(g1)
-    h1 = m._H_diag_current().copy()
-
-    g2 = np.array([2.0, 1.0, 0.0, -1.0])
-    m.update_state(g2)
-    h2 = m._H_diag_current().copy()
-
-    assert np.all(h2 >= h1 - 1e-15)  # monotone nondecreasing
-    assert np.any(h2 > h1 + 1e-12)  # at least one coordinate increased
+from skfolio.optimization.online._projection import IdentityProjector
 
 
 def test_sword_var_simplex_and_zero_grad_stability():
@@ -51,7 +23,7 @@ def test_sword_var_simplex_and_zero_grad_stability():
     )
 
     model = FTRLProximal(
-        objective=FTRLStrategy.SWORD_VAR,
+        strategy=FTRLStrategy.SWORD_VAR,
         ftrl=False,  # OMD
         learning_rate=0.1,
         warm_start=False,
@@ -73,14 +45,14 @@ def test_sword_meta_weights_shift_to_better_expert():
     proj = IdentityProjector()
     # Use Euclidean maps; we'll manually set current iterations
     e1 = _FTRLEngine(
-        mirror_map=AdaptiveMahalanobisMap(eps=1e-8),
+        mirror_map=AdaptiveMahalanobisMap(),
         projector=proj,
         eta=0.1,
         predictor=None,
         mode="omd",
     )
     e2 = _FTRLEngine(
-        mirror_map=AdaptiveMahalanobisMap(eps=1e-8),
+        mirror_map=AdaptiveMahalanobisMap(),
         projector=proj,
         eta=0.1,
         predictor=None,
@@ -113,7 +85,7 @@ def test_ops_integration_sword_best_and_pp(objective):
     X = base + np.concatenate([trend, -trend, np.zeros((T, n - 2))], axis=1)
 
     model = FTRLProximal(
-        objective=objective,
+        strategy=objective,
         ftrl=False,
         learning_rate=0.1,
         warm_start=False,

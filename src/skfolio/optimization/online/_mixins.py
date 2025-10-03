@@ -15,7 +15,6 @@ class RegretType(AutoEnum):
 class FTRLStrategy(AutoEnum):
     OGD = auto()
     EG = auto()
-    SMOOTH_PRED = auto()
     ADAGRAD = auto()
     ADABARRONS = auto()
     SWORD_SMALL = auto()
@@ -29,7 +28,6 @@ class MeanReversionStrategy(AutoEnum):
     """
     Mean-reversion families (mean-reversion).
 
-    - OLMAR: Online Moving Average Reversion ("1" or "2" version based on "olmar_order")
     - PAMR: Passive-Aggressive Mean Reversion
     - CWMR: Confidence-Weighted Mean Reversion (distributional, second-order)
     """
@@ -39,9 +37,20 @@ class MeanReversionStrategy(AutoEnum):
     CWMR = auto()
 
 
-class OLMARVariant(AutoEnum):
-    OLPS = auto()
-    CUMPROD = auto()
+class PAMRVariant(AutoEnum):
+    """Variants for Passive-Aggressive Mean Reversion (PAMR).
+
+    - SIMPLE: the original PAMR formula with τ = loss / ||c||²
+    - SLACK_LINEAR: introduces a linear slack variable ξ with weight C (PAMR-1)
+                    τ = min(C, loss / ||c||²)
+    - SLACK_QUADRATIC: quadratic slack regularisation ξ² with weight C (PAMR-2)
+                       τ = loss / (||c||² + 1/(2C))
+    See Li & Hoi book (2012), Equations 9.2, 9.3, 9.4.
+    """
+
+    SIMPLE = auto()  # PAMR (original)
+    SLACK_LINEAR = auto()  # PAMR-1
+    SLACK_QUADRATIC = auto()  # PAMR-2
 
 
 class UpdateMode(AutoEnum):
@@ -49,6 +58,18 @@ class UpdateMode(AutoEnum):
 
     PA = auto()  # Passive-Aggressive (closed-form)
     MD = auto()  # Mirror Descent (OCO-style)
+
+
+class OLMARPredictor(AutoEnum):
+    """Predictor for OLMAR strategy.
+
+    Two variants are implemented from the Li and Hoi "Online Portfolio Selection" book:
+    - MAR-1 (SMA) Simple Moving Average Eq. 11.1 ("1" version in OLMAR)
+    - MAR-2 (EWMA) Exponentially Weighted Moving Average Eq. 11.2 ("2" version in OLMAR)
+    """
+
+    SMA = "sma"
+    EWMA = "ewma"  # Exponentially Weighted Moving Average
 
 
 class OnlineMixin:
@@ -93,7 +114,7 @@ class OnlineParameterConstraintsMixin:
         "portfolio_params": [dict, None],
         "smooth_epsilon": [Interval(Real, 0, None, closed="neither")],
         "adagrad_D": [Interval(Real, 0, None, closed="neither"), "array-like", None],
-        "adagrad_eps": [Interval(Real, 0, 1e-3, closed="both"), None],
+        "adagrad_eps": [Interval(Real, 1e-12, 1e-3, closed="both"), None],
         "eg_tilde": ["boolean"],
         "eg_tilde_alpha": [Interval(Real, 0, 1, closed="both"), callable, None],
     }

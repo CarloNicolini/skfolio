@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from scipy.special import softmax as softmax_stable
 
-from skfolio.optimization.online._ftrl import _FTRLEngine, LastGradPredictor
+from skfolio.optimization.online._ftrl import LastGradPredictor, _FTRLEngine
 from skfolio.optimization.online._mirror_maps import (
     EntropyMirrorMap,
 )
@@ -10,6 +10,7 @@ from skfolio.optimization.online._projection import (
     AutoProjector,
     ProjectionConfig,
 )
+from ..utils import assert_box_budget
 
 
 def mult_weights_update(
@@ -49,11 +50,6 @@ def cumulative_post_update_linear_loss(
         x_next = engine.step(g)
         cum += float(np.dot(x_next, g))
     return cum
-
-
-def assert_simplex(w: np.ndarray, atol=1e-12):
-    assert np.all(w >= -1e-12)
-    assert np.allclose(np.sum(w), 1.0, atol=atol)
 
 
 def new_entropy_engine(eta, predictor=None, projector=None, mode="omd") -> _FTRLEngine:
@@ -175,12 +171,12 @@ def test_entropy_ftrl_and_omd_with_extreme_eta_remain_in_simplex():
     grads = [rng.normal(size=d) for _ in range(T)]
     eta = 1e6
 
-    omd = new_entropy_engine(eta=eta, predictor=LastGradPredictor())
+    omd = new_entropy_engine(eta=eta, predictor=LastGradPredictor(), mode="omd")
     ftr = new_entropy_engine(eta=eta, predictor=LastGradPredictor(), mode="ftrl")
 
     for g in grads:
         w1 = omd.step(g)
         w2 = ftr.step(g)
         assert np.all(np.isfinite(w1)) and np.all(np.isfinite(w2))
-        assert_simplex(w1)
-        assert_simplex(w2)
+        assert_box_budget(w1)
+        assert_box_budget(w2)

@@ -47,7 +47,8 @@ class SmoothPredictor:  # for implementing Optimistic Hedge (OHD)
 
 class _FTRLEngine:
     r"""Implements a unified engine for Online Mirror Descent (OMD) and
-    Follow-the-Regularized-Leader (FTRL).
+    Follow-the-Regularized-Leader (FTRL) through COMID (Composite-Objective Mirror Descent); Duchi et al., COLT 2010).
+    The helper _composite_update solves min ⟨η_t ĝ, w⟩ + ψ(w) with ψ un-linearised, exactly the COMID step.
 
     This engine provides the core logic for first-order online convex optimization
     algorithms, framed through the modern lens of FTRL-Proximal and dual averaging
@@ -72,7 +73,7 @@ class _FTRLEngine:
     OMD and FTRL can be made mathematically equivalent. This engine implements the
     FTRL-Proximal formulation, which can exactly reproduce OMD by choosing a
     time-varying proximal regularizer. The core solver method
-    `_solve_argmin_lin_plus_reg` implements this unified objective.
+    `_composite_update` implements this unified objective.
 
     Optimistic Updates
     ------------------
@@ -104,12 +105,14 @@ class _FTRLEngine:
         eta: EtaSchedule = 1.0,
         predictor: Predictor | None = None,
         mode: Literal["omd", "ftrl"] = "omd",
+        skip_auto_update: bool = False,
     ):
         self.map = mirror_map
         self.projector = projector
         self.eta = eta
         self.predictor = predictor
         self.mode = mode
+        self.skip_auto_update = skip_auto_update
         self._t = 0
         self._G_sum: np.ndarray | None = None
         self._x_t: np.ndarray | None = None
@@ -124,18 +127,18 @@ class _FTRLEngine:
             return float(self.eta[-1])
         return float(self.eta)
 
-    def _solve_argmin_lin_plus_reg(
-        self, lin_vec: np.ndarray, reg_center: np.ndarray | None
+    def _composite_update(
+        self, eta_grad_term: np.ndarray, reg_center: np.ndarray | None
     ) -> np.ndarray:
         """
-        Expectation: lin_vec is already multiplied by eta_t (i.e. lin_vec = eta_t * <sum or current>).
-        Solves dual: z = - lin_vec + grad_psi(reg_center)  (if reg_center provided)
+        Expectation: eta_grad_term is already multiplied by eta_t (i.e. eta_grad_term = eta_t * <sum or current>).
+        Solves dual: z = - eta_grad_term + grad_psi(reg_center)  (if reg_center provided)
         then x = grad_psi_star(z); follow with geometry-specific normalization & external projector.
         """
         if reg_center is None:
-            z = -lin_vec
+            z = -eta_grad_term
         else:
-            z = -lin_vec + self.map.grad_psi(reg_center)
+            z = -eta_grad_term + self.map.grad_psi(reg_center)
         x = self.map.grad_psi_star(z)
         x = self.map.project_geom(x)
         x = self.projector.project(x)
@@ -185,17 +188,17 @@ class _FTRLEngine:
                 x_next = self.map.project_geom(x_next)
                 x_next = self.projector.project(x_next)
             else:
-                x_next = self._solve_argmin_lin_plus_reg(
-                    lin_vec=lin, reg_center=self._x_t
-                )
+                x_next = self._composite_update(eta_grad_term=lin, reg_center=self._x_t)
 
         elif self.mode == "ftrl":
             lin = eta_t * (self._G_sum + m_t)
-            x_next = self._solve_argmin_lin_plus_reg(lin_vec=lin, reg_center=None)
+            x_next = self._composite_update(eta_grad_term=lin, reg_center=None)
         else:
             raise ValueError("mode must be 'omd' or 'ftrl'")
 
-        if isinstance(self.map, DynamicMirrorMap):
+        # Update mirror map state unless skip_auto_update is True
+        # (used for Ada-BARRONS which needs manual component-specific updates)
+        if not self.skip_auto_update and isinstance(self.map, DynamicMirrorMap):
             self.map.update_state(g)
 
         self._last_grad = g.copy()
@@ -274,7 +277,9 @@ class SwordMeta:
         X_next = [e.step(g) for e in self.experts]  # each is shape (d,)
 
         # Mixture and final projection
-        w_mix = np.sum(np.array([a * x for a, x in zip(self._alpha, X_next, strict=False)]), axis=0)
+        w_mix = np.sum(
+            np.array([a * x for a, x in zip(self._alpha, X_next, strict=False)]), axis=0
+        )
         w_proj = self.projector.project(w_mix)
         self._t += 1
         return w_proj

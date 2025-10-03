@@ -15,12 +15,13 @@ from skfolio.optimization.online._ftrl import (
     _FTRLEngine,
 )
 from skfolio.optimization.online._mirror_maps import (
-    AdaptiveLogBarrierMap,
     AdaptiveMahalanobisMap,
     AdaptiveVariationMap,
     BaseMirrorMap,
+    CompositeMirrorMap,
     EntropyMirrorMap,
     EuclideanMirrorMap,
+    make_ada_barrons_mirror_map,
 )
 from skfolio.optimization.online._mixins import (
     FTRLStrategy,
@@ -218,9 +219,6 @@ class OnlinePortfolioSelection(
         self
             The estimator instance.
         """
-        # Validate parameters
-        self._validate_params()
-
         if not self.warm_start:
             self._reset_state_for_fit()
 
@@ -288,7 +286,7 @@ class FTRLProximal(OnlinePortfolioSelection):
 
     def __init__(
         self,
-        objective: FTRLStrategy = FTRLStrategy.EG,
+        strategy: FTRLStrategy = FTRLStrategy.EG,
         *,
         ftrl: bool = False,
         warm_start: bool = True,
@@ -308,6 +306,11 @@ class FTRLProximal(OnlinePortfolioSelection):
         ## AdaGrad
         adagrad_D: float | npt.ArrayLike | None = None,
         adagrad_eps: float = 1e-8,
+        ## Ada-BARRONS
+        adabarrons_barrier_coef: float = 1.0,
+        adabarrons_alpha: float = 1.0,
+        adabarrons_euclidean_coef: float = 1.0,
+        adabarrons_beta: float = 0.1,
         eg_tilde: bool = False,
         eg_tilde_alpha: float | Callable[[int], float] = 0.1,
         # Projection constraints (fast path)
@@ -327,8 +330,8 @@ class FTRLProximal(OnlinePortfolioSelection):
 
         Parameters
         ----------
-            objective: OnlineObjective
-                The objective to use.
+            strategy: FTRLStrategy, default=FTRLStrategy.EG
+                The FTRL strategy to use.
             ftrl: bool, default=False
                 If `True`, use the Follow-the-regularized-leader (FTRL) update.
                 If `False` (default), use the Online Mirror Descent (OMD) update.
@@ -528,12 +531,16 @@ class FTRLProximal(OnlinePortfolioSelection):
         )
 
         # Public configuration
-        self.objective = objective
+        self.strategy = strategy
         self.learning_rate = learning_rate
         self.ftrl = ftrl
         self.smooth_epsilon = float(smooth_epsilon)
         self.adagrad_D = adagrad_D
         self.adagrad_eps = float(adagrad_eps)
+        self.adabarrons_barrier_coef = float(adabarrons_barrier_coef)
+        self.adabarrons_alpha = float(adabarrons_alpha)
+        self.adabarrons_euclidean_coef = float(adabarrons_euclidean_coef)
+        self.adabarrons_beta = float(adabarrons_beta)
         self.warm_start = bool(warm_start)
         self.initial_weights = initial_weights
         self.smooth_prediction = smooth_prediction
@@ -597,42 +604,53 @@ class FTRLProximal(OnlinePortfolioSelection):
             if self.smooth_prediction:
                 predictor = LastGradPredictor()
 
-            if self.objective == FTRLStrategy.EG:
-                mirror_map = EntropyMirrorMap()
-            elif self.objective == FTRLStrategy.OGD:
-                mirror_map = EuclideanMirrorMap()
-            elif self.objective == FTRLStrategy.ADAGRAD:
-                mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
-            elif self.objective == FTRLStrategy.ADABARRONS:
-                mirror_map = AdaptiveLogBarrierMap()
-            elif self.objective in (FTRLStrategy.SWORD_VAR, FTRLStrategy.SWORD):
-                # SWORD-Var: variation-adaptive OMD with optimistic gradients
-                predictor = LastGradPredictor()
-                mirror_map = AdaptiveVariationMap(eps=self.adagrad_eps)
-            elif self.objective == FTRLStrategy.SWORD_SMALL:
-                # SWORD-Small: AdaGrad geometry with optimistic gradients
-                predictor = LastGradPredictor()
-                mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
-            elif self.objective in (FTRLStrategy.SWORD_BEST, FTRLStrategy.SWORD_PP):
-                # Meta-aggregator combining SWORD-Var and SWORD-Small, plus EG for ++
-                predictor_var = LastGradPredictor()
-                predictor_small = LastGradPredictor()
-                var_engine = _FTRLEngine(
-                    mirror_map=AdaptiveVariationMap(eps=self.adagrad_eps),
-                    projector=IdentityProjector(),  # inner unconstrained
-                    eta=self.learning_rate,
-                    predictor=predictor_var,
-                    mode="omd",
-                )
-                small_engine = _FTRLEngine(
-                    mirror_map=AdaptiveMahalanobisMap(eps=self.adagrad_eps),
-                    projector=IdentityProjector(),
-                    eta=self.learning_rate,
-                    predictor=predictor_small,
-                    mode="omd",
-                )
-                experts: list[_FTRLEngine] = [var_engine, small_engine]
-                if self.objective == FTRLStrategy.SWORD_PP:
+            match self.strategy:
+                case FTRLStrategy.EG:
+                    mirror_map = EntropyMirrorMap()
+                case FTRLStrategy.OGD:
+                    mirror_map = EuclideanMirrorMap()
+                case FTRLStrategy.ADAGRAD:
+                    mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
+                case FTRLStrategy.ADABARRONS:
+                    # Ada-BARRONS uses a compositional mirror map:
+                    # - AdaBarronsBarrierMap: weight-proximity adaptive barrier
+                    # - EuclideanMap: Euclidean regularization
+                    # - FullQuadraticMap: second-order curvature
+                    mirror_map = make_ada_barrons_mirror_map(
+                        d=num_assets,
+                        barrier_coef=self.adabarrons_barrier_coef,
+                        alpha=self.adabarrons_alpha,
+                        euclidean_coef=self.adabarrons_euclidean_coef,
+                        beta=self.adabarrons_beta,
+                    )
+                case (FTRLStrategy.SWORD_VAR, FTRLStrategy.SWORD):
+                    # SWORD-Var: variation-adaptive OMD with optimistic gradients
+                    predictor = LastGradPredictor()
+                    mirror_map = AdaptiveVariationMap(eps=self.adagrad_eps)
+                case FTRLStrategy.SWORD_SMALL:
+                    # SWORD-Small: AdaGrad geometry with optimistic gradients
+                    predictor = LastGradPredictor()
+                    mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
+                case (FTRLStrategy.SWORD_BEST, FTRLStrategy.SWORD_PP):
+                    # Meta-aggregator combining SWORD-Var and SWORD-Small, plus EG for ++
+                    predictor_var = LastGradPredictor()
+                    predictor_small = LastGradPredictor()
+                    var_engine = _FTRLEngine(
+                        mirror_map=AdaptiveVariationMap(eps=self.adagrad_eps),
+                        projector=IdentityProjector(),  # inner unconstrained
+                        eta=self.learning_rate,
+                        predictor=predictor_var,
+                        mode="omd",
+                    )
+                    small_engine = _FTRLEngine(
+                        mirror_map=AdaptiveMahalanobisMap(eps=self.adagrad_eps),
+                        projector=IdentityProjector(),
+                        eta=self.learning_rate,
+                        predictor=predictor_small,
+                        mode="omd",
+                    )
+                    experts: list[_FTRLEngine] = [var_engine, small_engine]
+                case FTRLStrategy.SWORD_PP:
                     # add an entropy-geometry expert to stabilize/explore
                     eg_engine = _FTRLEngine(
                         mirror_map=EntropyMirrorMap(),
@@ -642,27 +660,23 @@ class FTRLProximal(OnlinePortfolioSelection):
                         mode="omd",
                     )
                     experts.append(eg_engine)
-                assert self._projector is not None
-                self._ftrl_engine = SwordMeta(
-                    experts=experts,
-                    projector=self._projector,
-                    eta_meta=self.learning_rate,  # tie meta-eta to learning_rate
-                )
-            else:
-                raise ValueError("Unknown objective provided.")
+                    self._ftrl_engine = SwordMeta(
+                        experts=experts,
+                        projector=self._projector,
+                        eta_meta=self.learning_rate,  # tie meta-eta to learning_rate
+                    )
+                case _:
+                    raise ValueError("Unknown objective provided.")
 
-            assert self._projector is not None
-            # For simple cases, create the vanilla FTRL engine after choosing mirror_map
-            if self._ftrl_engine is None:
-                assert mirror_map is not None
-                assert self._projector is not None
-                self._ftrl_engine = _FTRLEngine(
-                    mirror_map=mirror_map,
-                    projector=self._projector,
-                    eta=self.learning_rate,
-                    predictor=predictor,
-                    mode="ftrl" if self.ftrl else "omd",
-                )
+            skip_auto_update = self.strategy == FTRLStrategy.ADABARRONS
+            self._ftrl_engine = _FTRLEngine(
+                mirror_map=mirror_map,
+                projector=self._projector,
+                eta=self.learning_rate,
+                predictor=predictor,
+                mode="ftrl" if self.ftrl else "omd",
+                skip_auto_update=skip_auto_update,
+            )
 
         if not self._weights_initialized or not self.warm_start:
             self._initialize_weights(num_assets)
@@ -760,7 +774,7 @@ class FTRLProximal(OnlinePortfolioSelection):
         np.ndarray
             Final weights.
         """
-        if not (self.eg_tilde and self.objective == FTRLStrategy.EG):
+        if not (self.eg_tilde and self.strategy == FTRLStrategy.EG):
             return w_ftrl
 
         alpha_t = (
@@ -775,6 +789,37 @@ class FTRLProximal(OnlinePortfolioSelection):
         n = w_ftrl.shape[0]
         mixed = (1.0 - alpha_t) * w_ftrl + alpha_t / n
         return self._projector.project(mixed)
+
+    def _update_adabarrons_components(
+        self, weights: np.ndarray, gradient: np.ndarray
+    ) -> None:
+        """Special update logic for Ada-BARRONS compositional mirror map.
+
+        Ada-BARRONS requires:
+        - Barrier component updated with weights (weight-proximity adaptation)
+        - Full quadratic component updated with gradients (second-order curvature)
+
+        Parameters
+        ----------
+        weights : np.ndarray
+            Current portfolio weights.
+        gradient : np.ndarray
+            Portfolio gradient vector.
+        """
+        if self.strategy == FTRLStrategy.ADABARRONS and isinstance(
+            self._ftrl_engine.map, CompositeMirrorMap
+        ):
+            # Access the components of the Ada-BARRONS mirror map:
+            # [0] = AdaBarronsBarrierMap (weight-proximity adaptive)
+            # [1] = EuclideanMap (static, no update needed)
+            # [2] = FullQuadraticMap (gradient-based second-order)
+            components = self._ftrl_engine.map.components_
+
+            # Update barrier with weights (NOT gradients)
+            components[0].update_state(weights)
+
+            # Update full quadratic with gradients
+            components[2].update_state(gradient)
 
     def _finalize_partial_fit_state(self, effective_relatives: np.ndarray) -> None:
         """Update internal state and compute loss after weight update.
@@ -843,6 +888,10 @@ class FTRLProximal(OnlinePortfolioSelection):
 
         # Step 6: Apply post-processing (e.g., EG-tilde mixing)
         self.weights_ = self._apply_weights_mixing(w_ftrl)
+
+        # Step 6.5: Manual component updates for Ada-BARRONS
+        # (barrier with weights, full quadratic with gradients)
+        self._update_adabarrons_components(self.weights_, gradient)
 
         # Step 7: Update internal state and compute loss
         self._finalize_partial_fit_state(effective_relatives)

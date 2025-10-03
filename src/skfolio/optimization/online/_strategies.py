@@ -7,22 +7,19 @@ that handles both PA and MD update modes.
 
 from __future__ import annotations
 
+import warnings
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
 
-import numpy as np
-from scipy.stats import norm
+import numpy as np  # mypy: ignore
+from scipy.stats import norm  # mypy: ignore
 
 from skfolio.optimization.online import _cwmr
-from skfolio.optimization.online._mixins import UpdateMode
-
-if TYPE_CHECKING:
-    from skfolio.optimization.online._ftrl import _FTRLEngine
-    from skfolio.optimization.online._mean_reversion import (
-        BaseReversionPredictor,
-        SurrogateLoss,
-    )
-    from skfolio.optimization.online._projection import AutoProjector
+from skfolio.optimization.online._ftrl import _FTRLEngine
+from skfolio.optimization.online._mirror_maps import EuclideanMirrorMap
+from skfolio.optimization.online._mixins import PAMRVariant, UpdateMode
+from skfolio.optimization.online._prediction import BaseReversionPredictor
+from skfolio.optimization.online._projection import AutoProjector
+from skfolio.optimization.online._surrogates import SurrogateLoss
 
 
 class BaseStrategy(ABC):
@@ -39,11 +36,10 @@ class BaseStrategy(ABC):
         pass
 
     @abstractmethod
-    def execute_step(
+    def step(
         self,
         trade_w: np.ndarray,
-        x_t: np.ndarray,
-        phi_eff: np.ndarray,
+        arr: np.ndarray,
         update_mode: UpdateMode,
         projector: AutoProjector,
     ) -> np.ndarray:
@@ -51,99 +47,23 @@ class BaseStrategy(ABC):
         pass
 
 
-class OLMARStrategy(BaseStrategy):
-    """OLMAR (Online Moving Average Reversion) strategy."""
-
-    def __init__(
-        self,
-        predictor: BaseReversionPredictor,
-        surrogate: SurrogateLoss,
-        engine: _FTRLEngine | None,
-        epsilon: float,
-        olmar_order: int,
-    ):
-        self.predictor = predictor
-        self.surrogate = surrogate
-        self.engine = engine
-        self.epsilon = epsilon
-        self.olmar_order = olmar_order
-        self._t = 0
-
-    def reset(self, d: int) -> None:
-        self.predictor.reset(d)
-        self._t = 0
-
-    def should_update(self, t: int) -> bool:
-        self._t = t
-        if self.olmar_order == 1:
-            return t >= 1  # Need at least 1 observation
-        return True
-
-    def execute_step(
-        self,
-        trade_w: np.ndarray,
-        x_t: np.ndarray,
-        phi_eff: np.ndarray,
-        update_mode: UpdateMode,
-        projector: AutoProjector,
-    ) -> np.ndarray:
-        """Execute OLMAR update (PA or MD mode)."""
-        match update_mode:
-            case UpdateMode.PA:
-                return self._pa_step(trade_w, phi_eff, projector)
-            case UpdateMode.MD:
-                return self._md_step(trade_w, phi_eff, projector)
-
-    def _pa_step(
-        self, trade_w: np.ndarray, phi_eff: np.ndarray, projector: AutoProjector
-    ) -> np.ndarray:
-        """OLMAR passive-aggressive step."""
-        margin = float(phi_eff @ trade_w)
-        ell = max(0.0, self.epsilon - margin)
-        if ell <= 0.0:
-            return trade_w.copy()
-
-        c = phi_eff - np.mean(phi_eff)
-        denom = float(np.dot(c, c))
-        if denom <= 0.0:
-            return trade_w.copy()
-
-        lam = ell / denom
-        projector.config.previous_weights = trade_w
-        return projector.project(trade_w + lam * c)
-
-    def _md_step(
-        self, trade_w: np.ndarray, phi_eff: np.ndarray, projector: AutoProjector
-    ) -> np.ndarray:
-        """OLMAR mirror-descent step."""
-        if self.engine is None:
-            raise ValueError("MD mode requires engine to be initialized")
-
-        g = self.surrogate.grad(trade_w, phi_eff)
-
-        # Center gradient for Euclidean geometry
-        from skfolio.optimization.online._mirror_maps import EuclideanMirrorMap
-
-        if isinstance(self.engine.map, EuclideanMirrorMap):
-            g -= np.mean(g)
-
-        projector.config.previous_weights = trade_w
-        return self.engine.step(g)
-
-
 class PAMRStrategy(BaseStrategy):
     """PAMR (Passive-Aggressive Mean Reversion) strategy."""
 
     def __init__(
         self,
+        surrogate: SurrogateLoss,
         engine: _FTRLEngine | None,
         epsilon: float,
-        pamr_variant: int,
-        pamr_C: float,
+        pamr_variant: PAMRVariant = PAMRVariant.SIMPLE,
+        pamr_C: float = 10.0,
     ):
         self.engine = engine
+        self.surrogate = surrogate
         self.epsilon = epsilon
-        self.pamr_variant = pamr_variant
+        self.variant = (
+            PAMRVariant(pamr_variant) if isinstance(pamr_variant, int) else pamr_variant
+        )
         self.pamr_C = pamr_C
 
     def reset(self, d: int) -> None:
@@ -152,45 +72,60 @@ class PAMRStrategy(BaseStrategy):
     def should_update(self, t: int) -> bool:
         return True  # Always update
 
-    def execute_step(
+    def step(
         self,
         trade_w: np.ndarray,
-        x_t: np.ndarray,
-        phi_eff: np.ndarray,
+        arr: np.ndarray,  # arr = phi_eff for PAMR
         update_mode: UpdateMode,
         projector: AutoProjector,
     ) -> np.ndarray:
         """Execute PAMR update (PA or MD mode)."""
         match update_mode:
             case UpdateMode.PA:
-                return self._pa_step(trade_w, phi_eff, projector)
+                return self._pa_step(trade_w, arr, projector)
             case UpdateMode.MD:
-                return self._md_step(trade_w, phi_eff, projector)
+                return self._md_step(trade_w, arr, projector)
 
     def _pa_step(
-        self, trade_w: np.ndarray, phi_eff: np.ndarray, projector: AutoProjector
+        self, trade_w: np.ndarray, arr: np.ndarray, projector: AutoProjector
     ) -> np.ndarray:
         """PAMR passive-aggressive step."""
-        margin = float(phi_eff @ trade_w)
-        ell = max(0.0, margin - self.epsilon)
-        if ell <= 0.0:
+        # margin = float(phi_eff @ trade_w)
+        # loss = max(0.0, margin - self.epsilon) TODO control the loss with the margin is the same
+        loss = self.surrogate.value(trade_w, arr)
+        if loss <= 0.0:  # passive case, no update
             return trade_w.copy()
-
-        c = phi_eff - np.mean(phi_eff)
+        # active case, perform update
+        # Center gradient to remain in simplex tangent space
+        # c = x - mean(x)
+        c = arr - np.mean(arr)
         denom = float(np.dot(c, c))
-        if denom <= 0.0:
-            return trade_w.copy()
 
-        # Compute tau based on PAMR variant
-        match self.pamr_variant:
-            case 0:  # PAMR basic (no cap)
-                tau = ell / denom
-            case 1:  # PAMR-1 (capped step)
-                tau = min(self.pamr_C, ell / denom)
-            case 2:  # PAMR-2 (soft regularization)
-                tau = ell / (denom + 1.0 / (2.0 * self.pamr_C))
+        # ---------------------------------------------------------------------------------
+        # Convert surrogate-specific loss into the *margin shortfall* Δ = max(0, margin-ε)
+        # For hinge:    loss   = Δ
+        # For squared:  loss   = Δ²   ⇒ Δ = sqrt(loss)
+        # Softplus is a smooth proxy; we approximate Δ by loss for small β or
+        # by loss/β for large β but we simply keep loss (empirical).
+        # ---------------------------------------------------------------------------------
+        # TODO fix this within the SurrogateLoss class
+        from skfolio.optimization.online._surrogates import SquaredHingeLoss
+
+        if isinstance(self.surrogate, SquaredHingeLoss):
+            delta = np.sqrt(loss)
+        else:
+            delta = loss
+
+        # Compute tau based on PAMR variant using Δ
+        match self.variant:
+            case PAMRVariant.SIMPLE:
+                tau = delta / denom
+            case PAMRVariant.SLACK_LINEAR:
+                tau = min(self.pamr_C, delta / denom)
+            case PAMRVariant.SLACK_QUADRATIC:
+                tau = delta / (denom + 1.0 / (2.0 * self.pamr_C))
             case _:
-                raise ValueError(f"Invalid pamr_variant: {self.pamr_variant}")
+                raise ValueError(f"Unhandled PAMR variant: {self.variant}")
 
         projector.config.previous_weights = trade_w
         return projector.project(trade_w - tau * c)
@@ -198,7 +133,7 @@ class PAMRStrategy(BaseStrategy):
     def _md_step(
         self, trade_w: np.ndarray, phi_eff: np.ndarray, projector: AutoProjector
     ) -> np.ndarray:
-        """PAMR mirror-descent step."""
+        """PAMR mirror-descent step. This is experimental, PAMR paper is described using PA-only updates."""
         if self.engine is None:
             raise ValueError("MD mode requires engine to be initialized")
 
@@ -206,12 +141,18 @@ class PAMRStrategy(BaseStrategy):
         g = phi_eff if (margin - self.epsilon) > 0.0 else np.zeros_like(phi_eff)
 
         # Center gradient for Euclidean geometry
-        from skfolio.optimization.online._mirror_maps import EuclideanMirrorMap
-
         if isinstance(self.engine.map, EuclideanMirrorMap):
             g -= np.mean(g)
+        else:
+            warnings.warn(
+                "PAMR MD step with non-Euclidean mirror map is experimental and may not work as intended.",
+                stacklevel=2,
+            )
+        # TODO what should we do in case of other mirror maps, for example EntropyMirrorMap?
 
+        # TODO this assignment is a bit ugly, we should refactor the engine interface?
         projector.config.previous_weights = trade_w
+
         return self.engine.step(g)
 
 
@@ -256,7 +197,7 @@ class CWMRStrategy(BaseStrategy):
     def should_update(self, t: int) -> bool:
         return True
 
-    def execute_step(
+    def step(
         self,
         trade_w: np.ndarray,
         x_t: np.ndarray,
@@ -334,3 +275,89 @@ class CWMRStrategy(BaseStrategy):
             diag_new, self.cwmr_min_var, self.cwmr_max_var
         )
         return w_next
+
+
+class OLMARStrategy(BaseStrategy):
+    """OLMAR (Online Moving Average Reversion) strategy."""
+
+    def __init__(
+        self,
+        predictor: BaseReversionPredictor,
+        surrogate: SurrogateLoss,
+        engine: _FTRLEngine | None,
+        epsilon: float,
+        olmar_order: int,
+    ):
+        self.predictor = predictor
+        self.surrogate = surrogate
+        self.engine = engine
+        self.epsilon = epsilon
+        self.olmar_order = olmar_order
+        self._t = 0
+
+    def reset(self, d: int) -> None:
+        self.predictor.reset(d)
+        self._t = 0
+
+    def should_update(self, t: int) -> bool:
+        self._t = t
+        if self.olmar_order == 1:
+            # OLMAR-1 needs window periods of history before updating
+            # After window periods (t=0,1,...,window-1), we have window+1 prices
+            # Start updating at t=window
+            return t >= self.predictor.window
+        # OLMAR-2 can start updating from t >= 1
+        return t >= 1
+
+    def step(
+        self,
+        trade_w: np.ndarray,
+        x_t: np.ndarray,
+        phi_eff: np.ndarray,
+        update_mode: UpdateMode,
+        projector: AutoProjector,
+    ) -> np.ndarray:
+        """Execute OLMAR update (PA or MD mode)."""
+        match update_mode:
+            case UpdateMode.PA:
+                return self._pa_step(trade_w, phi_eff, projector)
+            case UpdateMode.MD:
+                return self._md_step(trade_w, phi_eff, projector)
+            case _:
+                raise ValueError(f"Unknown update mode: {update_mode}")
+
+    def _pa_step(
+        self, trade_w: np.ndarray, phi_eff: np.ndarray, projector: AutoProjector
+    ) -> np.ndarray:
+        """OLMAR passive-aggressive step."""
+        margin = float(phi_eff @ trade_w)
+        ell = max(0.0, self.epsilon - margin)
+        if ell <= 0.0:
+            return trade_w.copy()
+
+        c = phi_eff - np.mean(phi_eff)
+        denom = float(np.dot(c, c))
+        if denom <= 0.0:
+            return trade_w.copy()
+
+        lam = ell / denom
+        projector.config.previous_weights = trade_w
+        return projector.project(trade_w + lam * c)
+
+    def _md_step(
+        self, trade_w: np.ndarray, phi_eff: np.ndarray, projector: AutoProjector
+    ) -> np.ndarray:
+        """OLMAR mirror-descent step."""
+        if self.engine is None:
+            raise ValueError("MD mode requires engine to be initialized")
+
+        g = self.surrogate.grad(trade_w, phi_eff)
+
+        # Center gradient for Euclidean geometry
+        from skfolio.optimization.online._mirror_maps import EuclideanMirrorMap
+
+        if isinstance(self.engine.map, EuclideanMirrorMap):
+            g -= np.mean(g)
+
+        projector.config.previous_weights = trade_w
+        return self.engine.step(g)

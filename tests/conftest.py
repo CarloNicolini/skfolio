@@ -200,3 +200,13 @@ def linear_constraints():
         "Europe >= 0.5 * Fund",
         "Japan <= 1",
     ]
+
+
+@pytest.fixture(scope="module")
+def check_box_budget(
+    w: np.ndarray, lower: float, upper: float, budget: float, atol=1e-8
+):
+    assert np.isfinite(w).all(), "Infinite weights!"
+    assert np.all(abs(np.sum(w) - budget) <= 1e-6), "budget constraint not respected"
+    assert np.all(np.max(w) - upper <= atol), "box constraint (upper) not respected"
+    assert np.all(np.min(w) - lower >= -atol), "box constraint (lower) not respected"
