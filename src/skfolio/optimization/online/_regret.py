@@ -7,7 +7,10 @@ from numpy.typing import ArrayLike
 
 from skfolio.optimization._base import BaseOptimization
 from skfolio.optimization.online._benchmark import BCRP
+from skfolio.optimization.online._mixins import RegretType as LegacyRegretType
 from skfolio.optimization.online._utils import CLIP_EPSILON, net_to_relatives
+
+_LEGACY_TO_REGRET: dict[Any, "RegretType"] = {}
 
 
 class RegretType(StrEnum):
@@ -19,6 +22,23 @@ class RegretType(StrEnum):
     )  # universal dynamic regret with path-length budget or penalty
     DYNAMIC_WORST_CASE = auto()  # per-round minimizers (one-hot on argmax relative)
     DYNAMIC_LEGACY = auto()  # explicit alias for legacy
+
+
+if isinstance(LegacyRegretType, type):
+    _LEGACY_TO_REGRET = {
+        LegacyRegretType.STATIC: RegretType.STATIC,
+        LegacyRegretType.DYNAMIC: RegretType.DYNAMIC,
+    }
+    if hasattr(LegacyRegretType, "DYNAMIC_UNIVERSAL"):
+        _LEGACY_TO_REGRET[LegacyRegretType.DYNAMIC_UNIVERSAL] = (
+            RegretType.DYNAMIC_UNIVERSAL
+        )
+    if hasattr(LegacyRegretType, "DYNAMIC_WORST_CASE"):
+        _LEGACY_TO_REGRET[LegacyRegretType.DYNAMIC_WORST_CASE] = (
+            RegretType.DYNAMIC_WORST_CASE
+        )
+    if hasattr(LegacyRegretType, "DYNAMIC_LEGACY"):
+        _LEGACY_TO_REGRET[LegacyRegretType.DYNAMIC_LEGACY] = RegretType.DYNAMIC_LEGACY
 
 
 def plot_regret_curve(
@@ -155,7 +175,7 @@ def _universal_dynamic_weights(
     solver_params: dict | None = None,
 ) -> np.ndarray:
     r"""
-    Solve universal dynamic comparator sequence u_1..u_T on the simplex:
+    Solve universal dynamic comparator sequence u_1..u_T on the simplex.
 
         maximize     sum_t log( r_t^T u_t )
         subject to   u_t >= 0, sum_i u_{t,i} = 1  for each t
@@ -291,6 +311,20 @@ def regret(
       algorithms achieve problem-dependent bounds in terms of PT and gradient variation VT (and small loss FT) under smoothness, within the universal dynamic regret framework.
     """
     # Fit the online estimator and collect per-period weights
+    if isinstance(regret_type, RegretType):
+        rt = regret_type
+    elif isinstance(LegacyRegretType, type) and isinstance(
+        regret_type, LegacyRegretType
+    ):
+        try:
+            rt = _LEGACY_TO_REGRET[regret_type]
+        except KeyError as exc:  # pragma: no cover - defensive
+            raise ValueError(f"Unsupported regret_type: {regret_type!r}") from exc
+    elif isinstance(regret_type, str):
+        rt = RegretType(regret_type)
+    else:
+        rt = RegretType(regret_type)
+
     est = estimator.fit(X)
     if not hasattr(est, "all_weights_"):
         raise RuntimeError("estimator must expose all_weights_ after fit(X)")
@@ -308,7 +342,6 @@ def regret(
     online_losses = _losses_from_weights(relatives, W_online)
 
     # Comparator weights and losses
-    rt = regret_type
     if rt == RegretType.DYNAMIC:
         # Alias to legacy; warn to migrate
         import warnings

@@ -9,7 +9,6 @@ from sklearn.utils.validation import _check_sample_weight, validate_data
 import skfolio.typing as skt
 from skfolio.optimization._base import BaseOptimization
 from skfolio.optimization.online._ftrl import (
-    LastGradPredictor,
     Predictor,
     SwordMeta,
     _FTRLEngine,
@@ -18,6 +17,7 @@ from skfolio.optimization.online._mirror_maps import (
     AdaptiveMahalanobisMap,
     AdaptiveVariationMap,
     BaseMirrorMap,
+    BurgMirrorMap,
     CompositeMirrorMap,
     EntropyMirrorMap,
     EuclideanMirrorMap,
@@ -28,6 +28,7 @@ from skfolio.optimization.online._mixins import (
     OnlineMixin,
     OnlineParameterConstraintsMixin,
 )
+from skfolio.optimization.online._prediction import LastGradPredictor
 from skfolio.optimization.online._projection import (
     AutoProjector,
     IdentityProjector,
@@ -263,9 +264,9 @@ class FTRLProximal(OnlinePortfolioSelection):
     It unifies FTRL and OMD through the lens of FTRL-Proximal, which is a unified framework for FTRL and OMD.
 
     Implements standard first-order OCO methods:
-    - Mirror Descent family: OGD, EG
+    - Mirror Descent family: OGD, EG, PROD (Soft-Bayes)
     - Adaptive methods: AdaGrad, AdaBARRONS
-    - Optimistic methods: Smooth Prediction
+    - Optimistic methods: Smooth Prediction, SWORD family
 
     Projection:
     - Fast path: box + budget (+ turnover) via project_box_and_sum/project_with_turnover
@@ -282,17 +283,23 @@ class FTRLProximal(OnlinePortfolioSelection):
     Fitting
     -------
     - :meth:`fit` iterates over ``X`` row by row, calling :meth:`partial_fit` on each row to preserve online/sequential updates.
+
+    References
+    ----------
+    .. [1] Orseau, L., Lattimore, T., & Legg, S. (2017). Soft-Bayes: Prod for
+           Mixtures of Experts with Log-Loss. In Algorithmic Learning Theory,
+           PMLR 76:73-90.
     """
 
     def __init__(
         self,
         strategy: FTRLStrategy = FTRLStrategy.EG,
         *,
-        ftrl: bool = False,
+        learning_rate: float | Callable[[int], float] = 0.05,
+        update_mode: bool = False,
         warm_start: bool = True,
         initial_weights: npt.ArrayLike | None = None,
         previous_weights: skt.MultiInput | None = None,
-        learning_rate: float | Callable[[int], float] = 0.05,
         smooth_prediction: bool = False,
         transaction_costs: skt.MultiInput = 0.0,
         management_fees: skt.MultiInput = 0.0,
@@ -335,9 +342,14 @@ class FTRLProximal(OnlinePortfolioSelection):
             ftrl: bool, default=False
                 If `True`, use the Follow-the-regularized-leader (FTRL) update.
                 If `False` (default), use the Online Mirror Descent (OMD) update.
-            learning_rate: float, default=0.05
+            learning_rate: float, default=1.0
                 Step size :math:`\eta_t` scaling factor for the learning rate schedule.
                 Can be a float or a callable `lambda t: f(t)`.
+                A good default to start is 1.
+                Otherwise, backed by cross-validation adaptive learning rate schedules like n / sqrt(t) with n the number of assets tend to yield good results.
+                In the limit learning_rate -> 0, the algorithm converges to the UCRP.
+                When strategy=FTRLStrategy.EG, the learning rate enters the softmax function, thus it acts as an inverse temperature parameter.
+                In the limit learning_rate -> 0, every expert is weighted equally (high temperature limit), while in the limit learning_rate -> +inf, the choice of expert is deterministic corresponding to the argmax.
             transaction_costs : float | dict[str, float] | array-like of shape (n_assets, ), default=0.0
                 Transaction costs of the assets. It is used to add linear transaction costs to
                 the optimization problem:
@@ -533,7 +545,7 @@ class FTRLProximal(OnlinePortfolioSelection):
         # Public configuration
         self.strategy = strategy
         self.learning_rate = learning_rate
-        self.ftrl = ftrl
+        self.update_mode = update_mode
         self.smooth_epsilon = float(smooth_epsilon)
         self.adagrad_D = adagrad_D
         self.adagrad_eps = float(adagrad_eps)
@@ -609,6 +621,8 @@ class FTRLProximal(OnlinePortfolioSelection):
                     mirror_map = EntropyMirrorMap()
                 case FTRLStrategy.OGD:
                     mirror_map = EuclideanMirrorMap()
+                case FTRLStrategy.PROD:
+                    mirror_map = BurgMirrorMap()
                 case FTRLStrategy.ADAGRAD:
                     mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
                 case FTRLStrategy.ADABARRONS:
@@ -623,7 +637,7 @@ class FTRLProximal(OnlinePortfolioSelection):
                         euclidean_coef=self.adabarrons_euclidean_coef,
                         beta=self.adabarrons_beta,
                     )
-                case (FTRLStrategy.SWORD_VAR, FTRLStrategy.SWORD):
+                case FTRLStrategy.SWORD_VAR | FTRLStrategy.SWORD:
                     # SWORD-Var: variation-adaptive OMD with optimistic gradients
                     predictor = LastGradPredictor()
                     mirror_map = AdaptiveVariationMap(eps=self.adagrad_eps)
@@ -631,7 +645,7 @@ class FTRLProximal(OnlinePortfolioSelection):
                     # SWORD-Small: AdaGrad geometry with optimistic gradients
                     predictor = LastGradPredictor()
                     mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
-                case (FTRLStrategy.SWORD_BEST, FTRLStrategy.SWORD_PP):
+                case FTRLStrategy.SWORD_BEST | FTRLStrategy.SWORD_PP:
                     # Meta-aggregator combining SWORD-Var and SWORD-Small, plus EG for ++
                     predictor_var = LastGradPredictor()
                     predictor_small = LastGradPredictor()
@@ -650,16 +664,16 @@ class FTRLProximal(OnlinePortfolioSelection):
                         mode="omd",
                     )
                     experts: list[_FTRLEngine] = [var_engine, small_engine]
-                case FTRLStrategy.SWORD_PP:
-                    # add an entropy-geometry expert to stabilize/explore
-                    eg_engine = _FTRLEngine(
-                        mirror_map=EntropyMirrorMap(),
-                        projector=IdentityProjector(),
-                        eta=self.learning_rate,
-                        predictor=LastGradPredictor(),
-                        mode="omd",
-                    )
-                    experts.append(eg_engine)
+                    if self.strategy == FTRLStrategy.SWORD_PP:
+                        # add an entropy-geometry expert to stabilize/explore
+                        eg_engine = _FTRLEngine(
+                            mirror_map=EntropyMirrorMap(),
+                            projector=IdentityProjector(),
+                            eta=self.learning_rate,
+                            predictor=LastGradPredictor(),
+                            mode="omd",
+                        )
+                        experts.append(eg_engine)
                     self._ftrl_engine = SwordMeta(
                         experts=experts,
                         projector=self._projector,
@@ -668,18 +682,22 @@ class FTRLProximal(OnlinePortfolioSelection):
                 case _:
                     raise ValueError("Unknown objective provided.")
 
-            skip_auto_update = self.strategy == FTRLStrategy.ADABARRONS
-            self._ftrl_engine = _FTRLEngine(
-                mirror_map=mirror_map,
-                projector=self._projector,
-                eta=self.learning_rate,
-                predictor=predictor,
-                mode="ftrl" if self.ftrl else "omd",
-                skip_auto_update=skip_auto_update,
-            )
+            if self._ftrl_engine is None:
+                skip_auto_update = self.strategy == FTRLStrategy.ADABARRONS
+                self._ftrl_engine = _FTRLEngine(
+                    mirror_map=mirror_map,
+                    projector=self._projector,
+                    eta=self.learning_rate,
+                    predictor=predictor,
+                    mode="ftrl" if self.update_mode else "omd",
+                    skip_auto_update=skip_auto_update,
+                )
 
         if not self._weights_initialized or not self.warm_start:
             self._initialize_weights(num_assets)
+            if self._ftrl_engine is not None and hasattr(self._ftrl_engine, "_x_t"):
+                if self._ftrl_engine._x_t is None:
+                    self._ftrl_engine._x_t = self.weights_.copy()
 
         # Mark overall init complete
         self._is_initialized = True
@@ -707,6 +725,7 @@ class FTRLProximal(OnlinePortfolioSelection):
         self, effective_relatives: np.ndarray
     ) -> np.ndarray:
         """Compute the portfolio gradient including transaction costs.
+        The gradient is relative to the log-wealth objective.
 
         Parameters
         ----------

@@ -200,17 +200,16 @@ class CWMRStrategy(BaseStrategy):
     def step(
         self,
         trade_w: np.ndarray,
-        x_t: np.ndarray,
-        phi_eff: np.ndarray,
+        arr: np.ndarray,
         update_mode: UpdateMode,
         projector: AutoProjector,
     ) -> np.ndarray:
         """Execute CWMR update (PA or MD mode)."""
         match update_mode:
             case UpdateMode.PA:
-                return self._pa_step(trade_w, x_t, projector)
+                return self._pa_step(trade_w, arr, projector)
             case UpdateMode.MD:
-                return self._md_step(trade_w, x_t, projector)
+                return self._md_step(trade_w, arr, projector)
 
     def _pa_step(
         self, trade_w: np.ndarray, x_t: np.ndarray, projector: AutoProjector
@@ -312,17 +311,16 @@ class OLMARStrategy(BaseStrategy):
     def step(
         self,
         trade_w: np.ndarray,
-        x_t: np.ndarray,
-        phi_eff: np.ndarray,
+        arr: np.ndarray,
         update_mode: UpdateMode,
         projector: AutoProjector,
     ) -> np.ndarray:
         """Execute OLMAR update (PA or MD mode)."""
         match update_mode:
             case UpdateMode.PA:
-                return self._pa_step(trade_w, phi_eff, projector)
+                return self._pa_step(trade_w, arr, projector)
             case UpdateMode.MD:
-                return self._md_step(trade_w, phi_eff, projector)
+                return self._md_step(trade_w, arr, projector)
             case _:
                 raise ValueError(f"Unknown update mode: {update_mode}")
 

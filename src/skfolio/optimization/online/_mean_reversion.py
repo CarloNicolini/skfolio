@@ -14,7 +14,7 @@ from sklearn.utils._param_validation import Interval, StrOptions
 from sklearn.utils.validation import validate_data
 
 from skfolio.optimization.online._base import OnlinePortfolioSelection
-from skfolio.optimization.online._ftrl import LastGradPredictor, _FTRLEngine
+from skfolio.optimization.online._ftrl import _FTRLEngine
 from skfolio.optimization.online._mirror_maps import (
     BaseMirrorMap,
     EntropyMirrorMap,
@@ -23,10 +23,12 @@ from skfolio.optimization.online._mirror_maps import (
 from skfolio.optimization.online._mixins import (
     MeanReversionStrategy,
     OLMARPredictor,
+    PAMRVariant,
     UpdateMode,
 )
 from skfolio.optimization.online._prediction import (
     BaseReversionPredictor,
+    LastGradPredictor,
     OLMAR1Predictor,
     OLMAR2Predictor,
 )
@@ -62,8 +64,9 @@ class MeanReversion(OnlinePortfolioSelection):
     olmar_alpha : float, default=0.5
         OLMAR smoothing parameter (applies only for EWMA).
     # PAMR parameters
-    pamr_variant : {0, 1, 2}, default=0
-        PAMR variant (0=basic, 1=capped, 2=soft-reg).
+    pamr_variant : {"simple", "slack_linear", "slack_quadratic"}, default="simple"
+        PAMR variant "simple", "slack_linear", or "slack_quadratic".
+        These variants are the 0, 1 and 2 versions of PAMR in Li & Hoi book (2012).
     pamr_C : float, default=500.0
         PAMR aggressiveness parameter.
     # CWMR parameters
@@ -109,7 +112,7 @@ class MeanReversion(OnlinePortfolioSelection):
         "olmar_window": [Interval(Integral, 1, None, closed="left")],
         "olmar_alpha": [Interval(Real, 0, 1, closed="both")],
         # PAMR parameters
-        "pamr_variant": [Interval(Integral, 0, 2, closed="both")],
+        "pamr_variant": [StrOptions({m.value.lower() for m in PAMRVariant})],
         "pamr_C": [Interval(Real, 0, None, closed="neither")],
         # CWMR parameters
         "cwmr_eta": [Interval(Real, 0.5000001, 1.0, closed="neither")],
@@ -134,7 +137,7 @@ class MeanReversion(OnlinePortfolioSelection):
         olmar_predictor: OLMARPredictor | str = OLMARPredictor.SMA,
         olmar_window: int = 5,
         olmar_alpha: float = 0.5,
-        pamr_variant: int = 0,
+        pamr_variant: PAMRVariant = "simple",
         pamr_C: float = 500.0,
         cwmr_eta: float = 0.95,
         cwmr_sigma0: float = 1.0,
@@ -302,6 +305,7 @@ class MeanReversion(OnlinePortfolioSelection):
                 )
             case MeanReversionStrategy.PAMR:
                 strategy = PAMRStrategy(
+                    surrogate=self._surrogate,
                     engine=self._engine,
                     epsilon=self.epsilon,
                     pamr_variant=self.pamr_variant,
@@ -339,8 +343,7 @@ class MeanReversion(OnlinePortfolioSelection):
 
         return self._strategy_impl.step(
             trade_w=trade_w,
-            x_t=x_t,
-            phi_eff=phi_eff,
+            arr=x_t,
             update_mode=self.update_mode,
             projector=self._projector,
         )

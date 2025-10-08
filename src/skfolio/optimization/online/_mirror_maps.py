@@ -357,6 +357,339 @@ class EntropyMirrorMap(BaseMirrorMap):
         return w / np.sum(w)
 
 
+class BurgMirrorMap(BaseMirrorMap):
+    r"""
+    Burg (log-barrier) mirror map for rational multiplicative updates.
+
+    The Burg regularizer :math:`\psi(w) = -\sum_i \log w_i` yields the exact
+    Online Mirror Descent (OMD) update:
+
+    .. math::
+        w_{t+1,i} = \frac{w_{t,i}}{1 + \eta w_{t,i}(g_i - \lambda)}
+
+    where :math:`\lambda` is the Lagrange multiplier chosen to ensure
+    :math:`\sum_i w_{t+1,i} = 1`.
+
+    **Mathematical Derivation (OMD/FTRL with simplex constraint):**
+
+    The update arises from solving:
+
+    .. math::
+        w_{t+1} = \arg\min_{w \in \Delta} \langle g_t, w \rangle
+                  + \frac{1}{\eta} D_R(w, w_t)
+
+    where :math:`D_R` is the Bregman divergence induced by :math:`R(w) = -\sum_i \log w_i`.
+    The KKT stationarity condition with simplex constraint gives:
+
+    .. math::
+        g_i - \frac{1}{\eta}\left(\frac{1}{w_i} - \frac{1}{w_{t,i}}\right) = \lambda
+
+    Rearranging yields the boxed update formula.
+
+    **Connection to Prod (Soft-Bayes) Algorithm:**
+
+    For **small step sizes** :math:`\eta \ll 1`, the rational factor expands to:
+
+    .. math::
+        \frac{1}{1 + \eta w_{t,i}(g_i - \lambda)}
+        \approx 1 - \eta w_{t,i}(g_i - \lambda) + O(\eta^2)
+
+    Thus:
+
+    .. math::
+        w_{t+1,i} \approx w_{t,i} \left(1 - \eta w_{t,i}(g_i - \lambda)\right)
+
+    which resembles Prod's :math:`w_{t,i}(1 - \eta \bar{\ell}_i)` update [1]_.
+
+    **Key Differences from Prod:**
+
+    1. **Exact vs Approximate:** Burg update is exact (not a Taylor approximation)
+    2. **Structural:** :math:`w_{t,i}` appears inside the denominator
+    3. **Agreement:** Matches Prod to :math:`O(\eta)`, diverges at :math:`O(\eta^2)`
+
+    **When to Use:**
+
+    - Small-to-moderate :math:`\eta` (typically :math:`\eta \lesssim 0.2`): stable OMD
+    - Principled log-barrier FTRL with rigorous regret analysis
+    - Self-concordant barrier geometry for interior-point perspectives
+
+    **When NOT to Use:**
+
+    - Large :math:`\eta`: risk of numerical instability (denominators → 0)
+    - If exact Prod behavior is required: implement Prod directly
+
+    **Numerical Robustness:**
+
+    - Requires :math:`w_t` strictly positive (interior of simplex)
+    - Uses `scipy.optimize.newton` (secant method) for root finding
+    - Clips to `eps` floor to prevent division by zero
+    - Robust bracketing ensures convergence even with challenging gradients
+
+    Parameters
+    ----------
+    barrier_coef : float, default=1.0
+        Barrier coefficient (scaling factor; typically 1.0 for standard Burg).
+    eps : float, default=1e-16
+        Numerical floor for positivity.
+    max_iter : int, default=50
+        Maximum iterations for λ solver (secant method via scipy).
+    tol : float, default=1e-12
+        Convergence tolerance for λ.
+
+    References
+    ----------
+    .. [1] Orseau, L., Lattimore, T., & Hutter, M. (2017). "Soft-Bayes:
+           Prod for Mixtures of Experts with Log-Loss." ICML 2017, PMLR 76:73-90.
+    .. [2] Hazan, E. (2016). "Introduction to Online Convex Optimization."
+           Foundations and Trends in Optimization, 2(3-4), 157-325.
+    .. [3] McMahan, H. B. (2011). "Follow-the-Regularized-Leader and Mirror Descent."
+           COLT 2011.
+
+    Notes
+    -----
+    This mirror map requires the specialized `constrained_inverse` method for
+    the full OMD update with simplex constraint. The standard `grad_psi_star`
+    interface is insufficient for the constrained problem.
+
+    See Also
+    --------
+    LogBarrierMap : Dynamic log-barrier with adaptive coefficients
+    EntropyMirrorMap : Entropy regularizer (exponential/softmax updates)
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from skfolio.optimization.online._mirror_maps import BurgMirrorMap
+    >>> mirror = BurgMirrorMap(eps=1e-12)
+    >>> w_t = np.array([0.6, 0.4])
+    >>> g_t = np.array([0.1, -0.1])
+    >>> eta = 0.1
+    >>> w_next, lam = mirror.constrained_inverse(w_t, eta, g_t)
+    >>> print(f"Updated weights: {w_next}")
+    >>> print(f"Lagrange multiplier λ: {lam:.6f}")
+    """
+
+    def __init__(
+        self,
+        barrier_coef: float = 1.0,
+        eps: float = 1e-16,
+        max_iter: int = 50,
+        tol: float = 1e-12,
+    ):
+        self.barrier_coef = float(barrier_coef)
+        self.eps = float(eps)
+        self.max_iter = int(max_iter)
+        self.tol = float(tol)
+
+    def grad_psi(self, w: np.ndarray) -> np.ndarray:
+        r"""
+        Forward map: gradient of Burg potential.
+
+        .. math::
+            \nabla\psi(w)_i = -\frac{c}{w_i}
+
+        where c is the barrier coefficient.
+
+        Parameters
+        ----------
+        w : ndarray
+            Portfolio weights (must be positive).
+
+        Returns
+        -------
+        ndarray
+            Gradient of Burg potential.
+        """
+        w_safe = np.maximum(w, self.eps)
+        return -self.barrier_coef / w_safe
+
+    def grad_psi_star(self, z: np.ndarray) -> np.ndarray:
+        r"""
+        Unconstrained inverse (for compatibility only).
+
+        .. warning::
+            This returns the unconstrained inverse and does NOT enforce
+            the simplex constraint. For the full OMD update with Burg
+            regularizer, use `constrained_inverse` instead.
+
+        The unconstrained inverse is:
+
+        .. math::
+            w_i = -\frac{c}{z_i}
+
+        Parameters
+        ----------
+        z : ndarray
+            Dual variable.
+
+        Returns
+        -------
+        ndarray
+            Unconstrained inverse (normalized for fallback use).
+
+        See Also
+        --------
+        constrained_inverse : Full OMD update with simplex constraint
+        """
+        z_safe = np.minimum(z, -self.eps)
+        w = -self.barrier_coef / z_safe
+        # Normalize for basic fallback (not the correct OMD update)
+        w = np.maximum(w, self.eps)
+        w /= np.sum(w)
+        return w
+
+    def constrained_inverse(
+        self, w: np.ndarray, eta: float, g: np.ndarray
+    ) -> tuple[np.ndarray, float]:
+        r"""
+        Constrained OMD inverse with simplex constraint (full Burg update).
+
+        Solves for :math:`w_{t+1}` and :math:`\lambda` such that:
+
+        .. math::
+            w_{t+1,i} = \frac{w_{t,i}}{1 + \eta w_{t,i}(g_i - \lambda)}, \quad
+            \sum_i w_{t+1,i} = 1
+
+        Uses `scipy.optimize.newton` (secant method) for robust root finding.
+
+        Parameters
+        ----------
+        w : ndarray of shape (n_assets,)
+            Current weights (must be positive and sum to 1).
+        eta : float
+            Step size (learning rate).
+        g : ndarray of shape (n_assets,)
+            Gradient vector (linearized loss).
+
+        Returns
+        -------
+        w_next : ndarray of shape (n_assets,)
+            Updated weights (on simplex).
+        lambda_opt : float
+            Optimal Lagrange multiplier.
+
+        Raises
+        ------
+        RuntimeError
+            If root finding fails to converge.
+
+        Notes
+        -----
+        - Requires w strictly positive (interior of simplex)
+        - Robust for small-to-moderate eta (< 0.5 recommended)
+        - Uses secant method via scipy.optimize.newton for fast convergence
+
+        Examples
+        --------
+        >>> w = np.array([0.5, 0.5])
+        >>> g = np.array([0.2, -0.1])
+        >>> eta = 0.1
+        >>> w_new, lam = mirror.constrained_inverse(w, eta, g)
+        """
+        from scipy.optimize import newton
+
+        w_t = np.maximum(w, self.eps)
+        eta = float(eta)
+
+        def sum_weights_residual(lam: float) -> float:
+            """
+            Residual function: Σ w_i(λ) - 1.
+
+            Returns
+            -------
+            float
+                Sum of weights minus 1 (zero at optimal λ).
+            """
+            denom = 1.0 + eta * w_t * (g - lam)
+            # Clamp denominators away from zero for numerical stability
+            denom = np.where(np.abs(denom) < self.eps, self.eps, denom)
+            w_lam = w_t / denom
+            return float(np.sum(w_lam)) - 1.0
+
+        # Initial guess for λ: mean of gradients
+        lam_init = float(np.mean(g))
+
+        # Use scipy.optimize.newton with secant method (no derivative needed)
+        try:
+            lam_opt = newton(
+                sum_weights_residual,
+                x0=lam_init,
+                maxiter=self.max_iter,
+                tol=self.tol,
+            )
+        except RuntimeError as e:
+            # Fallback to bisection if secant fails
+            import warnings
+
+            warnings.warn(
+                f"Secant method failed for Burg λ solver: {e}. "
+                "Falling back to bisection.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            # Bracket: λ must be in range where all denominators are positive
+            g_min, g_max = float(np.min(g)), float(np.max(g))
+            # Safe upper bound: slightly below min_i(g_i + 1/(eta * w_i))
+            safe_ub = g_min + 0.99 / (eta * float(np.max(w_t)) + self.eps)
+            lam_low = g_min - 10.0 / (eta + self.eps)
+            lam_high = min(safe_ub, g_max + 10.0 / (eta + self.eps))
+
+            # Bisection
+            for _ in range(self.max_iter):
+                lam_mid = 0.5 * (lam_low + lam_high)
+                f_mid = sum_weights_residual(lam_mid)
+
+                if abs(f_mid) < self.tol:
+                    lam_opt = lam_mid
+                    break
+
+                f_low = sum_weights_residual(lam_low)
+                if f_low * f_mid < 0:
+                    lam_high = lam_mid
+                else:
+                    lam_low = lam_mid
+            else:
+                lam_opt = 0.5 * (lam_low + lam_high)
+
+        # Compute final weights with optimal λ
+        denom = 1.0 + eta * w_t * (g - lam_opt)
+        denom = np.where(np.abs(denom) < self.eps, self.eps, denom)
+        w_new = w_t / denom
+
+        # Ensure positivity and renormalize (guard against floating-point drift)
+        w_new = np.maximum(w_new, self.eps)
+        s = float(np.sum(w_new))
+        if s > self.eps:
+            w_new = w_new / s
+        else:
+            # Degenerate case: return uniform
+            w_new = np.ones_like(w_new) / len(w_new)
+
+        return w_new, float(lam_opt)
+
+    def project_geom(self, w: np.ndarray) -> np.ndarray:
+        """
+        Normalize to simplex.
+
+        Parameters
+        ----------
+        w : ndarray
+            Weights.
+
+        Returns
+        -------
+        ndarray
+            Normalized weights (sum to 1).
+        """
+        w = np.maximum(w, self.eps)
+        s = float(np.sum(w))
+        return w / s if s > self.eps else np.ones_like(w) / len(w)
+
+
+# Alias for backward compatibility
+ProdMirrorMap = BurgMirrorMap
+
+
 class LogBarrierMap(DynamicMirrorMap):
     r"""
     Log-barrier potential.

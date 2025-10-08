@@ -8,8 +8,11 @@ from skfolio.utils.tools import AutoEnum
 
 
 class RegretType(AutoEnum):
-    DYNAMIC = auto()
     STATIC = auto()
+    DYNAMIC = auto()
+    DYNAMIC_UNIVERSAL = auto()
+    DYNAMIC_WORST_CASE = auto()
+    DYNAMIC_LEGACY = auto()
 
 
 class FTRLStrategy(AutoEnum):
@@ -21,6 +24,7 @@ class FTRLStrategy(AutoEnum):
     SWORD_VAR = auto()
     SWORD_BEST = auto()
     SWORD_PP = auto()
+    PROD = auto()  # Soft-Bayes Prod algorithm
     SWORD = SWORD_VAR
 
 
@@ -80,7 +84,6 @@ class OnlineParameterConstraintsMixin:
     _parameter_constraints: ClassVar[dict] = {
         "objective": [StrOptions({m.value for m in FTRLStrategy})],
         "ftrl": ["boolean"],
-        "batch_size": [Interval(Integral, 1, None, closed="left")],
         "learning_rate": [Interval(Real, 0, None, closed="neither"), callable],
         "warm_start": ["boolean"],
         "initial_weights": ["array-like", None],

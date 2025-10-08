@@ -13,38 +13,6 @@ Predictor = Callable[[int, np.ndarray | None, np.ndarray | None], np.ndarray]
 EtaSchedule = float | np.ndarray | Callable[[int], float]
 
 
-class LastGradPredictor:
-    def __call__(
-        self, t: int, last_played_x: np.ndarray | None, last_grad: np.ndarray | None
-    ) -> np.ndarray:
-        if last_grad is not None:
-            return last_grad.copy()
-        if last_played_x is not None:
-            return np.zeros_like(last_played_x)
-        # fallback: empty array — caller must handle shape
-        return np.array([])
-
-
-class SmoothPredictor:  # for implementing Optimistic Hedge (OHD)
-    def __init__(self, smoothness_L: float = 1.0):  # L from paper (Lipschitz constant)
-        self.smoothness_L = smoothness_L
-        self.last_grad = None
-
-    def __call__(
-        self, t: int, last_played_x: np.ndarray | None, last_grad: np.ndarray | None
-    ) -> np.ndarray:
-        if last_grad is not None:
-            self.last_grad = last_grad.copy()
-        if self.last_grad is None:
-            return (
-                np.zeros_like(last_played_x)
-                if last_played_x is not None
-                else np.array([])
-            )
-        # Paper-inspired: Predict bounded variation (e.g., clip to [-L, L])
-        return np.clip(self.last_grad, -self.smoothness_L, self.smoothness_L)
-
-
 class _FTRLEngine:
     r"""Implements a unified engine for Online Mirror Descent (OMD) and
     Follow-the-Regularized-Leader (FTRL) through COMID (Composite-Objective Mirror Descent); Duchi et al., COLT 2010).
@@ -174,7 +142,17 @@ class _FTRLEngine:
 
         self._G_sum += g
 
-        if self.mode == "omd":
+        # Special handling for BurgMirrorMap (Prod/Soft-Bayes algorithm)
+        # The Burg regularizer requires solving for λ in the constrained OMD problem,
+        # which cannot be done through the standard grad_psi_star interface
+        from skfolio.optimization.online._mirror_maps import BurgMirrorMap
+
+        if isinstance(self.map, BurgMirrorMap):
+            # Use specialized constrained_inverse method for Burg update
+            x_next, _ = self.map.constrained_inverse(self._x_t, eta_t, g + m_t)
+            # Apply external projector for additional constraints
+            x_next = self.projector.project(x_next)
+        elif self.mode == "omd":
             lin = eta_t * (g + m_t)
             if isinstance(self.map, DynamicMirrorMap):
                 _ = self.map.grad_psi(self._x_t)  # preserves Spy test (pre-geometry)

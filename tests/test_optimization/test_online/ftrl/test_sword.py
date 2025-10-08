@@ -24,7 +24,7 @@ def test_sword_var_simplex_and_zero_grad_stability():
 
     model = FTRLProximal(
         strategy=FTRLStrategy.SWORD_VAR,
-        ftrl=False,  # OMD
+        update_mode=False,  # OMD
         learning_rate=0.1,
         warm_start=False,
     )
@@ -86,7 +86,7 @@ def test_ops_integration_sword_best_and_pp(objective):
 
     model = FTRLProximal(
         strategy=objective,
-        ftrl=False,
+        update_mode=False,
         learning_rate=0.1,
         warm_start=False,
     )

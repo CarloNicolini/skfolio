@@ -2,10 +2,11 @@ import numpy as np
 import pytest
 from scipy.special import softmax as softmax_stable
 
-from skfolio.optimization.online._ftrl import LastGradPredictor, _FTRLEngine
+from skfolio.optimization.online._ftrl import _FTRLEngine
 from skfolio.optimization.online._mirror_maps import (
     EntropyMirrorMap,
 )
+from skfolio.optimization.online._prediction import LastGradPredictor
 from skfolio.optimization.online._projection import (
     AutoProjector,
     ProjectionConfig,
