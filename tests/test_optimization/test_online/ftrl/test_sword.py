@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from skfolio.optimization.online._base import FTRLProximal
-from skfolio.optimization.online._ftrl import SwordMeta, _FTRLEngine
+from skfolio.optimization.online._ftrl import SwordMeta, FirstOrderOCO
 from skfolio.optimization.online._mirror_maps import (
     AdaptiveMahalanobisMap,
 )
@@ -24,7 +24,7 @@ def test_sword_var_simplex_and_zero_grad_stability():
 
     model = FTRLProximal(
         strategy=FTRLStrategy.SWORD_VAR,
-        update_mode=False,  # OMD
+        update_mode="omd",
         learning_rate=0.1,
         warm_start=False,
     )
@@ -44,14 +44,14 @@ def test_sword_meta_weights_shift_to_better_expert():
     d = 3
     proj = IdentityProjector()
     # Use Euclidean maps; we'll manually set current iterations
-    e1 = _FTRLEngine(
+    e1 = FirstOrderOCO(
         mirror_map=AdaptiveMahalanobisMap(),
         projector=proj,
         eta=0.1,
         predictor=None,
         mode="omd",
     )
-    e2 = _FTRLEngine(
+    e2 = FirstOrderOCO(
         mirror_map=AdaptiveMahalanobisMap(),
         projector=proj,
         eta=0.1,

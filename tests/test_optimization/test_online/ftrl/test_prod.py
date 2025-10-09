@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 
 from skfolio.optimization.online._base import FTRLProximal
-from skfolio.optimization.online._ftrl import _FTRLEngine
+from skfolio.optimization.online._ftrl import FirstOrderOCO
 from skfolio.optimization.online._mirror_maps import BurgMirrorMap
 from skfolio.optimization.online._mixins import FTRLStrategy
 from skfolio.optimization.online._projection import IdentityProjector
@@ -274,7 +274,7 @@ def test_prod_with_smooth_prediction():
     model = FTRLProximal(
         strategy=FTRLStrategy.PROD,
         learning_rate=0.1,
-        smooth_prediction=True,
+        grad_predictor=True,
         warm_start=False,
     )
 
@@ -297,7 +297,7 @@ def test_prod_mirror_map_interface():
     """Test that BurgMirrorMap works correctly within _FTRLEngine."""
     d = 3
     mirror_map = BurgMirrorMap()
-    engine = _FTRLEngine(
+    engine = FirstOrderOCO(
         mirror_map=mirror_map,
         projector=IdentityProjector(),
         eta=0.1,

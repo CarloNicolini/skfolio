@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from skfolio.optimization.online._ftrl import _FTRLEngine
+from skfolio.optimization.online._ftrl import FirstOrderOCO
 from skfolio.optimization.online._mirror_maps import (
     AdaptiveLogBarrierMap,
     AdaptiveMahalanobisMap,
@@ -36,10 +36,10 @@ def test_entropy_omd_ftrl_equivalence_constant_eta(d, T):
     projector = AutoProjector(ProjectionConfig(lower=0.0, upper=1.0, budget=1.0))
     eta = 0.1
 
-    omd = _FTRLEngine(
+    omd = FirstOrderOCO(
         mirror_map=EntropyMirrorMap(), projector=projector, eta=eta, mode="omd"
     )
-    ftr = _FTRLEngine(
+    ftr = FirstOrderOCO(
         mirror_map=EntropyMirrorMap(), projector=projector, eta=eta, mode="ftrl"
     )
 
@@ -62,7 +62,7 @@ def test_euclidean_omd_step_matches_formula_identity_projector():
     g0 = np.array([1.0, -2.0, 0.5])
     g1 = np.array([-0.3, 0.7, 1.2])
     eta = 0.2
-    omd = _FTRLEngine(
+    omd = FirstOrderOCO(
         mirror_map=EuclideanMirrorMap(),
         projector=IdentityProjector(),
         eta=eta,
@@ -84,7 +84,7 @@ def test_euclidean_ftrl_matches_dual_averaging_identity_projector():
     g0 = np.array([1.0, 2.0, -3.0, 0.5])
     g1 = np.array([0.0, -1.0, 1.0, -0.5])
     eta = 0.1
-    ftr = _FTRLEngine(
+    ftr = FirstOrderOCO(
         mirror_map=EuclideanMirrorMap(),
         projector=IdentityProjector(),
         eta=eta,
@@ -105,14 +105,14 @@ def test_predictor_effect_and_shape_check():
     g0 = np.array([1.0, -1.0])
     g1 = np.array([2.0, 0.5])
     pred = LastGradPredictor()
-    omd_pred = _FTRLEngine(
+    omd_pred = FirstOrderOCO(
         mirror_map=EuclideanMirrorMap(),
         projector=IdentityProjector(),
         eta=eta,
         predictor=pred,
         mode="omd",
     )
-    omd_base = _FTRLEngine(
+    omd_base = FirstOrderOCO(
         mirror_map=EuclideanMirrorMap(),
         projector=IdentityProjector(),
         eta=eta,
@@ -135,7 +135,7 @@ def test_predictor_effect_and_shape_check():
         def __call__(self, t, last_x, last_g):
             return np.zeros(d + 1)  # wrong shape
 
-    omd_bad = _FTRLEngine(
+    omd_bad = FirstOrderOCO(
         mirror_map=EuclideanMirrorMap(),
         projector=IdentityProjector(),
         eta=eta,
@@ -152,7 +152,7 @@ def test_eta_schedule_array_and_callable():
 
     # Array schedule
     eta_arr = np.array([0.3, 0.2, 0.1])
-    omd_a = _FTRLEngine(
+    omd_a = FirstOrderOCO(
         mirror_map=EuclideanMirrorMap(),
         projector=IdentityProjector(),
         eta=eta_arr,
@@ -175,7 +175,7 @@ def test_eta_schedule_array_and_callable():
     def eta_fn(t):  # t=0,1,2... uses seq[t] if in range else last
         return seq[t] if t < len(seq) else seq[-1]
 
-    omd_c = _FTRLEngine(
+    omd_c = FirstOrderOCO(
         mirror_map=EuclideanMirrorMap(),
         projector=IdentityProjector(),
         eta=eta_fn,
@@ -200,10 +200,10 @@ def test_dynamic_mirror_maps_update_internals():
 
     # AdaGrad-like: H grows with sum of squares, step in coord 0 diminishes compared to Euclidean
     am = AdaptiveMahalanobisMap(eps=1e-8)
-    omd_adagrad = _FTRLEngine(
+    omd_adagrad = FirstOrderOCO(
         mirror_map=am, projector=IdentityProjector(), eta=1.0, mode="omd"
     )
-    euc = _FTRLEngine(
+    euc = FirstOrderOCO(
         mirror_map=EuclideanMirrorMap(),
         projector=IdentityProjector(),
         eta=1.0,
@@ -224,7 +224,7 @@ def test_dynamic_mirror_maps_update_internals():
     # AdaBARRONS: keep positivity and normalization even with extreme grads
     alb = AdaptiveLogBarrierMap(eps=1e-12)
     proj = AutoProjector(ProjectionConfig(lower=0.0, upper=1.0, budget=1.0))
-    ftrl_alb = _FTRLEngine(mirror_map=alb, projector=proj, eta=0.5, mode="ftrl")
+    ftrl_alb = FirstOrderOCO(mirror_map=alb, projector=proj, eta=0.5, mode="ftrl")
     w = ftrl_alb.step(np.array([-10.0, -10.0, -10.0]))  # adversarial sign
     assert_simplex(w, atol=1e-9)
 
@@ -233,7 +233,7 @@ def test_euclidean_omd_matches_projected_step():
     """
     With ψ(w)=½‖w‖² the OMD step is Proj(w_t - η g_t); _composite_update should be identity plus projector (src/.../_mirror_maps.py:328-340).
     """
-    engine = _FTRLEngine(
+    engine = FirstOrderOCO(
         mirror_map=EuclideanMirrorMap(),
         projector=IdentityProjector(),
         eta=0.1,

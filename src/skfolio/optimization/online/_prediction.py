@@ -64,6 +64,21 @@ class OLMAR2Predictor(BaseReversionPredictor):
 
 
 class LastGradPredictor:
+    """Predictor that returns the last observed gradient.
+
+    This implements the "smooth prediction" strategy from online learning theory,
+    where we predict that the next gradient will be the same as the current one.
+
+    When used with optimistic OMD, this leads to regret bounds that scale with
+    the temporal variation of gradients: sum_t ||g_t - g_{t-1}||^2, rather than
+    sum_t ||g_t||^2.
+
+    References
+    ----------
+    Chiang et al. (2012). "Online optimization with gradual variations." JMLR.
+    Rakhlin & Sridharan (2013). "Online Learning with Predictable Sequences."
+    """
+
     def __call__(
         self, t: int, last_played_x: np.ndarray | None, last_grad: np.ndarray | None
     ) -> np.ndarray:
@@ -75,8 +90,27 @@ class LastGradPredictor:
         return np.array([])
 
 
-class SmoothPredictor:  # for implementing Optimistic Hedge (OHD)
-    def __init__(self, smoothness_L: float = 1.0):  # L from paper (Lipschitz constant)
+class SmoothPredictor:
+    """Predictor that returns clipped last gradient for bounded variation.
+
+    This implements optimistic prediction with bounded variation assumptions,
+    clipping the last observed gradient to [-L, L] where L is a smoothness constant.
+
+    When used with optimistic OMD, this is appropriate when gradients are known
+    to have bounded temporal variation, leading to improved regret bounds.
+
+    Parameters
+    ----------
+    smoothness_L : float, default=1.0
+        Lipschitz constant bounding gradient variation (clips to [-L, L]).
+
+    References
+    ----------
+    Chiang et al. (2012). "Online optimization with gradual variations." JMLR.
+    Rakhlin & Sridharan (2013). "Online Learning with Predictable Sequences."
+    """
+
+    def __init__(self, smoothness_L: float = 1.0):
         self.smoothness_L = smoothness_L
         self.last_grad = None
 
@@ -91,5 +125,5 @@ class SmoothPredictor:  # for implementing Optimistic Hedge (OHD)
                 if last_played_x is not None
                 else np.array([])
             )
-        # Paper-inspired: Predict bounded variation (e.g., clip to [-L, L])
+        # Predict bounded variation: clip to [-L, L]
         return np.clip(self.last_grad, -self.smoothness_L, self.smoothness_L)

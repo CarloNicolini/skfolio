@@ -3,7 +3,7 @@ import numpy as np
 from skfolio.optimization.online._mean_reversion import MeanReversion
 
 
-def test_mean_reversion_pa(X_small):
+def test_mean_reversion_passive_aggressive(X_small):
     m_olmar = MeanReversion(
         strategy="olmar",
         olmar_predictor="sma",

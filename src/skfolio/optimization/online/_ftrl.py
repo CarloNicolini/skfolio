@@ -13,10 +13,9 @@ Predictor = Callable[[int, np.ndarray | None, np.ndarray | None], np.ndarray]
 EtaSchedule = float | np.ndarray | Callable[[int], float]
 
 
-class _FTRLEngine:
-    r"""Implements a unified engine for Online Mirror Descent (OMD) and
-    Follow-the-Regularized-Leader (FTRL) through COMID (Composite-Objective Mirror Descent); Duchi et al., COLT 2010).
-    The helper _composite_update solves min ⟨η_t ĝ, w⟩ + ψ(w) with ψ un-linearised, exactly the COMID step.
+class FirstOrderOCO:
+    r"""Implements a unified engine for first order online convex optimization algorithms supporting both Online Mirror Descent (OMD) and Follow-the-Regularized-Leader (FTRL) through COMID (Composite-Objective Mirror Descent); Duchi et al., COLT 2010).
+    The helper `_composite_update` solves min ⟨η_t ĝ, w⟩ + ψ(w) with ψ un-linearised, exactly the COMID step.
 
     This engine provides the core logic for first-order online convex optimization
     algorithms, framed through the modern lens of FTRL-Proximal and dual averaging
@@ -26,12 +25,12 @@ class _FTRLEngine:
 
     OMD vs. FTRL
     ------------
-    - **OMD** takes a local proximal step around the current iterate `x_t` using the
+    Two update modes are supported:
+    - **OMD** (Online Mirror Descent) takes a local proximal step around the current iterate `x_t` using the
       current gradient `g_t`. Its update is:
       :math:`x_{t+1} = \arg\min_{x \in K} \{ \eta_t \langle g_t, x \rangle + D_\psi(x, x_t) \}`
 
-    - **FTRL** chooses the point that minimizes the regularized cumulative loss over
-      all past gradients:
+    - **FTRL** (Follow-the-Regularized-Leader) chooses the point that minimizes the regularized cumulative linearized loss over all past gradients:
       :math:`x_{t+1} = \arg\min_{x \in K} \{ \sum_{s=1}^{t} \langle g_s, x \rangle + \frac{1}{\eta_t}\psi(x) \}`
       This implementation uses a formulation where eta is multiplied with the linear term:
       :math:`x_{t+1} = \arg\min_{x \in K} \{ \eta_t \sum_{s=1}^{t} \langle g_s, x \rangle + \psi(x) \}`
@@ -45,10 +44,25 @@ class _FTRLEngine:
 
     Optimistic Updates
     ------------------
-    The engine supports optimistic updates by incorporating a predictor `m_t`
-    (a guess for the current gradient `g_t`) into the linear term of the
-    objective. This can improve performance in non-stationary environments.
-    See Chiang 2012.
+    The engine supports optimistic updates following Rakhlin & Sridharan (2013).
+    When a predictor is provided, the effective gradient at round t becomes:
+        g_eff = g_t - tilde{g}_t + tilde{g}_{t+1}
+    where:
+    - g_t is the actual gradient at round t
+    - tilde{g}_t is the prediction made at round t-1 (stored from previous round)
+    - tilde{g}_{t+1} is the new prediction made at round t (returned by predictor)
+
+    This formulation ensures the regret bound scales with ||g_t - tilde{g}_t||^2
+    (prediction error) rather than ||g_t||^2, providing better performance when
+    gradients are predictable.
+
+    **OMD mode**: Uses the full effective gradient in the local proximal step
+    **FTRL mode**: The telescoping sum handles the prediction terms implicitly
+                   through cumulative gradient tracking
+
+    See Orabona (2020+), "A Modern Introduction to Online Learning", Chapter 6,
+    Section 6.9 for detailed analysis. Also see Joulani et al. (2017) "A modular
+    analysis of adaptive (non-)convex optimization: Optimism, composite objectives, and variational bounds" for the original algorithm.
 
     Learning Rate Schedule
     ----------------------
@@ -85,6 +99,7 @@ class _FTRLEngine:
         self._G_sum: np.ndarray | None = None
         self._x_t: np.ndarray | None = None
         self._last_grad: np.ndarray | None = None
+        self._prev_prediction: np.ndarray | None = None
 
     def _get_eta(self, t: int) -> float:
         if callable(self.eta):
@@ -128,6 +143,10 @@ class _FTRLEngine:
             d = g.shape[0]
             self._x_t = self.projector.project(np.ones(d) / d)
 
+        # Initialize previous prediction to zeros on first step when predictor is used
+        if self._prev_prediction is None and self.predictor is not None:
+            self._prev_prediction = np.zeros_like(g)
+
         eta_t = self._get_eta(self._t)
 
         m_t = np.zeros_like(g)
@@ -148,12 +167,24 @@ class _FTRLEngine:
         from skfolio.optimization.online._mirror_maps import BurgMirrorMap
 
         if isinstance(self.map, BurgMirrorMap):
+            # Compute effective gradient for optimistic updates
+            effective_grad = g.copy()
+            if self._prev_prediction is not None:
+                effective_grad -= self._prev_prediction
+            effective_grad += m_t
             # Use specialized constrained_inverse method for Burg update
-            x_next, _ = self.map.constrained_inverse(self._x_t, eta_t, g + m_t)
+            x_next, _ = self.map.constrained_inverse(self._x_t, eta_t, effective_grad)
             # Apply external projector for additional constraints
             x_next = self.projector.project(x_next)
         elif self.mode == "omd":
-            lin = eta_t * (g + m_t)
+            # Compute effective gradient: g_t - tilde{g}_t + tilde{g}_{t+1}
+            # where tilde{g}_t is the prediction made at round t-1 (stored in _prev_prediction)
+            # and tilde{g}_{t+1} is the new prediction made at round t (m_t)
+            effective_grad = g.copy()
+            if self._prev_prediction is not None:
+                effective_grad -= self._prev_prediction
+            effective_grad += m_t
+            lin = eta_t * effective_grad
             if isinstance(self.map, DynamicMirrorMap):
                 _ = self.map.grad_psi(self._x_t)  # preserves Spy test (pre-geometry)
                 center = self.map.grad_psi_after(
@@ -180,6 +211,11 @@ class _FTRLEngine:
             self.map.update_state(g)
 
         self._last_grad = g.copy()
+
+        # Update previous prediction for next round (optimistic OMD)
+        if self.predictor is not None:
+            self._prev_prediction = m_t.copy()
+
         self._x_t = x_next
         self._t += 1
 
@@ -204,7 +240,7 @@ class SwordMeta:
 
     def __init__(
         self,
-        experts: list[_FTRLEngine],
+        experts: list[FirstOrderOCO],
         projector: BaseProjector,
         eta_meta: EtaSchedule = 1.0,
     ):

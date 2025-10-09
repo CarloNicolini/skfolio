@@ -1,6 +1,6 @@
 import numpy as np
 
-from skfolio.optimization.online._ftrl import _FTRLEngine
+from skfolio.optimization.online._ftrl import FirstOrderOCO
 from skfolio.optimization.online._mirror_maps import AdaptiveMahalanobisMap
 from skfolio.optimization.online._projection import IdentityProjector
 
@@ -33,7 +33,7 @@ def test_adagrad_off_by_one_accumulation_order_is_previous_only():
     # This test asserts that the per-round diagonal used BEFORE the update does not yet include g_t.
     d = 3
     spy = SpyMahalanobis(eps=1e-10)
-    eng = _FTRLEngine(
+    eng = FirstOrderOCO(
         mirror_map=spy, projector=IdentityProjector(), eta=1.0, mode="omd"
     )
     grads = gen_repeated_single_coord_grads(d=d, T=2, coord=0, val=3.0)
@@ -56,7 +56,7 @@ def test_adagrad_extreme_coordinate_hits_do_not_numerically_blow_up():
     # without causing NaNs in the adaptive geometry.
     d, T = 4, 10
     grads = [np.array([1e6, 0.0, 0.0, 0.0])] + [np.zeros(d)] * (T - 1)
-    eng = _FTRLEngine(
+    eng = FirstOrderOCO(
         mirror_map=AdaptiveMahalanobisMap(eps=1e-12),
         projector=IdentityProjector(),
         eta=1.0,

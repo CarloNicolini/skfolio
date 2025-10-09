@@ -14,12 +14,15 @@ import numpy as np  # mypy: ignore
 from scipy.stats import norm  # mypy: ignore
 
 from skfolio.optimization.online import _cwmr
-from skfolio.optimization.online._ftrl import _FTRLEngine
+from skfolio.optimization.online._ftrl import FirstOrderOCO
 from skfolio.optimization.online._mirror_maps import EuclideanMirrorMap
 from skfolio.optimization.online._mixins import PAMRVariant, UpdateMode
 from skfolio.optimization.online._prediction import BaseReversionPredictor
 from skfolio.optimization.online._projection import AutoProjector
-from skfolio.optimization.online._surrogates import SurrogateLoss
+from skfolio.optimization.online._surrogates import (
+    SquaredHingeLoss,
+    SurrogateLoss,
+)
 
 
 class BaseStrategy(ABC):
@@ -53,7 +56,7 @@ class PAMRStrategy(BaseStrategy):
     def __init__(
         self,
         surrogate: SurrogateLoss,
-        engine: _FTRLEngine | None,
+        engine: FirstOrderOCO | None,
         epsilon: float,
         pamr_variant: PAMRVariant = PAMRVariant.SIMPLE,
         pamr_C: float = 10.0,
@@ -92,7 +95,7 @@ class PAMRStrategy(BaseStrategy):
         """PAMR passive-aggressive step."""
         # margin = float(phi_eff @ trade_w)
         # loss = max(0.0, margin - self.epsilon) TODO control the loss with the margin is the same
-        loss = self.surrogate.value(trade_w, arr)
+        loss = self.surrogate(trade_w, arr)
         if loss <= 0.0:  # passive case, no update
             return trade_w.copy()
         # active case, perform update
@@ -108,8 +111,6 @@ class PAMRStrategy(BaseStrategy):
         # Softplus is a smooth proxy; we approximate Δ by loss for small β or
         # by loss/β for large β but we simply keep loss (empirical).
         # ---------------------------------------------------------------------------------
-        # TODO fix this within the SurrogateLoss class
-        from skfolio.optimization.online._surrogates import SquaredHingeLoss
 
         if isinstance(self.surrogate, SquaredHingeLoss):
             delta = np.sqrt(loss)
@@ -283,7 +284,7 @@ class OLMARStrategy(BaseStrategy):
         self,
         predictor: BaseReversionPredictor,
         surrogate: SurrogateLoss,
-        engine: _FTRLEngine | None,
+        engine: FirstOrderOCO | None,
         epsilon: float,
         olmar_order: int,
     ):

@@ -60,7 +60,7 @@ def test_smooth_prediction(X_small):
     # Test that smooth prediction runs and produces different weights from vanilla
     est_vanilla = FTRLProximal(strategy=FTRLStrategy.EG, learning_rate=0.1)
     est_smooth = FTRLProximal(
-        strategy=FTRLStrategy.EG, learning_rate=0.1, smooth_prediction=True
+        strategy=FTRLStrategy.EG, learning_rate=0.1, grad_predictor=True
     )
 
     est_vanilla.fit(X_small)
@@ -337,14 +337,14 @@ def test_smooth_prediction_accelerates_initial_adaptation():
         strategy=FTRLStrategy.EG,
         update_mode=False,
         learning_rate=0.3,
-        smooth_prediction=False,
+        grad_predictor=False,
         warm_start=False,
     )
     opti = FTRLProximal(
         strategy=FTRLStrategy.EG,
         update_mode=False,
         learning_rate=0.3,
-        smooth_prediction=True,
+        grad_predictor=True,
         warm_start=False,
     )
 

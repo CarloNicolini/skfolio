@@ -1,6 +1,6 @@
 import warnings
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -11,7 +11,7 @@ from skfolio.optimization._base import BaseOptimization
 from skfolio.optimization.online._ftrl import (
     Predictor,
     SwordMeta,
-    _FTRLEngine,
+    FirstOrderOCO,
 )
 from skfolio.optimization.online._mirror_maps import (
     AdaptiveMahalanobisMap,
@@ -28,7 +28,7 @@ from skfolio.optimization.online._mixins import (
     OnlineMixin,
     OnlineParameterConstraintsMixin,
 )
-from skfolio.optimization.online._prediction import LastGradPredictor
+from skfolio.optimization.online._prediction import LastGradPredictor, SmoothPredictor
 from skfolio.optimization.online._projection import (
     AutoProjector,
     IdentityProjector,
@@ -115,7 +115,7 @@ class OnlinePortfolioSelection(
             previous_weights=self.previous_weights,
             max_turnover=self.max_turnover,
         )
-        self._projector = AutoProjector(projection_config)
+        return AutoProjector(projection_config)
 
     def _initialize_weights(self, num_assets: int):
         if self.initial_weights is not None:
@@ -293,14 +293,14 @@ class FTRLProximal(OnlinePortfolioSelection):
 
     def __init__(
         self,
-        strategy: FTRLStrategy = FTRLStrategy.EG,
+        strategy: FTRLStrategy | str = FTRLStrategy.EG,
         *,
         learning_rate: float | Callable[[int], float] = 0.05,
-        update_mode: bool = False,
+        update_mode: Literal["ftrl", "omd"] = "ftrl",
         warm_start: bool = True,
         initial_weights: npt.ArrayLike | None = None,
         previous_weights: skt.MultiInput | None = None,
-        smooth_prediction: bool = False,
+        grad_predictor: Literal["last", "smooth"] | None = None,
         transaction_costs: skt.MultiInput = 0.0,
         management_fees: skt.MultiInput = 0.0,
         groups: skt.Groups | None = None,
@@ -339,17 +339,31 @@ class FTRLProximal(OnlinePortfolioSelection):
         ----------
             strategy: FTRLStrategy, default=FTRLStrategy.EG
                 The FTRL strategy to use.
-            ftrl: bool, default=False
-                If `True`, use the Follow-the-regularized-leader (FTRL) update.
-                If `False` (default), use the Online Mirror Descent (OMD) update.
+
+            update_mode: {"ftrl", "omd"}, default="ftrl"
+               Specifies which update rule to use:
+               - **"omd"** : use the Online Mirror Descent (a "local" Bregman/ proximal step)
+               - **"ftrl"** : use Follow-the-Regularized-Leader (a "global" minimization over cumulative losses + regularizer)
+
+               The two modes coincide under certain conditions (e.g. quadratic regularizer, smooth losses, fixed step size), but differ when non-smooth terms, changing regularization, or composite objectives are involved.
+
             learning_rate: float, default=1.0
                 Step size :math:`\eta_t` scaling factor for the learning rate schedule.
-                Can be a float or a callable `lambda t: f(t)`.
-                A good default to start is 1.
-                Otherwise, backed by cross-validation adaptive learning rate schedules like n / sqrt(t) with n the number of assets tend to yield good results.
-                In the limit learning_rate -> 0, the algorithm converges to the UCRP.
-                When strategy=FTRLStrategy.EG, the learning rate enters the softmax function, thus it acts as an inverse temperature parameter.
-                In the limit learning_rate -> 0, every expert is weighted equally (high temperature limit), while in the limit learning_rate -> +inf, the choice of expert is deterministic corresponding to the argmax.
+                Can be a float or a callable ``lambda t: f(t)``.
+                Otherwise, adaptive learning rate schedules such as :math:`1 / \sqrt{t}` (backed by cross-validation) tend to yield good results on small asset universes.
+
+                For EG, in the limit :math:`\eta \to 0`, the algorithm converges to the equally-weighted portfolio, as it acts as an inverse temperature parameter:
+
+                .. math::
+
+                    \lim_{\eta \to 0} w^{(\text{EG})} = (1/n, ..., 1/n)
+
+                In the limit :math:`\eta \to +\infty`, the choice of expert is deterministic, corresponding to the :math:`\arg\max` (i.e., tracking the best stock):
+
+                .. math::
+
+                    \lim_{\eta \to +\infty} w^{(\text{EG})} = \text{one-hot vector for best asset}
+
             transaction_costs : float | dict[str, float] | array-like of shape (n_assets, ), default=0.0
                 Transaction costs of the assets. It is used to add linear transaction costs to
                 the optimization problem:
@@ -398,51 +412,49 @@ class FTRLProximal(OnlinePortfolioSelection):
                     `X` is composed of **daily** returns, the `management_fees` need to be
                     expressed in **daily** fees.
             warm_start: bool
-                Whether to warm start the estimator.
+                Whether to warm start the estimator. If `False`, the estimator will be reset before fitting.
             initial_weights: np.ndarray
-                The initial weights to use.
+                The initial weights to use. If `None`, the estimator will be initialized to the equally-weighted portfolio.
             min_weights : float | dict[str, float] | array-like of shape (n_assets, ) | None, default=0.0
                 Minimum assets weights (weights lower bounds).
                 Differently from MeanRisk in online setting, set weights must be between 0 and 1.
-                If a float is provided, it is applied to each asset.
-                `None` is equivalent to `0`.
+                If a float is provided, it is applied to each asset. If `None`, the minimum weight is set to 0.
                 If a dictionary is provided, its (key/value) pair must be the
-                (asset name/asset minium weight) and the input `X` of the `fit` method must
+                (asset name/asset minimum weight) and the input `X` of the `fit` method must
                 be a DataFrame with the assets names in columns.
                 When using a dictionary, assets values that are not provided are assigned
-                a minimum weight of `0.0`.
-                The default value is `0.0` (no short selling).
+                a minimum weight of 0.
+                The default value is 0.0 (no short selling).
 
                 Example:
 
                 * `min_weights = 0` --> long only portfolio (no short selling).
-                * `min_weights = None` --> 0.
+                * `min_weights = None` --> default to 0
                 * `min_weights = {"SX5E": 0.2, "SPX":0.1}`
                 * `min_weights = [0.2, 0.3]`
 
             max_weights : float | dict[str, float] | array-like of shape (n_assets, ) | None, default=1.0
                 Maximum assets weights (weights upper bounds).
                 Differently from MeanRisk in online setting, set weights must be between 0 and 1.
-                If a float is provided, it is applied to each asset.
-                `None` is equivalent to 1.
+                If a float is provided, it is applied to each asset. If `None`, the maximum weight is set to 1.
                 If a dictionary is provided, its (key/value) pair must be the
                 (asset name/asset maximum weight) and the input `X` of the `fit` method must
                 be a DataFrame with the assets names in columns.
                 When using a dictionary, assets values that are not provided are assigned
-                a minimum weight of `1.0`.
-                The default value is `1.0` (each asset is below 100%).
+                a maximum weight of 1.
+                The default value is 1.0 (each asset is below 100%).
 
                 Example:
 
-                * `max_weights = None` --> default to 1
+                * `max_weights = None` --> default to 1.
                 * `max_weights = {"SX5E": 0.8, "SPX": 0.9}`
                 * `max_weights = [0.8, 0.9]`
 
             budget : float | None, default=1.0
                 Investment budget. It is the sum of long positions and short positions (sum of
-                all weights). `None` means no budget constraints.
+                all weights). If `None`, no budget constraints are applied.
                 Budget must be between 0 and 1.
-                The default value is `1.0` (fully invested portfolio).
+                The default value is 1.0 (fully invested portfolio).
 
             previous_weights : float | dict[str, float] | array-like of shape (n_assets, ), optional
                 Previous weights of the assets. Previous weights are used to compute the
@@ -546,18 +558,18 @@ class FTRLProximal(OnlinePortfolioSelection):
         self.strategy = strategy
         self.learning_rate = learning_rate
         self.update_mode = update_mode
-        self.smooth_epsilon = float(smooth_epsilon)
+        self.smooth_epsilon = smooth_epsilon
         self.adagrad_D = adagrad_D
-        self.adagrad_eps = float(adagrad_eps)
-        self.adabarrons_barrier_coef = float(adabarrons_barrier_coef)
-        self.adabarrons_alpha = float(adabarrons_alpha)
-        self.adabarrons_euclidean_coef = float(adabarrons_euclidean_coef)
-        self.adabarrons_beta = float(adabarrons_beta)
-        self.warm_start = bool(warm_start)
-        self.initial_weights = initial_weights
-        self.smooth_prediction = smooth_prediction
+        self.adagrad_eps = adagrad_eps
+        self.adabarrons_barrier_coef = adabarrons_barrier_coef
+        self.adabarrons_alpha = adabarrons_alpha
+        self.adabarrons_euclidean_coef = adabarrons_euclidean_coef
+        self.adabarrons_beta = adabarrons_beta
         self.eg_tilde = eg_tilde
         self.eg_tilde_alpha = eg_tilde_alpha
+        self.warm_start = warm_start
+        self.initial_weights = initial_weights
+        self.grad_predictor = grad_predictor
 
         # Costs and fees (public attributes preserved for predict())
         self.transaction_costs = transaction_costs
@@ -582,7 +594,7 @@ class FTRLProximal(OnlinePortfolioSelection):
         self.variance_bound = variance_bound
 
         # Internal state (initialized deterministically)
-        self._ftrl_engine: _FTRLEngine | None = None
+        self._ftrl_engine: FirstOrderOCO | None = None
         self._cumulative_loss: float = 0.0
 
     def _ensure_initialized(self, gross_relatives: np.ndarray) -> None:
@@ -606,26 +618,31 @@ class FTRLProximal(OnlinePortfolioSelection):
         )
 
         # Resolve transaction costs and management fees once number of assets is known
-        if self._projector is None:
-            self._initialize_projector()
+
+        self._projector = self._initialize_projector()
 
         if self._ftrl_engine is None:
             mirror_map: BaseMirrorMap | None = None
             predictor: Predictor | None = None
 
-            if self.smooth_prediction:
-                predictor = LastGradPredictor()
+            match self.grad_predictor:
+                case "last":
+                    predictor = LastGradPredictor()
+                case "smooth":
+                    predictor = SmoothPredictor()
+                case None:
+                    predictor = None
 
             match self.strategy:
-                case FTRLStrategy.EG:
+                case FTRLStrategy.EG | "eg":
                     mirror_map = EntropyMirrorMap()
-                case FTRLStrategy.OGD:
+                case FTRLStrategy.OGD | "ogd":
                     mirror_map = EuclideanMirrorMap()
-                case FTRLStrategy.PROD:
+                case FTRLStrategy.PROD | "prod":
                     mirror_map = BurgMirrorMap()
-                case FTRLStrategy.ADAGRAD:
+                case FTRLStrategy.ADAGRAD | "adagrad":
                     mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
-                case FTRLStrategy.ADABARRONS:
+                case FTRLStrategy.ADABARRONS | "adabarrons":
                     # Ada-BARRONS uses a compositional mirror map:
                     # - AdaBarronsBarrierMap: weight-proximity adaptive barrier
                     # - EuclideanMap: Euclidean regularization
@@ -637,36 +654,39 @@ class FTRLProximal(OnlinePortfolioSelection):
                         euclidean_coef=self.adabarrons_euclidean_coef,
                         beta=self.adabarrons_beta,
                     )
-                case FTRLStrategy.SWORD_VAR | FTRLStrategy.SWORD:
+                case (
+                    FTRLStrategy.SWORD_VAR | FTRLStrategy.SWORD | "sword" | "sword_var"
+                ):
                     # SWORD-Var: variation-adaptive OMD with optimistic gradients
-                    predictor = LastGradPredictor()
                     mirror_map = AdaptiveVariationMap(eps=self.adagrad_eps)
-                case FTRLStrategy.SWORD_SMALL:
+                case FTRLStrategy.SWORD_SMALL | "sword_small":
                     # SWORD-Small: AdaGrad geometry with optimistic gradients
-                    predictor = LastGradPredictor()
                     mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
-                case FTRLStrategy.SWORD_BEST | FTRLStrategy.SWORD_PP:
-                    # Meta-aggregator combining SWORD-Var and SWORD-Small, plus EG for ++
-                    predictor_var = LastGradPredictor()
-                    predictor_small = LastGradPredictor()
-                    var_engine = _FTRLEngine(
+                case (
+                    FTRLStrategy.SWORD_BEST
+                    | FTRLStrategy.SWORD_PP
+                    | "sword_best"
+                    | "sword_pp"
+                ):
+                    # Meta-aggregator combining SWORD-Var and SWORD-Small, plus EG for Sword++
+                    var_engine = FirstOrderOCO(
                         mirror_map=AdaptiveVariationMap(eps=self.adagrad_eps),
                         projector=IdentityProjector(),  # inner unconstrained
                         eta=self.learning_rate,
-                        predictor=predictor_var,
+                        predictor=LastGradPredictor(),
                         mode="omd",
                     )
-                    small_engine = _FTRLEngine(
+                    small_engine = FirstOrderOCO(
                         mirror_map=AdaptiveMahalanobisMap(eps=self.adagrad_eps),
                         projector=IdentityProjector(),
                         eta=self.learning_rate,
-                        predictor=predictor_small,
+                        predictor=LastGradPredictor(),
                         mode="omd",
                     )
-                    experts: list[_FTRLEngine] = [var_engine, small_engine]
-                    if self.strategy == FTRLStrategy.SWORD_PP:
-                        # add an entropy-geometry expert to stabilize/explore
-                        eg_engine = _FTRLEngine(
+                    experts: list[FirstOrderOCO] = [var_engine, small_engine]
+                    if self.strategy in (FTRLStrategy.SWORD_PP, "sword_pp"):
+                        # add an entropy-geometry expert to stabilize/explore (only for Sword++)
+                        eg_engine = FirstOrderOCO(
                             mirror_map=EntropyMirrorMap(),
                             projector=IdentityProjector(),
                             eta=self.learning_rate,
@@ -674,6 +694,8 @@ class FTRLProximal(OnlinePortfolioSelection):
                             mode="omd",
                         )
                         experts.append(eg_engine)
+                    # specific case treating SwordMeta differently
+                    # we initialize it here because it needs to be initialized with the experts (only for SwordMeta)
                     self._ftrl_engine = SwordMeta(
                         experts=experts,
                         projector=self._projector,
@@ -682,14 +704,18 @@ class FTRLProximal(OnlinePortfolioSelection):
                 case _:
                     raise ValueError("Unknown objective provided.")
 
+            # Finally initialize the FTRL engine to be used in the fit method
             if self._ftrl_engine is None:
-                skip_auto_update = self.strategy == FTRLStrategy.ADABARRONS
-                self._ftrl_engine = _FTRLEngine(
+                skip_auto_update = self.strategy in (
+                    FTRLStrategy.ADABARRONS,
+                    "adabarrons",
+                )
+                self._ftrl_engine = FirstOrderOCO(
                     mirror_map=mirror_map,
                     projector=self._projector,
                     eta=self.learning_rate,
                     predictor=predictor,
-                    mode="ftrl" if self.update_mode else "omd",
+                    mode=self.update_mode,
                     skip_auto_update=skip_auto_update,
                 )
 

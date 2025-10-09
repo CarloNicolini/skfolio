@@ -14,7 +14,7 @@ from sklearn.utils._param_validation import Interval, StrOptions
 from sklearn.utils.validation import validate_data
 
 from skfolio.optimization.online._base import OnlinePortfolioSelection
-from skfolio.optimization.online._ftrl import _FTRLEngine
+from skfolio.optimization.online._ftrl import FirstOrderOCO
 from skfolio.optimization.online._mirror_maps import (
     BaseMirrorMap,
     EntropyMirrorMap,
@@ -54,45 +54,72 @@ class MeanReversion(OnlinePortfolioSelection):
 
     Parameters
     ----------
-    strategy : {'olmar', 'pamr', 'cwmr'}, default='olmar'
-        Mean-reversion family.
-    # OLMAR parameters
+    strategy : {'olmar', 'pamr', 'cwmr'}
+        Mean-reversion strategy, can be one of 'olmar', 'pamr', or 'cwmr'.
+        OLMAR: Online Moving Average Reversion
+        PAMR: Passive-Aggressive Mean Reversion
+        CWMR: Confidence-Weighted Mean Reversion
+
     olmar_predictor : {"sma", "ewma"}
         OLMAR reversion predictor (sma=for simple moving-average, ewma for exponentially weighted).
+
     olmar_window : int, default=5
         OLMAR window size (applies only for SMA version).
+
     olmar_alpha : float, default=0.5
         OLMAR smoothing parameter (applies only for EWMA).
-    # PAMR parameters
+
     pamr_variant : {"simple", "slack_linear", "slack_quadratic"}, default="simple"
         PAMR variant "simple", "slack_linear", or "slack_quadratic".
         These variants are the 0, 1 and 2 versions of PAMR in Li & Hoi book (2012).
+
     pamr_C : float, default=500.0
         PAMR aggressiveness parameter.
-    # CWMR parameters
+
     cwmr_eta : float, default=0.95
         CWMR confidence level (0.5, 1).
+
     cwmr_sigma0 : float, default=1.0
         CWMR initial variance.
+
     cwmr_min_var, cwmr_max_var : float or None
         CWMR variance bounds.
+
     cwmr_mean_lr, cwmr_var_lr : float, default=1.0
         CWMR learning rates (MD mode).
-    # Mirror Descent (MD) and Passive-Aggressive (PA) parameters
+
     epsilon : float, default=2.0
-        Margin threshold.
+        Margin threshold. It detects mean reversion opportunities.
+        Larger values mean more tolerant to mean reversion opportunities with less false positives.
+        Smaller values mean more sensitive to mean reversion opportunities but potentially higher turnover.
+
     loss : {'hinge', 'squared_hinge', 'softplus'}, default='hinge'
-        Surrogate loss (MD mode).
+        Surrogate loss (MD mode). It is used to compute the gradient of the surrogate loss.
+        Hinge loss is the most common choice.
+        Squared hinge loss is a smooth variant of the hinge loss.
+        Softplus loss is a smooth variant of the hinge loss.
+
     beta : float, default=5.0
-        Softplus temperature.
+        Softplus temperature. It is used to compute the gradient of the softplus loss.
+        Larger values mean more sensitive to mean reversion opportunities but potentially higher turnover.
+        Smaller values mean more tolerant to mean reversion opportunities with less false positives.
+
     update_mode : {'pa', 'md'}, default='pa'
         Update mode (PA=passive-aggressive, MD=mirror-descent).
-        The passive aggressive update mode reflects the original algorithms.
-        The MD uses Online Mirror Descent and supports more flexibility (e.g., learning rate, mirror map).
+        PA: Passive-aggressive update mode reflects the original algorithms.
+        MD: Mirror-descent update mode uses Online Mirror Descent and supports more flexibility (e.g., learning rate, mirror map). It provides the OCO-style updates using surrogate losses.
+
     learning_rate : float or callable, default=1.0
-        Learning rate (MD mode).
+        Learning rate (MD mode). It is used to compute the gradient of the surrogate loss.
+        Larger values mean more aggressive updates.
+        Smaller values mean more conservative updates.
+
     mirror : {'euclidean', 'entropy'}, default='euclidean'
-        Mirror map (MD mode).
+        Mirror map to only be utilized in the MD mode.
+        It is used to compute the gradient of the surrogate loss.
+        Euclidean mirror map is the most common choice.
+        Entropy mirror map is a smooth variant of the Euclidean mirror map.
+
     **kwargs
         Additional constraints.
 
@@ -218,12 +245,11 @@ class MeanReversion(OnlinePortfolioSelection):
         self._strategy_impl: BaseStrategy | None = None
         self._predictor: BaseReversionPredictor | None = None
         self._surrogate: SurrogateLoss | None = None
-        self._engine: _FTRLEngine | None = None
+        self._engine: FirstOrderOCO | None = None
 
     def _initialize_components(self, d: int) -> None:
         """Initialize all strategy components."""
-        if self._projector is None:
-            self._initialize_projector()
+        self._projector = self._initialize_projector()
 
         if not self._weights_initialized:
             self._initialize_weights(d)
@@ -244,12 +270,17 @@ class MeanReversion(OnlinePortfolioSelection):
             self._strategy_impl = self._create_strategy(d)
 
     def _init_olmar_components(self, d: int) -> None:
-        """Initialize OLMAR-specific components."""
+        """
+        Initializes OLMAR-specific components: predictor, surrogate, and engine.
+        We also allow for alternative kinds of loss, thus extending the family of mean-reversion strategies in OLMAR that was initially thought to only support Hinge loss (max(0, epsilon - phi^T weights))
+        """
         if self._predictor is None:
-            if self.olmar_predictor == 1:
+            if self.olmar_predictor in (OLMARPredictor.SMA, 1, "sma"):
                 self._predictor = OLMAR1Predictor(window=self.olmar_window)
-            else:
+            elif self.olmar_predictor in (OLMARPredictor.EWMA, 2, "ewma"):
                 self._predictor = OLMAR2Predictor(alpha=self.olmar_alpha)
+            else:
+                raise ValueError(f"Unknown OLMAR predictor: {self.olmar_predictor}")
             self._predictor.reset(d)
 
         if self._surrogate is None:
@@ -274,7 +305,7 @@ class MeanReversion(OnlinePortfolioSelection):
         # CWMR doesn't need separate initialization
         pass
 
-    def _create_engine(self) -> _FTRLEngine:
+    def _create_engine(self) -> FirstOrderOCO:
         """Create FTRL engine for MD mode."""
         match self.mirror:
             case "euclidean":
@@ -284,7 +315,7 @@ class MeanReversion(OnlinePortfolioSelection):
             case _:
                 raise ValueError(f"Unknown mirror: {self.mirror}")
 
-        return _FTRLEngine(
+        return FirstOrderOCO(
             mirror_map=mm,
             projector=self._projector,
             eta=self.learning_rate,

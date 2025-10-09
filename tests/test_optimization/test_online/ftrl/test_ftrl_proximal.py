@@ -21,7 +21,7 @@ def test_entropy_omd_matches_exponentiated_gradient():
     """
     model = FTRLProximal(
         strategy=FTRLStrategy.EG,
-        update_mode=False,
+        update_mode="omd",
         learning_rate=0.5,
         warm_start=False,
         initial_weights=np.array([0.6, 0.4]),
@@ -42,7 +42,7 @@ def test_entropy_ftrl_matches_dual_averaging():
     Expected outcome: final weights align with dual averaging recursion, confirming cumulative-gradient handling."""
     model = FTRLProximal(
         strategy=FTRLStrategy.EG,
-        update_mode=True,
+        update_mode="ftrl",
         learning_rate=0.3,
         warm_start=False,
         initial_weights=np.array([0.5, 0.5]),
