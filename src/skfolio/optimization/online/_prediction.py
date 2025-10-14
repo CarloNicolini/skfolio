@@ -3,6 +3,68 @@ import numpy as np
 from skfolio.optimization.online._utils import CLIP_EPSILON
 
 
+def l1median_vazhz_vec(X, maxiter=200, tol=1e-9, zerotol=1e-15, medIn=None):
+    """
+    Compute the L1 (geometric) median of X using the Vardi-Zhang (Weiszfeld-type) algorithm.
+    Vectorized implementation (no explicit loop over samples).
+
+    Parameters
+    ----------
+    X : ndarray of shape (n_samples, n_features)
+        Input data points.
+    maxiter : int, optional
+        Maximum number of iterations (default: 200).
+    tol : float, optional
+        Convergence tolerance (default: 1e-9).
+    zerotol : float, optional
+        Distance below which points are considered coincident (default: 1e-15).
+    medIn : ndarray of shape (n_features,), optional
+        Initial median estimate (default: coordinate-wise median of X).
+
+    Returns
+    -------
+    y : ndarray of shape (n_features,)
+        Estimated L1 (geometric) median.
+    """
+    X = np.asarray(X, dtype=float)
+    n, d = X.shape
+    y = np.median(X, axis=0) if medIn is None else np.asarray(medIn, dtype=float)
+
+    for _ in range(maxiter):
+        diffs = X - y  # shape: (n, d)
+        dists = np.linalg.norm(diffs, axis=1)  # shape: (n,)
+
+        # Mask for nonzero distances
+        mask = dists >= zerotol
+        if not np.any(mask):
+            break
+
+        inv_dists = np.zeros_like(dists)
+        inv_dists[mask] = 1.0 / dists[mask]
+
+        # Weighted averages
+        Tnum = np.sum(X * inv_dists[:, None], axis=0)
+        Tden = np.sum(inv_dists)
+        T = Tnum / Tden if Tden != 0 else np.zeros(d)
+
+        # Compute R and yita
+        R = np.sum(diffs[mask] * inv_dists[mask, None], axis=0)
+        yita = np.any(~mask).astype(float)
+
+        Rnorm = np.linalg.norm(R)
+        r = min(1.0, yita / Rnorm) if Rnorm != 0 else 0.0
+
+        Ty = (1 - r) * T + r * y
+
+        # Convergence test
+        iterdis = np.linalg.norm(Ty - y, 1) - tol * np.linalg.norm(y, 1)
+        y = Ty
+        if iterdis <= 0:
+            break
+
+    return y
+
+
 class BaseReversionPredictor:
     def reset(self, d: int) -> None:
         self._d = d
@@ -61,6 +123,77 @@ class OLMAR2Predictor(BaseReversionPredictor):
             self._phi / np.maximum(x_t, CLIP_EPSILON)
         )
         return self._phi.copy()
+
+
+class RMRPredictor(BaseReversionPredictor):
+    """RMR L1-median reversion predictor.
+
+    Uses the geometric median (L1-median) of recent price vectors
+    as a robust predictor, less sensitive to outliers than OLMAR's
+    arithmetic mean.
+
+    Parameters
+    ----------
+    window : int, default=5
+        Window size for historical price vectors.
+    max_iter : int, default=200
+        Maximum iterations for L1-median computation.
+    tolerance : float, default=1e-9
+        Convergence tolerance for L1-median algorithm.
+
+    References
+    ----------
+    Huang, D., Zhou, J., Li, B., Hoi, S. C. H., & Zhou, S. (2013).
+    Robust Median Reversion Strategy for On-Line Portfolio Selection.
+    IJCAI.
+    """
+
+    def __init__(self, window: int = 5, max_iter: int = 200, tolerance: float = 1e-9):
+        if window < 1:
+            raise ValueError("window must be >= 1.")
+        if max_iter < 1:
+            raise ValueError("max_iter must be >= 1.")
+        if tolerance <= 0:
+            raise ValueError("tolerance must be > 0.")
+        self.window = int(window)
+        self.max_iter = int(max_iter)
+        self.tolerance = float(tolerance)
+        self._history: list[np.ndarray] = []
+        self._price_history: list[np.ndarray] = []
+
+    def reset(self, d: int) -> None:
+        super().reset(d)
+        self._history = []
+        self._price_history = []
+
+    def update_and_predict(self, x_t: np.ndarray) -> np.ndarray:
+        x_t = np.asarray(x_t, dtype=float)
+        self._history.append(x_t)
+
+        # Reconstruct prices (cumulative product)
+        if not self._price_history:
+            p_t = np.ones_like(x_t)
+        else:
+            p_t = self._price_history[-1] * x_t
+        self._price_history.append(p_t)
+
+        T = len(self._price_history)
+        W = self.window
+
+        # Cold-start: match OLMAR-1 behavior
+        if T < W + 1:
+            return self._history[-1].copy()
+
+        # Compute L1-median of recent W price vectors
+        recent_prices = np.stack(self._price_history[-W:], axis=0)
+        median_price = l1median_vazhz_vec(
+            recent_prices, maxiter=self.max_iter, tol=self.tolerance
+        )
+
+        # Convert to price relative: median_price / current_price
+        p_current = self._price_history[-1]
+        phi = median_price / np.maximum(p_current, CLIP_EPSILON)
+        return phi
 
 
 class LastGradPredictor:

@@ -14,15 +14,12 @@ import numpy as np  # mypy: ignore
 from scipy.stats import norm  # mypy: ignore
 
 from skfolio.optimization.online import _cwmr
+from skfolio.optimization.online._autograd_objectives import BaseObjective
 from skfolio.optimization.online._ftrl import FirstOrderOCO
 from skfolio.optimization.online._mirror_maps import EuclideanMirrorMap
 from skfolio.optimization.online._mixins import PAMRVariant, UpdateMode
 from skfolio.optimization.online._prediction import BaseReversionPredictor
 from skfolio.optimization.online._projection import AutoProjector
-from skfolio.optimization.online._surrogates import (
-    SquaredHingeLoss,
-    SurrogateLoss,
-)
 
 
 class BaseStrategy(ABC):
@@ -55,19 +52,21 @@ class PAMRStrategy(BaseStrategy):
 
     def __init__(
         self,
-        surrogate: SurrogateLoss,
+        objective: BaseObjective,
         engine: FirstOrderOCO | None,
         epsilon: float,
         pamr_variant: PAMRVariant = PAMRVariant.SIMPLE,
         pamr_C: float = 10.0,
+        transaction_costs_arr: np.ndarray | None = None,
     ):
         self.engine = engine
-        self.surrogate = surrogate
+        self.objective = objective
         self.epsilon = epsilon
         self.variant = (
             PAMRVariant(pamr_variant) if isinstance(pamr_variant, int) else pamr_variant
         )
         self.pamr_C = pamr_C
+        self.transaction_costs_arr = transaction_costs_arr
 
     def reset(self, d: int) -> None:
         pass  # PAMR has no state
@@ -92,54 +91,87 @@ class PAMRStrategy(BaseStrategy):
     def _pa_step(
         self, trade_w: np.ndarray, arr: np.ndarray, projector: AutoProjector
     ) -> np.ndarray:
-        """PAMR passive-aggressive step."""
-        # margin = float(phi_eff @ trade_w)
-        # loss = max(0.0, margin - self.epsilon) TODO control the loss with the margin is the same
-        loss = self.surrogate(trade_w, arr)
+        """PAMR passive-aggressive step using objective.
+
+        PAMR wants w^T x <= epsilon, so loss = max(0, w^T x - epsilon).
+        This is opposite to OLMAR which wants phi^T w >= epsilon.
+
+        The objective is designed for OLMAR semantics, so we pass -x_t
+        to flip the sign: loss(w, -x) = max(0, ε - w^T(-x)) = max(0, ε + w^T x)
+        is wrong, so instead we negate the gradient result.
+        """
+        x_t = arr  # For PAMR, arr is x_t
+
+        # PAMR semantics: pass -x_t to objective to flip sign
+        # loss(w, -x_t) = max(0, ε - w^T(-x_t)) = max(0, ε + w^T x_t)
+        # But we want: max(0, w^T x_t - ε)
+        # So let's compute directly for PAMR
+        margin = float(np.dot(trade_w, x_t))
+        loss = max(0.0, margin - self.epsilon)
+
         if loss <= 0.0:  # passive case, no update
             return trade_w.copy()
-        # active case, perform update
-        # Center gradient to remain in simplex tangent space
-        # c = x - mean(x)
-        c = arr - np.mean(arr)
-        denom = float(np.dot(c, c))
 
-        # ---------------------------------------------------------------------------------
-        # Convert surrogate-specific loss into the *margin shortfall* Δ = max(0, margin-ε)
-        # For hinge:    loss   = Δ
-        # For squared:  loss   = Δ²   ⇒ Δ = sqrt(loss)
-        # Softplus is a smooth proxy; we approximate Δ by loss for small β or
-        # by loss/β for large β but we simply keep loss (empirical).
-        # ---------------------------------------------------------------------------------
+        # PAMR gradient: +x_t when violated (want to reduce w^T x)
+        # Objective returns -phi, so negate: -(-x_t) = x_t
+        # Actually, let's compute directly for clarity
+        c = x_t - np.mean(x_t)
 
-        if isinstance(self.surrogate, SquaredHingeLoss):
-            delta = np.sqrt(loss)
-        else:
-            delta = loss
+        # Add transaction cost subgradient to direction
+        if self.transaction_costs_arr is not None:
+            prev = projector.config.previous_weights
+            if prev is not None:
+                prev_arr = np.asarray(prev, dtype=float)
+                if prev_arr.shape == trade_w.shape:
+                    delta = trade_w - prev_arr
+                    tc_grad = self.transaction_costs_arr * np.sign(delta)
+                    c = c + tc_grad
+                    c = c - np.mean(c)  # Re-center
 
-        # Compute tau based on PAMR variant using Δ
+        c_norm_sq = float(np.dot(c, c))
+
+        if c_norm_sq < 1e-16:
+            return trade_w.copy()
+
+        # Compute tau based on PAMR variant
+        # All variants use the loss value directly (design decision: option a)
         match self.variant:
             case PAMRVariant.SIMPLE:
-                tau = delta / denom
+                tau = loss / c_norm_sq
             case PAMRVariant.SLACK_LINEAR:
-                tau = min(self.pamr_C, delta / denom)
+                tau = min(self.pamr_C, loss / c_norm_sq)
             case PAMRVariant.SLACK_QUADRATIC:
-                tau = delta / (denom + 1.0 / (2.0 * self.pamr_C))
+                tau = loss / (c_norm_sq + 1.0 / (2.0 * self.pamr_C))
             case _:
                 raise ValueError(f"Unhandled PAMR variant: {self.variant}")
 
+        # Update: w_new = w - tau * c (gradient descent step)
+        w_new = trade_w - tau * c
         projector.config.previous_weights = trade_w
-        return projector.project(trade_w - tau * c)
+        return projector.project(w_new)
 
     def _md_step(
         self, trade_w: np.ndarray, phi_eff: np.ndarray, projector: AutoProjector
     ) -> np.ndarray:
-        """PAMR mirror-descent step. This is experimental, PAMR paper is described using PA-only updates."""
+        """PAMR mirror-descent step.
+
+        PAMR wants w^T x <= epsilon. When violated (w^T x > epsilon),
+        gradient points in direction of x to reduce the margin.
+
+        Since the objective is designed for OLMAR semantics (grad = -phi),
+        we need to negate to get PAMR semantics (grad = +x).
+        """
         if self.engine is None:
             raise ValueError("MD mode requires engine to be initialized")
 
-        margin = float(phi_eff @ trade_w)
-        g = phi_eff if (margin - self.epsilon) > 0.0 else np.zeros_like(phi_eff)
+        x_t = phi_eff  # For PAMR, phi_eff is x_t
+        margin = float(np.dot(trade_w, x_t))
+
+        # PAMR gradient: +x_t when margin > epsilon, else 0
+        if margin > self.epsilon:
+            g = x_t
+        else:
+            g = np.zeros_like(x_t)
 
         # Center gradient for Euclidean geometry
         if isinstance(self.engine.map, EuclideanMirrorMap):
@@ -149,7 +181,15 @@ class PAMRStrategy(BaseStrategy):
                 "PAMR MD step with non-Euclidean mirror map is experimental and may not work as intended.",
                 stacklevel=2,
             )
-        # TODO what should we do in case of other mirror maps, for example EntropyMirrorMap?
+
+        # Add transaction cost subgradient
+        if self.transaction_costs_arr is not None:
+            prev = projector.config.previous_weights
+            if prev is not None:
+                prev_arr = np.asarray(prev, dtype=float)
+                if prev_arr.shape == trade_w.shape:
+                    delta = trade_w - prev_arr
+                    g += self.transaction_costs_arr * np.sign(delta)
 
         # TODO this assignment is a bit ugly, we should refactor the engine interface?
         projector.config.previous_weights = trade_w
@@ -283,16 +323,18 @@ class OLMARStrategy(BaseStrategy):
     def __init__(
         self,
         predictor: BaseReversionPredictor,
-        surrogate: SurrogateLoss,
+        objective: BaseObjective,
         engine: FirstOrderOCO | None,
         epsilon: float,
         olmar_order: int,
+        transaction_costs_arr: np.ndarray | None = None,
     ):
         self.predictor = predictor
-        self.surrogate = surrogate
+        self.objective = objective
         self.engine = engine
         self.epsilon = epsilon
         self.olmar_order = olmar_order
+        self.transaction_costs_arr = transaction_costs_arr
         self._t = 0
 
     def reset(self, d: int) -> None:
@@ -305,6 +347,9 @@ class OLMARStrategy(BaseStrategy):
             # OLMAR-1 needs window periods of history before updating
             # After window periods (t=0,1,...,window-1), we have window+1 prices
             # Start updating at t=window
+            return t >= self.predictor.window
+        elif self.olmar_order == "rmr":
+            # RMR uses same cold-start as OLMAR-1
             return t >= self.predictor.window
         # OLMAR-2 can start updating from t >= 1
         return t >= 1
@@ -328,35 +373,68 @@ class OLMARStrategy(BaseStrategy):
     def _pa_step(
         self, trade_w: np.ndarray, phi_eff: np.ndarray, projector: AutoProjector
     ) -> np.ndarray:
-        """OLMAR passive-aggressive step."""
-        margin = float(phi_eff @ trade_w)
-        ell = max(0.0, self.epsilon - margin)
-        if ell <= 0.0:
+        """OLMAR passive-aggressive step using objective.
+
+        OLMAR wants phi^T w >= epsilon, so loss = max(0, epsilon - phi^T w).
+        The PA update moves toward phi to increase phi^T w.
+        """
+        # Compute loss using objective
+        loss = self.objective.loss(trade_w, phi_eff)
+        if loss <= 0.0:
             return trade_w.copy()
 
-        c = phi_eff - np.mean(phi_eff)
-        denom = float(np.dot(c, c))
-        if denom <= 0.0:
+        # Compute gradient using objective
+        # Objective grad = -phi (loss decrease direction)
+        # But PA wants to move toward +phi (increase phi^T w)
+        # So negate the gradient
+        g = -self.objective.grad(trade_w, phi_eff)
+
+        # Center for simplex tangent space
+        c = g - np.mean(g)
+
+        # Add transaction cost subgradient to direction
+        if self.transaction_costs_arr is not None:
+            prev = projector.config.previous_weights
+            if prev is not None:
+                prev_arr = np.asarray(prev, dtype=float)
+                if prev_arr.shape == trade_w.shape:
+                    delta = trade_w - prev_arr
+                    tc_grad = self.transaction_costs_arr * np.sign(delta)
+                    c = c + tc_grad
+                    c = c - np.mean(c)  # Re-center
+
+        c_norm_sq = float(np.dot(c, c))
+        if c_norm_sq <= 1e-16:
             return trade_w.copy()
 
-        lam = ell / denom
+        lam = loss / c_norm_sq
         projector.config.previous_weights = trade_w
         return projector.project(trade_w + lam * c)
 
     def _md_step(
         self, trade_w: np.ndarray, phi_eff: np.ndarray, projector: AutoProjector
     ) -> np.ndarray:
-        """OLMAR mirror-descent step."""
+        """OLMAR mirror-descent step using objective gradient."""
         if self.engine is None:
             raise ValueError("MD mode requires engine to be initialized")
 
-        g = self.surrogate.grad(trade_w, phi_eff)
+        # Compute gradient using objective
+        g = self.objective.grad(trade_w, phi_eff)
 
         # Center gradient for Euclidean geometry
         from skfolio.optimization.online._mirror_maps import EuclideanMirrorMap
 
         if isinstance(self.engine.map, EuclideanMirrorMap):
             g -= np.mean(g)
+
+        # Add transaction cost subgradient
+        if self.transaction_costs_arr is not None:
+            prev = projector.config.previous_weights
+            if prev is not None:
+                prev_arr = np.asarray(prev, dtype=float)
+                if prev_arr.shape == trade_w.shape:
+                    delta = trade_w - prev_arr
+                    g += self.transaction_costs_arr * np.sign(delta)
 
         projector.config.previous_weights = trade_w
         return self.engine.step(g)

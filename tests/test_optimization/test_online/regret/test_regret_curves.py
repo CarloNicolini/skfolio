@@ -1,9 +1,9 @@
 import numpy as np
 import pytest
 
-from skfolio.optimization.online import FTRLProximal, RegretType, regret
+from skfolio.optimization.online import FollowTheWinner, RegretType, regret
 from skfolio.optimization.online._benchmark import BCRP
-from skfolio.optimization.online._mixins import FTRLStrategy
+from skfolio.optimization.online._mixins import FTWStrategy
 from skfolio.optimization.online._utils import CLIP_EPSILON, net_to_relatives
 
 
@@ -32,7 +32,7 @@ def _iid_relatives(T: int, n: int, seed: int = 0, sigma: float = 0.02) -> np.nda
 
 
 @pytest.mark.parametrize(
-    "objective", [FTRLStrategy.EG, FTRLStrategy.OGD, FTRLStrategy.ADAGRAD]
+    "objective", [FTWStrategy.EG, FTWStrategy.OGD, FTWStrategy.ADAGRAD]
 )
 def test_static_regret_matches_manual(objective):
     """
@@ -44,7 +44,7 @@ def test_static_regret_matches_manual(objective):
     X_net = relatives - 1.0
 
     # Online estimator
-    est_for_regret = FTRLProximal(
+    est_for_regret = FollowTheWinner(
         strategy=objective, learning_rate=0.1, warm_start=False
     )
 
@@ -56,7 +56,7 @@ def test_static_regret_matches_manual(objective):
     assert np.all(np.isfinite(r_curve))
 
     # Manual recomputation using fresh estimators
-    est_manual = FTRLProximal(
+    est_manual = FollowTheWinner(
         strategy=objective, learning_rate=0.1, warm_start=False
     ).fit(X_net)
     W_online = est_manual.all_weights_
@@ -85,22 +85,22 @@ def test_regret_average_modes_consistency_static():
     relatives = _iid_relatives(T, n, seed=2)
     X_net = relatives - 1.0
 
-    est = FTRLProximal(strategy=FTRLStrategy.EG, learning_rate=0.1, warm_start=False)
+    est = FollowTheWinner(strategy=FTWStrategy.EG, learning_rate=0.1, warm_start=False)
 
     r_running = regret(
         estimator=est, X=X_net, regret_type=RegretType.STATIC, average=True
     )
     r_running_str = regret(
-        estimator=FTRLProximal(
-            strategy=FTRLStrategy.EG, learning_rate=0.1, warm_start=False
+        estimator=FollowTheWinner(
+            strategy=FTWStrategy.EG, learning_rate=0.1, warm_start=False
         ),
         X=X_net,
         regret_type=RegretType.STATIC,
         average="running",
     )
     r_final = regret(
-        estimator=FTRLProximal(
-            strategy=FTRLStrategy.EG, learning_rate=0.1, warm_start=False
+        estimator=FollowTheWinner(
+            strategy=FTWStrategy.EG, learning_rate=0.1, warm_start=False
         ),
         X=X_net,
         regret_type=RegretType.STATIC,
@@ -122,7 +122,7 @@ def test_windowed_regret_consistency():
     X_net = relatives - 1.0
     window = 10
 
-    est = FTRLProximal(strategy=FTRLStrategy.OGD, learning_rate=0.1, warm_start=False)
+    est = FollowTheWinner(strategy=FTWStrategy.OGD, learning_rate=0.1, warm_start=False)
     # Library curve
     r_win = regret(
         estimator=est,
@@ -133,8 +133,8 @@ def test_windowed_regret_consistency():
     )
 
     # Manual computation
-    est_m = FTRLProximal(
-        strategy=FTRLStrategy.OGD, learning_rate=0.1, warm_start=False
+    est_m = FollowTheWinner(
+        strategy=FTWStrategy.OGD, learning_rate=0.1, warm_start=False
     ).fit(X_net)
     W_online = est_m.all_weights_
     R = net_to_relatives(X_net)
@@ -156,13 +156,13 @@ def test_windowed_regret_consistency():
 @pytest.mark.parametrize(
     "objective",
     [
-        FTRLStrategy.EG,
-        FTRLStrategy.OGD,
-        FTRLStrategy.ADAGRAD,
-        FTRLStrategy.SWORD_VAR,
-        FTRLStrategy.SWORD_SMALL,
-        FTRLStrategy.SWORD_BEST,
-        FTRLStrategy.SWORD_PP,
+        FTWStrategy.EG,
+        FTWStrategy.OGD,
+        FTWStrategy.ADAGRAD,
+        FTWStrategy.SWORD_VAR,
+        FTWStrategy.SWORD_SMALL,
+        FTWStrategy.SWORD_BEST,
+        FTWStrategy.SWORD_PP,
     ],
 )
 def test_random_relatives_static_and_dynamic_regret_curves(objective):
@@ -174,11 +174,13 @@ def test_random_relatives_static_and_dynamic_regret_curves(objective):
     relatives = _iid_relatives(T, n, seed=4)
     X_net = relatives - 1.0
 
-    model = FTRLProximal(strategy=objective, learning_rate=0.1, warm_start=False)
+    model = FollowTheWinner(strategy=objective, learning_rate=0.1, warm_start=False)
 
     rs = regret(estimator=model, X=X_net, regret_type=RegretType.STATIC, average=False)
     rd = regret(
-        estimator=FTRLProximal(strategy=objective, learning_rate=0.1, warm_start=False),
+        estimator=FollowTheWinner(
+            strategy=objective, learning_rate=0.1, warm_start=False
+        ),
         X=X_net,
         regret_type=RegretType.DYNAMIC,
         average=False,
@@ -203,7 +205,7 @@ def test_dynamic_regret_curve_matches_prefix_comparator_behavior():
     X_net = relatives - 1.0
 
     # Online EG
-    est = FTRLProximal(strategy=FTRLStrategy.EG, learning_rate=0.05, warm_start=False)
+    est = FollowTheWinner(strategy=FTWStrategy.EG, learning_rate=0.05, warm_start=False)
     est_fit = est.fit(X_net)
     W_online = est_fit.all_weights_
     R = net_to_relatives(X_net)
@@ -217,8 +219,8 @@ def test_dynamic_regret_curve_matches_prefix_comparator_behavior():
 
     # Library computation
     rd = regret(
-        estimator=FTRLProximal(
-            strategy=FTRLStrategy.EG, learning_rate=0.05, warm_start=False
+        estimator=FollowTheWinner(
+            strategy=FTWStrategy.EG, learning_rate=0.05, warm_start=False
         ),
         X=X_net,
         regret_type=RegretType.DYNAMIC,

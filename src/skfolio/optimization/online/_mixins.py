@@ -1,8 +1,8 @@
 from enum import auto
-from numbers import Integral, Real
+from numbers import Real
 from typing import ClassVar
 
-from sklearn.utils._param_validation import Interval, StrOptions  # mypy: ignore
+from sklearn.utils._param_validation import Interval
 
 from skfolio.utils.tools import AutoEnum
 
@@ -15,7 +15,7 @@ class RegretType(AutoEnum):
     DYNAMIC_LEGACY = auto()
 
 
-class FTRLStrategy(AutoEnum):
+class FTWStrategy(AutoEnum):
     OGD = auto()
     EG = auto()
     ADAGRAD = auto()
@@ -25,20 +25,22 @@ class FTRLStrategy(AutoEnum):
     SWORD_BEST = auto()
     SWORD_PP = auto()
     PROD = auto()  # Soft-Bayes Prod algorithm
-    SWORD = SWORD_VAR
 
 
-class MeanReversionStrategy(AutoEnum):
+class FTLStrategy(AutoEnum):
     """
-    Mean-reversion families (mean-reversion).
+    Follow-The-Loser families (mean-reversion).
 
+    - OLMAR: Online Moving Average Reversion
     - PAMR: Passive-Aggressive Mean Reversion
     - CWMR: Confidence-Weighted Mean Reversion (distributional, second-order)
+    - RMR: Robust Median Reversion (L1-median, outlier-robust)
     """
 
     OLMAR = auto()
     PAMR = auto()
     CWMR = auto()
+    RMR = auto()
 
 
 class PAMRVariant(AutoEnum):
@@ -82,13 +84,11 @@ class OnlineMixin:
 
 class OnlineParameterConstraintsMixin:
     _parameter_constraints: ClassVar[dict] = {
-        "objective": [StrOptions({m.value for m in FTRLStrategy})],
-        "ftrl": ["boolean"],
         "learning_rate": [Interval(Real, 0, None, closed="neither"), callable],
         "warm_start": ["boolean"],
         "initial_weights": ["array-like", None],
+        "initial_wealth": [Interval(Real, 0, None, closed="neither"), None],
         "previous_weights": ["array-like", None],
-        "l2_coef": [Interval(Real, 0, None, closed="left")],
         "transaction_costs": [
             Interval(Real, 0, None, closed="left"),
             "array-like",

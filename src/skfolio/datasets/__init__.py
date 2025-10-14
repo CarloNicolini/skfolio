@@ -12,6 +12,7 @@ from skfolio.datasets._base import (
     load_sp500_index,
 )
 from skfolio.datasets._relatives import (
+    load_cmc20_relatives_dataset,
     load_djia_relatives_dataset,
     load_msci_relatives_dataset,
     load_nyse_o_relatives_dataset,
@@ -20,6 +21,7 @@ from skfolio.datasets._relatives import (
 )
 
 __all__ = [
+    "load_cmc20_relatives_dataset",
     "load_djia_relatives_dataset",
     "load_factors_dataset",
     "load_ftse100_dataset",

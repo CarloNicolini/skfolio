@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-from skfolio.optimization.online import FTRLProximal, RegretType, regret
-from skfolio.optimization.online._mixins import FTRLStrategy
+from skfolio.optimization.online import FollowTheWinner, RegretType, regret
+from skfolio.optimization.online._mixins import FTWStrategy
 from skfolio.optimization.online._utils import net_to_relatives
 
 
@@ -16,7 +16,7 @@ def test_worst_case_dynamic_nonnegativity():
     R = _iid_relatives(T, n, seed=1)
     X = R - 1.0
 
-    est = FTRLProximal(strategy=FTRLStrategy.EG, learning_rate=0.1, warm_start=False)
+    est = FollowTheWinner(strategy=FTWStrategy.EG, learning_rate=0.1, warm_start=False)
     rd = regret(
         estimator=est, X=X, regret_type=RegretType.DYNAMIC_WORST_CASE, average=False
     )
@@ -30,12 +30,12 @@ def test_universal_dynamic_pt_zero_equals_static():
     R = _iid_relatives(T, n, seed=2)
     X = R - 1.0
 
-    est = FTRLProximal(strategy=FTRLStrategy.OGD, learning_rate=0.1, warm_start=False)
+    est = FollowTheWinner(strategy=FTWStrategy.OGD, learning_rate=0.1, warm_start=False)
 
     r_static = regret(estimator=est, X=X, regret_type=RegretType.STATIC, average=False)
     r_univ_pt0 = regret(
-        estimator=FTRLProximal(
-            strategy=FTRLStrategy.OGD, learning_rate=0.1, warm_start=False
+        estimator=FollowTheWinner(
+            strategy=FTWStrategy.OGD, learning_rate=0.1, warm_start=False
         ),
         X=X,
         regret_type=RegretType.DYNAMIC_UNIVERSAL,
@@ -54,7 +54,7 @@ def test_universal_dynamic_monotonic_in_pt():
     T, n = 80, 4
     R = _iid_relatives(T, n, seed=3)
     X = R - 1.0
-    est = FTRLProximal(strategy=FTRLStrategy.EG, learning_rate=0.05, warm_start=False)
+    est = FollowTheWinner(strategy=FTWStrategy.EG, learning_rate=0.05, warm_start=False)
 
     PTs = [
         0.0,
@@ -79,8 +79,8 @@ def test_universal_dynamic_monotonic_in_pt():
 
     # Compare with worst-case dynamic regret
     r_wc = regret(
-        estimator=FTRLProximal(
-            strategy=FTRLStrategy.EG, learning_rate=0.05, warm_start=False
+        estimator=FollowTheWinner(
+            strategy=FTWStrategy.EG, learning_rate=0.05, warm_start=False
         ),
         X=X,
         regret_type=RegretType.DYNAMIC_WORST_CASE,
@@ -94,14 +94,14 @@ def test_dynamic_legacy_alias_warns_and_matches():
     T, n = 40, 3
     R = _iid_relatives(T, n, seed=4)
     X = R - 1.0
-    est = FTRLProximal(strategy=FTRLStrategy.EG, learning_rate=0.1, warm_start=False)
+    est = FollowTheWinner(strategy=FTWStrategy.EG, learning_rate=0.1, warm_start=False)
 
     with pytest.warns(UserWarning):
         r_dyn = regret(estimator=est, X=X, regret_type=RegretType.DYNAMIC)
 
     r_leg = regret(
-        estimator=FTRLProximal(
-            strategy=FTRLStrategy.EG, learning_rate=0.1, warm_start=False
+        estimator=FollowTheWinner(
+            strategy=FTWStrategy.EG, learning_rate=0.1, warm_start=False
         ),
         X=X,
         regret_type=RegretType.DYNAMIC_LEGACY,

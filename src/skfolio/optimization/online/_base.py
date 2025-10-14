@@ -1,6 +1,5 @@
 import warnings
-from collections.abc import Callable
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -8,33 +7,15 @@ from sklearn.utils.validation import _check_sample_weight, validate_data
 
 import skfolio.typing as skt
 from skfolio.optimization._base import BaseOptimization
-from skfolio.optimization.online._ftrl import (
-    Predictor,
-    SwordMeta,
-    FirstOrderOCO,
-)
-from skfolio.optimization.online._mirror_maps import (
-    AdaptiveMahalanobisMap,
-    AdaptiveVariationMap,
-    BaseMirrorMap,
-    BurgMirrorMap,
-    CompositeMirrorMap,
-    EntropyMirrorMap,
-    EuclideanMirrorMap,
-    make_ada_barrons_mirror_map,
-)
 from skfolio.optimization.online._mixins import (
-    FTRLStrategy,
     OnlineMixin,
     OnlineParameterConstraintsMixin,
 )
-from skfolio.optimization.online._prediction import LastGradPredictor, SmoothPredictor
 from skfolio.optimization.online._projection import (
     AutoProjector,
-    IdentityProjector,
     ProjectionConfig,
 )
-from skfolio.optimization.online._utils import CLIP_EPSILON, net_to_relatives
+from skfolio.optimization.online._utils import net_to_relatives
 from skfolio.utils.tools import input_to_array
 
 
@@ -54,6 +35,7 @@ class OnlinePortfolioSelection(
         *,
         warm_start: bool = True,
         initial_weights: npt.ArrayLike | None = None,
+        initial_wealth: float | npt.ArrayLike | None = None,
         previous_weights: skt.MultiInput | None = None,
         transaction_costs: skt.MultiInput = 0.0,
         management_fees: skt.MultiInput = 0.0,
@@ -75,6 +57,7 @@ class OnlinePortfolioSelection(
         super().__init__(portfolio_params=portfolio_params)
         self.warm_start = warm_start
         self.initial_weights = initial_weights
+        self.initial_wealth = initial_wealth
         self.previous_weights = previous_weights
         self.transaction_costs = transaction_costs
         self.management_fees = management_fees
@@ -94,6 +77,7 @@ class OnlinePortfolioSelection(
 
         self._is_initialized: bool = False
         self._weights_initialized: bool = False
+        self._wealth_initialized: bool = False
         self._projector: AutoProjector | None = None
         self._t: int = 0
         self._last_trade_weights_: np.ndarray | None = None
@@ -126,6 +110,103 @@ class OnlinePortfolioSelection(
         else:
             self.weights_ = np.ones(num_assets, dtype=float) / float(num_assets)
         self._weights_initialized = True
+
+    def _initialize_wealth(self, num_assets: int) -> None:
+        """Initialize wealth tracking based on initial_wealth parameter.
+
+        Handles three cases:
+        1. Array initial_wealth → compute initial_weights if not provided
+        2. Scalar initial_wealth → use as starting wealth
+        3. No initial_wealth → default to 1.0
+
+        Raises
+        ------
+        ValueError
+            If both initial_weights and initial_wealth are arrays (incompatible).
+        """
+        # Case: Both arrays → error
+        if self.initial_weights is not None and self.initial_wealth is not None:
+            iw_arr = np.asarray(self.initial_weights, dtype=float)
+            ih_arr = np.asarray(self.initial_wealth, dtype=float)
+            if iw_arr.ndim > 0 and ih_arr.ndim > 0:
+                raise ValueError(
+                    "initial_weights and initial_wealth cannot both be arrays. "
+                    "Provide either initial_weights (for allocation) or "
+                    "initial_wealth (for dollar amounts), not both."
+                )
+
+        # Case: Array initial_wealth
+        if self.initial_wealth is not None:
+            ih_arr = np.asarray(self.initial_wealth, dtype=float)
+            if ih_arr.ndim > 0:  # Array
+                if ih_arr.shape != (num_assets,):
+                    raise ValueError(
+                        f"initial_wealth array must have shape ({num_assets},), "
+                        f"got {ih_arr.shape}"
+                    )
+                total = float(np.sum(ih_arr))
+                if total <= 0:
+                    raise ValueError("Sum of initial_wealth must be positive")
+
+                # Set wealth
+                self.wealth_ = total
+
+                # Compute weights if not provided
+                if not self._weights_initialized:
+                    budget = self.budget if self.budget is not None else 1.0
+                    self.weights_ = (ih_arr / total) * budget
+                    self._weights_initialized = True
+            else:  # Scalar
+                self.wealth_ = float(self.initial_wealth)
+                if self.wealth_ <= 0:
+                    raise ValueError("initial_wealth must be positive")
+        else:
+            # Default: unit wealth
+            self.wealth_ = 1.0
+
+        self._wealth_initialized = True
+
+    def _update_wealth(
+        self,
+        trade_weights: np.ndarray,
+        effective_relatives: np.ndarray,
+        previous_weights: np.ndarray | None,
+    ) -> None:
+        """Update wealth after observing period returns.
+
+        Computes net portfolio return accounting for:
+        - Gross return: trade_weights^T * effective_relatives
+        - Transaction costs: sum(c_i * |trade_weights_i - previous_weights_i|)
+
+        Parameters
+        ----------
+        trade_weights : np.ndarray
+            Weights used for trading (before update).
+        effective_relatives : np.ndarray
+            Price relatives after management fees.
+        previous_weights : np.ndarray | None
+            Weights from previous period (for turnover).
+        """
+        # Gross portfolio return (after management fees)
+        gross_return = float(np.dot(trade_weights, effective_relatives))
+
+        # Transaction costs (proportional to turnover)
+        txn_cost = 0.0
+        if previous_weights is not None and hasattr(self, "_transaction_costs_arr"):
+            prev_arr = np.asarray(previous_weights, dtype=float)
+            if prev_arr.shape == trade_weights.shape:
+                turnover = np.abs(trade_weights - prev_arr)
+                # Total cost as fraction of portfolio
+                if np.isscalar(self._transaction_costs_arr):
+                    txn_cost = float(self._transaction_costs_arr * np.sum(turnover))
+                else:
+                    txn_cost = float(np.dot(self._transaction_costs_arr, turnover))
+
+        # Net return after costs
+        net_return = gross_return - txn_cost
+
+        # Update wealth: W_{t+1} = W_t * net_return
+        self.wealth_ *= max(net_return, 1e-16)  # Prevent negative/zero wealth
 
     def _validate_and_preprocess_partial_fit_input(
         self,
@@ -190,10 +271,12 @@ class OnlinePortfolioSelection(
     def _reset_state_for_fit(self) -> None:
         """Reset internal state when warm_start=False. Subclasses override to add specific state."""
         self._weights_initialized = False
+        self._wealth_initialized = False
         self._is_initialized = False
         self._projector = None
         self._t = 0
         self._last_trade_weights_ = None
+        # Note: wealth_ is a learned attribute, only created after fit/partial_fit
 
     def fit(
         self,
@@ -225,13 +308,32 @@ class OnlinePortfolioSelection(
 
         trade_list: list[np.ndarray] = []
         X_arr = np.asarray(X, dtype=float)
+
+        # Initialize wealth before loop if needed (creates wealth_ attribute)
+        if X_arr.shape[0] > 0 and not self._wealth_initialized:
+            num_assets = X_arr.shape[1]
+            if not self._weights_initialized:
+                self._initialize_weights(num_assets)
+            self._initialize_wealth(num_assets)
+
+        # Start wealth tracking list (wealth_ now exists as a learned attribute)
+        wealth_list: list[float] = [self.wealth_] if hasattr(self, "wealth_") else []
+
         for t in range(X_arr.shape[0]):
             self.partial_fit(X_arr[t][None, :], y, sample_weight=None, **fit_params)
             if self._last_trade_weights_ is not None:
                 trade_list.append(self._last_trade_weights_.copy())
+            # Append wealth after each period (wealth_ created in first partial_fit if not already)
+            if hasattr(self, "wealth_"):
+                wealth_list.append(self.wealth_)
 
         if trade_list:
             self.all_weights_ = np.vstack(trade_list)
+
+        # Store wealth history (only if wealth tracking was enabled)
+        if wealth_list:
+            self.all_wealth_ = np.array(wealth_list, dtype=float)
+
         return self
 
     def _clean_input(
@@ -256,695 +358,3 @@ class OnlinePortfolioSelection(
             ),
             name=name,
         )
-
-
-class FTRLProximal(OnlinePortfolioSelection):
-    """FTRLProximal: Online Portfolio Selection via Online Convex Optimization.
-
-    It unifies FTRL and OMD through the lens of FTRL-Proximal, which is a unified framework for FTRL and OMD.
-
-    Implements standard first-order OCO methods:
-    - Mirror Descent family: OGD, EG, PROD (Soft-Bayes)
-    - Adaptive methods: AdaGrad, AdaBARRONS
-    - Optimistic methods: Smooth Prediction, SWORD family
-
-    Projection:
-    - Fast path: box + budget (+ turnover) via project_box_and_sum/project_with_turnover
-    - Rich constraints (groups/linear/tracking error/variance): fallback to project_convex
-
-    Data conventions
-    ----------------
-    - Inputs ``X`` to :meth:`fit` and :meth:`partial_fit` must be NET returns
-        (i.e., arithmetic returns r_t in [-1, +inf)). Internally, the estimator
-        converts each row to gross returns via ``1.0 + r_t`` before computing
-        losses/gradients. This keeps interfaces consistent with most skfolio
-        preprocessing pipelines that output net returns.
-
-    Fitting
-    -------
-    - :meth:`fit` iterates over ``X`` row by row, calling :meth:`partial_fit` on each row to preserve online/sequential updates.
-
-    References
-    ----------
-    .. [1] Orseau, L., Lattimore, T., & Legg, S. (2017). Soft-Bayes: Prod for
-           Mixtures of Experts with Log-Loss. In Algorithmic Learning Theory,
-           PMLR 76:73-90.
-    """
-
-    def __init__(
-        self,
-        strategy: FTRLStrategy | str = FTRLStrategy.EG,
-        *,
-        learning_rate: float | Callable[[int], float] = 0.05,
-        update_mode: Literal["ftrl", "omd"] = "ftrl",
-        warm_start: bool = True,
-        initial_weights: npt.ArrayLike | None = None,
-        previous_weights: skt.MultiInput | None = None,
-        grad_predictor: Literal["last", "smooth"] | None = None,
-        transaction_costs: skt.MultiInput = 0.0,
-        management_fees: skt.MultiInput = 0.0,
-        groups: skt.Groups | None = None,
-        linear_constraints: skt.LinearConstraints | None = None,
-        left_inequality: skt.Inequality | None = None,
-        right_inequality: skt.Inequality | None = None,
-        max_turnover: float | None = None,
-        ## Smooth Prediction
-        smooth_epsilon: float = 1.0,
-        ## AdaGrad
-        adagrad_D: float | npt.ArrayLike | None = None,
-        adagrad_eps: float = 1e-8,
-        ## Ada-BARRONS
-        adabarrons_barrier_coef: float = 1.0,
-        adabarrons_alpha: float = 1.0,
-        adabarrons_euclidean_coef: float = 1.0,
-        adabarrons_beta: float = 0.1,
-        eg_tilde: bool = False,
-        eg_tilde_alpha: float | Callable[[int], float] = 0.1,
-        # Projection constraints (fast path)
-        min_weights: skt.MultiInput | None = 0.0,
-        max_weights: skt.MultiInput | None = 1.0,
-        budget: float | None = 1.0,
-        # Rich constraints (fallback)
-        X_tracking: npt.ArrayLike | None = None,
-        tracking_error_benchmark: npt.ArrayLike | None = None,
-        max_tracking_error: float | None = None,
-        covariance: npt.ArrayLike | None = None,
-        variance_bound: float | None = None,
-        portfolio_params: dict | None = None,
-    ):
-        r"""
-        The Online Portfolio Selection estimator.
-
-        Parameters
-        ----------
-            strategy: FTRLStrategy, default=FTRLStrategy.EG
-                The FTRL strategy to use.
-
-            update_mode: {"ftrl", "omd"}, default="ftrl"
-               Specifies which update rule to use:
-               - **"omd"** : use the Online Mirror Descent (a "local" Bregman/ proximal step)
-               - **"ftrl"** : use Follow-the-Regularized-Leader (a "global" minimization over cumulative losses + regularizer)
-
-               The two modes coincide under certain conditions (e.g. quadratic regularizer, smooth losses, fixed step size), but differ when non-smooth terms, changing regularization, or composite objectives are involved.
-
-            learning_rate: float, default=1.0
-                Step size :math:`\eta_t` scaling factor for the learning rate schedule.
-                Can be a float or a callable ``lambda t: f(t)``.
-                Otherwise, adaptive learning rate schedules such as :math:`1 / \sqrt{t}` (backed by cross-validation) tend to yield good results on small asset universes.
-
-                For EG, in the limit :math:`\eta \to 0`, the algorithm converges to the equally-weighted portfolio, as it acts as an inverse temperature parameter:
-
-                .. math::
-
-                    \lim_{\eta \to 0} w^{(\text{EG})} = (1/n, ..., 1/n)
-
-                In the limit :math:`\eta \to +\infty`, the choice of expert is deterministic, corresponding to the :math:`\arg\max` (i.e., tracking the best stock):
-
-                .. math::
-
-                    \lim_{\eta \to +\infty} w^{(\text{EG})} = \text{one-hot vector for best asset}
-
-            transaction_costs : float | dict[str, float] | array-like of shape (n_assets, ), default=0.0
-                Transaction costs of the assets. It is used to add linear transaction costs to
-                the optimization problem:
-
-                .. math:: total\_cost = \sum_{i=1}^{N} c_{i} \times |w_{i} - w\_prev_{i}|
-
-                with :math:`c_{i}` the transaction cost of asset i, :math:`w_{i}` its weight
-                and :math:`w\_prev_{i}` its previous weight (defined in `previous_weights`).
-                The float :math:`total\_cost` is impacting the portfolio expected return in the optimization:
-
-                .. math:: expected\_return = \mu^{T} \cdot w - total\_cost
-
-                with :math:`\mu` the vector af assets' expected returns and :math:`w` the
-                vector of assets weights.
-
-                If a float is provided, it is applied to each asset.
-                If a dictionary is provided, its (key/value) pair must be the
-                (asset name/asset cost) and the input `X` of the `fit` method must be a
-                DataFrame with the assets names in columns.
-                The default value is `0.0`.
-
-                .. warning::
-
-                    Based on the above formula, the periodicity of the transaction costs
-                    needs to be homogenous to the periodicity of :math:`\mu`. For example, if
-                    the input `X` is composed of **daily** returns, the `transaction_costs` need
-                    to be expressed as **daily** costs.
-                    (See :ref:`sphx_glr_auto_examples_mean_risk_plot_6_transaction_costs.py`)
-            management_fees : float | dict[str, float] | array-like of shape (n_assets, ), default=0.0
-                Management fees of the assets. Fees are modeled as multiplicative
-                drags on gross relatives: internally, gradients are computed using
-                net-of-fee relatives ``x_eff = x ⊙ (1 - fee)`` (for small fees). This
-                aligns with log-wealth objectives and avoids mixing linear and
-                multiplicative fee models.
-
-                If a float is provided, it is applied to each asset.
-                If a dictionary is provided, its (key/value) pair must be the
-                (asset name/asset fee) and the input `X` of the `fit` method must be a
-                DataFrame with the assets names in columns.
-                The default value is `0.0`.
-
-                .. warning::
-
-                    Based on the above formula, the periodicity of the management fees needs to
-                    be homogenous to the periodicity of :math:`\mu`. For example, if the input
-                    `X` is composed of **daily** returns, the `management_fees` need to be
-                    expressed in **daily** fees.
-            warm_start: bool
-                Whether to warm start the estimator. If `False`, the estimator will be reset before fitting.
-            initial_weights: np.ndarray
-                The initial weights to use. If `None`, the estimator will be initialized to the equally-weighted portfolio.
-            min_weights : float | dict[str, float] | array-like of shape (n_assets, ) | None, default=0.0
-                Minimum assets weights (weights lower bounds).
-                Differently from MeanRisk in online setting, set weights must be between 0 and 1.
-                If a float is provided, it is applied to each asset. If `None`, the minimum weight is set to 0.
-                If a dictionary is provided, its (key/value) pair must be the
-                (asset name/asset minimum weight) and the input `X` of the `fit` method must
-                be a DataFrame with the assets names in columns.
-                When using a dictionary, assets values that are not provided are assigned
-                a minimum weight of 0.
-                The default value is 0.0 (no short selling).
-
-                Example:
-
-                * `min_weights = 0` --> long only portfolio (no short selling).
-                * `min_weights = None` --> default to 0
-                * `min_weights = {"SX5E": 0.2, "SPX":0.1}`
-                * `min_weights = [0.2, 0.3]`
-
-            max_weights : float | dict[str, float] | array-like of shape (n_assets, ) | None, default=1.0
-                Maximum assets weights (weights upper bounds).
-                Differently from MeanRisk in online setting, set weights must be between 0 and 1.
-                If a float is provided, it is applied to each asset. If `None`, the maximum weight is set to 1.
-                If a dictionary is provided, its (key/value) pair must be the
-                (asset name/asset maximum weight) and the input `X` of the `fit` method must
-                be a DataFrame with the assets names in columns.
-                When using a dictionary, assets values that are not provided are assigned
-                a maximum weight of 1.
-                The default value is 1.0 (each asset is below 100%).
-
-                Example:
-
-                * `max_weights = None` --> default to 1.
-                * `max_weights = {"SX5E": 0.8, "SPX": 0.9}`
-                * `max_weights = [0.8, 0.9]`
-
-            budget : float | None, default=1.0
-                Investment budget. It is the sum of long positions and short positions (sum of
-                all weights). If `None`, no budget constraints are applied.
-                Budget must be between 0 and 1.
-                The default value is 1.0 (fully invested portfolio).
-
-            previous_weights : float | dict[str, float] | array-like of shape (n_assets, ), optional
-                Previous weights of the assets. Previous weights are used to compute the
-                portfolio cost and the portfolio turnover.
-                If a float is provided, it is applied to each asset.
-                If a dictionary is provided, its (key/value) pair must be the
-                (asset name/asset previous weight) and the input `X` of the `fit` method must
-                be a DataFrame with the assets names in columns.
-                The default (`None`) means no previous weights.
-
-            max_turnover : float, optional
-                Upper bound constraint of the turnover.
-                The turnover is defined as the absolute difference between the portfolio weights
-                and the `previous_weights`. Note that another way to control for turnover is by
-                using the `transaction_costs` parameter.
-            groups : dict[str, list[str]] or array-like of shape (n_groups, n_assets), optional
-                The assets groups referenced in `linear_constraints`.
-                If a dictionary is provided, its (key/value) pair must be the
-                (asset name/asset groups) and the input `X` of the `fit` method must be a
-                DataFrame with the assets names in columns.
-
-                For example:
-
-                    * `groups = {"SX5E": ["Equity", "Europe"], "SPX": ["Equity", "US"], "TLT": ["Bond", "US"]}`
-                    * `groups = [["Equity", "Equity", "Bond"], ["Europe", "US", "US"]]`
-
-            left_inequality : array-like of shape (n_constraints, n_assets), optional
-                Left inequality matrix :math:`A` of the linear
-                constraint :math:`A \cdot w \leq b`.
-
-            right_inequality : array-like of shape (n_constraints, ), optional
-                Right inequality vector :math:`b` of the linear
-                constraint :math:`A \cdot w \leq b`.
-            linear_constraints : array-like of shape (n_constraints,), optional
-                Linear constraints.
-                The linear constraints must match any of following patterns:
-
-                * `"2.5 * ref1 + 0.10 * ref2 + 0.0013 <= 2.5 * ref3"`
-                * `"ref1 >= 2.9 * ref2"`
-                * `"ref1 == ref2"`
-                * `"ref1 >= ref1"`
-
-                With `"ref1"`, `"ref2"` ... the assets names or the groups names provided
-                in the parameter `groups`. Assets names can be referenced without the need of
-                `groups` if the input `X` of the `fit` method is a DataFrame with these
-                assets names in columns.
-
-                For example:
-
-                    * `"SPX >= 0.10"` --> SPX weight must be greater than 10% (note that you can also use `min_weights`)
-                    * `"SX5E + TLT >= 0.2"` --> the sum of SX5E and TLT weights must be greater than 20%
-                    * `"US == 0.7"` --> the sum of all US weights must be equal to 70%
-                    * `"Equity == 3 * Bond"` --> the sum of all Equity weights must be equal to 3 times the sum of all Bond weights.
-                    * `"2*SPX + 3*Europe <= Bond + 0.05"` --> mixing assets and group constraints
-            l2_coef: float
-                The L2 regularization coefficient to use.
-            smooth_epsilon: float
-                Log-barrier regularization parameter for Smooth Prediction method.
-                Controls the strength of the regularization term ε * ∑ log(w_i) in the
-                FTRL objective. Larger values provide more regularization (smoother weights).
-                Typical values: 1.0 (standard), 1/r for known return lower bound r.
-                Only used when method=OnlineMethod.SMOOTH_PRED.
-            adagrad_D: float or array-like, optional
-                Diameter bound(s) for AdaGrad algorithm. Controls the scaling of coordinate-wise adaptive learning rates: η_{t,i} = D_i / (√(∑ g_{j,i}²) + ε). If float, uses same bound for all coordinates. If array-like, should have length equal to problem dimension. If None, defaults to √2 (simplex diameter).
-                Only used when objective=OnlineObjective.ADAGRAD.
-            adagrad_eps: float
-                Small constant added to denominator for numerical stability.
-                Set to 0 for truly scale-free updates.
-                Only used when objective=OnlineObjective.ADAGRAD.
-            covariance: np.ndarray
-                The covariance to use.
-            variance_bound: float
-                The variance bound to use.
-            portfolio_params: dict
-                The portfolio parameters to use.
-
-        """
-        super().__init__(
-            warm_start=warm_start,
-            initial_weights=initial_weights,
-            previous_weights=previous_weights,
-            transaction_costs=transaction_costs,
-            management_fees=management_fees,
-            groups=groups,
-            linear_constraints=linear_constraints,
-            left_inequality=left_inequality,
-            right_inequality=right_inequality,
-            max_turnover=max_turnover,
-            min_weights=min_weights,
-            max_weights=max_weights,
-            budget=budget,
-            X_tracking=X_tracking,
-            tracking_error_benchmark=tracking_error_benchmark,
-            max_tracking_error=max_tracking_error,
-            covariance=covariance,
-            variance_bound=variance_bound,
-            portfolio_params=portfolio_params,
-        )
-
-        # Public configuration
-        self.strategy = strategy
-        self.learning_rate = learning_rate
-        self.update_mode = update_mode
-        self.smooth_epsilon = smooth_epsilon
-        self.adagrad_D = adagrad_D
-        self.adagrad_eps = adagrad_eps
-        self.adabarrons_barrier_coef = adabarrons_barrier_coef
-        self.adabarrons_alpha = adabarrons_alpha
-        self.adabarrons_euclidean_coef = adabarrons_euclidean_coef
-        self.adabarrons_beta = adabarrons_beta
-        self.eg_tilde = eg_tilde
-        self.eg_tilde_alpha = eg_tilde_alpha
-        self.warm_start = warm_start
-        self.initial_weights = initial_weights
-        self.grad_predictor = grad_predictor
-
-        # Costs and fees (public attributes preserved for predict())
-        self.transaction_costs = transaction_costs
-        self.management_fees = management_fees
-
-        # Projection parameters
-        self.min_weights = min_weights
-        self.max_weights = max_weights
-        self.budget = budget
-        self.previous_weights = previous_weights
-        self.max_turnover = max_turnover
-
-        # Rich constraints
-        self.groups = groups
-        self.linear_constraints = linear_constraints
-        self.left_inequality = left_inequality
-        self.right_inequality = right_inequality
-        self.X_tracking = X_tracking
-        self.tracking_error_benchmark = tracking_error_benchmark
-        self.max_tracking_error = max_tracking_error
-        self.covariance = covariance
-        self.variance_bound = variance_bound
-
-        # Internal state (initialized deterministically)
-        self._ftrl_engine: FirstOrderOCO | None = None
-        self._cumulative_loss: float = 0.0
-
-    def _ensure_initialized(self, gross_relatives: np.ndarray) -> None:
-        num_assets = int(gross_relatives.shape[0])
-
-        if not self._is_initialized:
-            self.n_features_in_ = num_assets
-
-        self._transaction_costs_arr = self._clean_input(
-            self.transaction_costs,
-            n_assets=num_assets,
-            fill_value=0,
-            name="transaction_costs",
-        )
-
-        self._management_fees_arr = self._clean_input(
-            self.management_fees,
-            n_assets=num_assets,
-            fill_value=0,
-            name="management_fees",
-        )
-
-        # Resolve transaction costs and management fees once number of assets is known
-
-        self._projector = self._initialize_projector()
-
-        if self._ftrl_engine is None:
-            mirror_map: BaseMirrorMap | None = None
-            predictor: Predictor | None = None
-
-            match self.grad_predictor:
-                case "last":
-                    predictor = LastGradPredictor()
-                case "smooth":
-                    predictor = SmoothPredictor()
-                case None:
-                    predictor = None
-
-            match self.strategy:
-                case FTRLStrategy.EG | "eg":
-                    mirror_map = EntropyMirrorMap()
-                case FTRLStrategy.OGD | "ogd":
-                    mirror_map = EuclideanMirrorMap()
-                case FTRLStrategy.PROD | "prod":
-                    mirror_map = BurgMirrorMap()
-                case FTRLStrategy.ADAGRAD | "adagrad":
-                    mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
-                case FTRLStrategy.ADABARRONS | "adabarrons":
-                    # Ada-BARRONS uses a compositional mirror map:
-                    # - AdaBarronsBarrierMap: weight-proximity adaptive barrier
-                    # - EuclideanMap: Euclidean regularization
-                    # - FullQuadraticMap: second-order curvature
-                    mirror_map = make_ada_barrons_mirror_map(
-                        d=num_assets,
-                        barrier_coef=self.adabarrons_barrier_coef,
-                        alpha=self.adabarrons_alpha,
-                        euclidean_coef=self.adabarrons_euclidean_coef,
-                        beta=self.adabarrons_beta,
-                    )
-                case (
-                    FTRLStrategy.SWORD_VAR | FTRLStrategy.SWORD | "sword" | "sword_var"
-                ):
-                    # SWORD-Var: variation-adaptive OMD with optimistic gradients
-                    mirror_map = AdaptiveVariationMap(eps=self.adagrad_eps)
-                case FTRLStrategy.SWORD_SMALL | "sword_small":
-                    # SWORD-Small: AdaGrad geometry with optimistic gradients
-                    mirror_map = AdaptiveMahalanobisMap(eps=self.adagrad_eps)
-                case (
-                    FTRLStrategy.SWORD_BEST
-                    | FTRLStrategy.SWORD_PP
-                    | "sword_best"
-                    | "sword_pp"
-                ):
-                    # Meta-aggregator combining SWORD-Var and SWORD-Small, plus EG for Sword++
-                    var_engine = FirstOrderOCO(
-                        mirror_map=AdaptiveVariationMap(eps=self.adagrad_eps),
-                        projector=IdentityProjector(),  # inner unconstrained
-                        eta=self.learning_rate,
-                        predictor=LastGradPredictor(),
-                        mode="omd",
-                    )
-                    small_engine = FirstOrderOCO(
-                        mirror_map=AdaptiveMahalanobisMap(eps=self.adagrad_eps),
-                        projector=IdentityProjector(),
-                        eta=self.learning_rate,
-                        predictor=LastGradPredictor(),
-                        mode="omd",
-                    )
-                    experts: list[FirstOrderOCO] = [var_engine, small_engine]
-                    if self.strategy in (FTRLStrategy.SWORD_PP, "sword_pp"):
-                        # add an entropy-geometry expert to stabilize/explore (only for Sword++)
-                        eg_engine = FirstOrderOCO(
-                            mirror_map=EntropyMirrorMap(),
-                            projector=IdentityProjector(),
-                            eta=self.learning_rate,
-                            predictor=LastGradPredictor(),
-                            mode="omd",
-                        )
-                        experts.append(eg_engine)
-                    # specific case treating SwordMeta differently
-                    # we initialize it here because it needs to be initialized with the experts (only for SwordMeta)
-                    self._ftrl_engine = SwordMeta(
-                        experts=experts,
-                        projector=self._projector,
-                        eta_meta=self.learning_rate,  # tie meta-eta to learning_rate
-                    )
-                case _:
-                    raise ValueError("Unknown objective provided.")
-
-            # Finally initialize the FTRL engine to be used in the fit method
-            if self._ftrl_engine is None:
-                skip_auto_update = self.strategy in (
-                    FTRLStrategy.ADABARRONS,
-                    "adabarrons",
-                )
-                self._ftrl_engine = FirstOrderOCO(
-                    mirror_map=mirror_map,
-                    projector=self._projector,
-                    eta=self.learning_rate,
-                    predictor=predictor,
-                    mode=self.update_mode,
-                    skip_auto_update=skip_auto_update,
-                )
-
-        if not self._weights_initialized or not self.warm_start:
-            self._initialize_weights(num_assets)
-            if self._ftrl_engine is not None and hasattr(self._ftrl_engine, "_x_t"):
-                if self._ftrl_engine._x_t is None:
-                    self._ftrl_engine._x_t = self.weights_.copy()
-
-        # Mark overall init complete
-        self._is_initialized = True
-
-    def _compute_effective_relatives(self, gross_relatives: np.ndarray) -> np.ndarray:
-        """Apply management fees to gross relatives.
-
-        Parameters
-        ----------
-        gross_relatives : np.ndarray
-            Gross price relatives for one period.
-
-        Returns
-        -------
-        np.ndarray
-            Effective relatives after applying management fees.
-        """
-        # Apply management fees multiplicatively to gross relatives for Kelly-like gradients
-        effective_relatives = np.maximum(
-            gross_relatives * (1 - self._management_fees_arr), CLIP_EPSILON
-        )
-        return effective_relatives
-
-    def _compute_portfolio_gradient(
-        self, effective_relatives: np.ndarray
-    ) -> np.ndarray:
-        """Compute the portfolio gradient including transaction costs.
-        The gradient is relative to the log-wealth objective.
-
-        Parameters
-        ----------
-        effective_relatives : np.ndarray
-            Effective price relatives after fees.
-
-        Returns
-        -------
-        np.ndarray
-            Gradient vector for the portfolio optimization.
-        """
-        # Gradient for log-wealth objective
-        denominator = np.dot(self.weights_, effective_relatives)
-        if float(denominator) <= 0:
-            # Handle non-positive return, e.g. by using a small positive constant
-            # or by returning without updating, depending on desired behavior.
-            # For now, we skip the update to avoid division by zero.
-            warnings.warn(
-                "Non-positive portfolio return, skipping update.",
-                UserWarning,
-                stacklevel=3,
-            )
-            gradient = np.zeros_like(self.weights_)
-        else:
-            gradient = -effective_relatives / denominator
-
-        # Add L1 turnover subgradient for transaction costs: grad C_t(b) = c * sign(b - b_prev)
-        if self.transaction_costs and self.previous_weights is not None:
-            prev = np.asarray(self.previous_weights, dtype=float)
-            if prev.shape == self.weights_.shape:
-                delta = self.weights_ - prev
-                gradient += self._transaction_costs_arr * np.sign(delta)
-
-        return gradient
-
-    def _execute_ftrl_step(self, gradient: np.ndarray) -> np.ndarray:
-        """Execute the FTRL optimization step.
-
-        Parameters
-        ----------
-        gradient : np.ndarray
-            Portfolio gradient vector.
-
-        Returns
-        -------
-        np.ndarray
-            New portfolio weights from FTRL step.
-        """
-        if self._ftrl_engine:
-            w_ftrl = self._ftrl_engine.step(gradient)
-        else:
-            raise RuntimeError("FTRL Engine not initialized")
-        return w_ftrl
-
-    def _apply_weights_mixing(self, w_ftrl: np.ndarray) -> np.ndarray:
-        """Apply weights mixing (only for EG-tilde mixing).
-
-        Parameters
-        ----------
-        w_ftrl : np.ndarray
-            Weights from FTRL step.
-
-        Returns
-        -------
-        np.ndarray
-            Final weights.
-        """
-        if not (self.eg_tilde and self.strategy == FTRLStrategy.EG):
-            return w_ftrl
-
-        alpha_t = (
-            self.eg_tilde_alpha(self._ftrl_engine._t)
-            if callable(self.eg_tilde_alpha)
-            else self.eg_tilde_alpha
-        )
-
-        if alpha_t <= 0:
-            return w_ftrl
-
-        n = w_ftrl.shape[0]
-        mixed = (1.0 - alpha_t) * w_ftrl + alpha_t / n
-        return self._projector.project(mixed)
-
-    def _update_adabarrons_components(
-        self, weights: np.ndarray, gradient: np.ndarray
-    ) -> None:
-        """Special update logic for Ada-BARRONS compositional mirror map.
-
-        Ada-BARRONS requires:
-        - Barrier component updated with weights (weight-proximity adaptation)
-        - Full quadratic component updated with gradients (second-order curvature)
-
-        Parameters
-        ----------
-        weights : np.ndarray
-            Current portfolio weights.
-        gradient : np.ndarray
-            Portfolio gradient vector.
-        """
-        if self.strategy == FTRLStrategy.ADABARRONS and isinstance(
-            self._ftrl_engine.map, CompositeMirrorMap
-        ):
-            # Access the components of the Ada-BARRONS mirror map:
-            # [0] = AdaBarronsBarrierMap (weight-proximity adaptive)
-            # [1] = EuclideanMap (static, no update needed)
-            # [2] = FullQuadraticMap (gradient-based second-order)
-            components = self._ftrl_engine.map.components_
-
-            # Update barrier with weights (NOT gradients)
-            components[0].update_state(weights)
-
-            # Update full quadratic with gradients
-            components[2].update_state(gradient)
-
-    def _finalize_partial_fit_state(self, effective_relatives: np.ndarray) -> None:
-        """Update internal state and compute loss after weight update.
-
-        Parameters
-        ----------
-        effective_relatives : np.ndarray
-            Effective price relatives used for loss computation.
-        """
-        # Compute loss for inspection (optional, can be simplified)
-        final_return = np.dot(self.weights_, effective_relatives)
-        self.loss_ = -np.log(np.maximum(final_return, CLIP_EPSILON))
-        self._cumulative_loss += self.loss_
-        self.previous_weights = self.weights_.copy()
-        self._t += 1
-
-    def partial_fit(
-        self,
-        X: npt.ArrayLike,
-        y: npt.ArrayLike | None = None,
-        sample_weight: npt.ArrayLike | None = None,
-        **fit_params: Any,
-    ) -> "FTRLProximal":
-        """Perform one online update with a single period of net returns.
-
-        In OCO, ``partial_fit`` is the core update and must receive exactly one
-        row of data (one period). Use :meth:`fit` to iterate over multiple rows
-        in sequential order.
-
-        Parameters
-        ----------
-        X : array-like of shape (n_assets,) or (1, n_assets)
-            Net returns for a single period. Internally converted to price
-            relatives via ``1.0 + r_t``.
-        y : Ignored
-            Present for API consistency.
-        sample_weight : array-like of shape (n_samples,), default=None
-            Sample weights. Currently ignored but present for API consistency.
-        **fit_params : Any
-            Additional parameters (unused).
-
-        Returns
-        -------
-        OPS
-            The estimator instance.
-        """
-        # Step 1: Validate input and preprocess to gross relatives
-        gross_relatives = self._validate_and_preprocess_partial_fit_input(
-            X, y, sample_weight
-        )
-
-        # Step 2: Initialize engine and weights if needed
-        self._ensure_initialized(gross_relatives)
-
-        # Step 3: Apply management fees to get effective relatives
-        effective_relatives = self._compute_effective_relatives(gross_relatives)
-
-        # Step 4: Compute portfolio gradient (including transaction costs)
-        gradient = self._compute_portfolio_gradient(effective_relatives)
-
-        # Step 5: Execute FTRL optimization step
-        w_ftrl = self._execute_ftrl_step(gradient)
-
-        # Step 5.5: Store trading weights before update
-        self._last_trade_weights_ = self.weights_.copy()
-
-        # Step 6: Apply post-processing (e.g., EG-tilde mixing)
-        self.weights_ = self._apply_weights_mixing(w_ftrl)
-
-        # Step 6.5: Manual component updates for Ada-BARRONS
-        # (barrier with weights, full quadratic with gradients)
-        self._update_adabarrons_components(self.weights_, gradient)
-
-        # Step 7: Update internal state and compute loss
-        self._finalize_partial_fit_state(effective_relatives)
-
-        return self
-
-    def _reset_state_for_fit(self) -> None:
-        """Reset internal state when warm_start=False."""
-        super()._reset_state_for_fit()
-        self._ftrl_engine = None
-        self._cumulative_loss = 0.0
