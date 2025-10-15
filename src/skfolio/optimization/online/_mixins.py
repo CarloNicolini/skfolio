@@ -2,7 +2,7 @@ from enum import auto
 from numbers import Real
 from typing import ClassVar
 
-from sklearn.utils._param_validation import Interval
+from sklearn.utils._param_validation import Interval, StrOptions
 
 from skfolio.utils.tools import AutoEnum
 
@@ -84,7 +84,11 @@ class OnlineMixin:
 
 class OnlineParameterConstraintsMixin:
     _parameter_constraints: ClassVar[dict] = {
-        "learning_rate": [Interval(Real, 0, None, closed="neither"), callable],
+        "learning_rate": [
+            Interval(Real, 0, None, closed="neither"),
+            callable,
+            StrOptions({"auto"}),
+        ],
         "warm_start": ["boolean"],
         "initial_weights": ["array-like", None],
         "initial_wealth": [Interval(Real, 0, None, closed="neither"), None],

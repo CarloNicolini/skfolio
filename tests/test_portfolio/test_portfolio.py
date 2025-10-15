@@ -331,6 +331,26 @@ def test_portfolio_diversification(portfolio):
     np.testing.assert_almost_equal(portfolio.diversification, 1.449839842913199)
 
 
+def test_portfolio_log_wealth(portfolio):
+    """Test log_wealth computation through Portfolio."""
+    # Access log_wealth attribute
+    lw = portfolio.log_wealth
+    assert isinstance(lw, float)
+    assert not np.isnan(lw)
+
+    # Verify it's computed correctly as sum(log(1 + r_t))
+    expected = np.sum(np.log1p(portfolio.returns))
+    np.testing.assert_almost_equal(lw, expected)
+
+    # Verify it's equal to log of final wealth
+    final_wealth = np.prod(1 + portfolio.returns)
+    np.testing.assert_almost_equal(lw, np.log(final_wealth))
+
+    # Verify it's accessible through get_measure
+    lw_from_measure = portfolio.get_measure(PerfMeasure.LOG_WEALTH)
+    np.testing.assert_almost_equal(lw, lw_from_measure)
+
+
 def test_portfolio_slots(X, weights):
     portfolio = Portfolio(X=X, weights=weights, annualized_factor=252)
     for attr in portfolio._slots():
