@@ -82,8 +82,12 @@ from skfolio.measures import (
     standard_deviation,
     variance,
     worst_realization,
+    log_wealth,
+    get_cumulative_returns,
 )
+from functools import partial
 from skfolio.measures._enums import BaseMeasure, PerfMeasure, RiskMeasure
+from skfolio.optimization.online._utils import CLIP_EPSILON
 
 
 class BaseObjective(ABC):
@@ -142,13 +146,8 @@ class BaseObjective(ABC):
         pass
 
 
-# =============================================================================
-# Helper functions for analytical gradients
-# =============================================================================
-
-
-def _compute_sample_covariance(net_returns: np.ndarray) -> np.ndarray:
-    """Compute sample covariance matrix from net returns.
+def _sample_covariance(net_returns: np.ndarray) -> np.ndarray:
+    """Compute unbiased sample covariance matrix from net returns.
 
     Parameters
     ----------
@@ -158,12 +157,13 @@ def _compute_sample_covariance(net_returns: np.ndarray) -> np.ndarray:
     Returns
     -------
     ndarray of shape (n_assets, n_assets)
-        Sample covariance matrix.
+        Unbiased sample covariance matrix (divides by T-1).
     """
     T = net_returns.shape[0]
     mean_returns = np.mean(net_returns, axis=0, keepdims=True)
     centered = net_returns - mean_returns
-    return (centered.T @ centered) / T
+    # Use unbiased estimator (divide by T-1, not T)
+    return (centered.T @ centered) / (T - 1) if T > 1 else (centered.T @ centered)
 
 
 def _analytical_log_wealth_gradient(
@@ -176,7 +176,8 @@ def _analytical_log_wealth_gradient(
     weights : ndarray of shape (n_assets,)
         Portfolio weights.
     net_returns : ndarray of shape (n_assets,)
-        Net returns of assets (single observation).
+        Net returns of assets (single observation). LOG_WEALTH is a per-observation
+        measure and is excluded from automatic 2D reshaping.
     **kwargs
         Unused, included for signature consistency.
 
@@ -210,7 +211,8 @@ def _analytical_mean_gradient(
     weights : ndarray of shape (n_assets,)
         Portfolio weights (unused, included for signature consistency).
     net_returns : ndarray of shape (n_observations, n_assets)
-        Historical net returns.
+        Historical net returns. For single observations, automatically reshaped
+        from (n_assets,) to (1, n_assets) by MeasureObjective.grad().
     **kwargs
         Unused, included for signature consistency.
 
@@ -233,7 +235,8 @@ def _analytical_variance_gradient(
     weights : ndarray of shape (n_assets,)
         Portfolio weights.
     net_returns : ndarray of shape (n_observations, n_assets)
-        Historical net returns.
+        Historical net returns. For single observations, automatically reshaped
+        from (n_assets,) to (1, n_assets) by MeasureObjective.grad().
     **kwargs
         Unused, included for signature consistency.
 
@@ -242,23 +245,142 @@ def _analytical_variance_gradient(
     ndarray of shape (n_assets,)
         Gradient vector.
     """
-    Sigma = _compute_sample_covariance(net_returns)
-    return 2.0 * (Sigma @ weights)
+    T = net_returns.shape[0]
+    if T == 1:
+        # Single observation: use proxy (w^T r)^2, gradient = 2(w^T r)r
+        portfolio_return = net_returns[0] @ weights
+        return 2.0 * portfolio_return * net_returns[0]
+
+    Sigma = _sample_covariance(net_returns)
+    return 2.0 * (weights @ Sigma)
 
 
 def _analytical_semi_variance_gradient(
     weights: np.ndarray, net_returns: np.ndarray, **kwargs
 ) -> np.ndarray:
-    """Analytical gradient of semi-variance.
+    """Analytical gradient of semi-variance (unbiased estimator).
 
-    Semi-variance gradient: ∇_w SV = (2/T) Σ_{t: r_t^T w < τ} (r_t^T w - τ) r_t
+    When min_acceptable_return is None (defaults to mean), the gradient includes
+    the chain rule through the mean:
+    ∇_w SV = (2T/(T-1)) * (1/T) Σ_{t: r_t^T w < μ(w)} (r_t^T w - μ(w)) * (r_t - ∇μ)
+    where μ(w) = mean(w^T r) and ∇μ = mean(r).
 
     Parameters
     ----------
     weights : ndarray of shape (n_assets,)
         Portfolio weights.
     net_returns : ndarray of shape (n_observations, n_assets)
-        Historical net returns.
+        Historical net returns. For single observations, automatically reshaped
+        from (n_assets,) to (1, n_assets) by MeasureObjective.grad().
+    **kwargs
+        Additional parameters (min_acceptable_return).
+
+    Returns
+    -------
+    ndarray of shape (n_assets,)
+        Gradient vector.
+
+    Notes
+    -----
+    When min_acceptable_return is an external constant, the gradient simplifies.
+    When it depends on weights (via mean), we must apply the chain rule properly.
+    """
+    T = net_returns.shape[0]
+    portfolio_returns = net_returns @ weights
+
+    # Check if min_acceptable_return is provided or defaults to mean
+    min_acceptable_return_arg = kwargs.get("min_acceptable_return", None)
+    is_mean_dependent = min_acceptable_return_arg is None
+
+    if is_mean_dependent:
+        min_acceptable_return = np.mean(portfolio_returns)
+        mean_gradient = np.mean(net_returns, axis=0)  # ∇_w mean(portfolio_returns)
+    else:
+        min_acceptable_return = min_acceptable_return_arg
+        mean_gradient = np.zeros(net_returns.shape[1])  # No dependency on w
+
+    # Indicator for returns below threshold
+    below_threshold = portfolio_returns < min_acceptable_return
+
+    grad = np.zeros_like(weights)
+    if np.any(below_threshold):
+        bad_returns = net_returns[below_threshold]
+        bad_portfolio_returns = portfolio_returns[below_threshold]
+        deviations = bad_portfolio_returns - min_acceptable_return
+
+        # Gradient with chain rule: 2 * Σ(deviation) * (r_t - ∇τ)
+        # where ∇τ = mean_gradient if threshold is mean-dependent, else 0
+        grad_terms = bad_returns - mean_gradient[np.newaxis, :]
+        grad = 2.0 * np.sum(deviations[:, np.newaxis] * grad_terms, axis=0) / T
+
+        # Apply unbiased correction
+        if T > 1:
+            grad = grad * T / (T - 1)
+
+    return grad
+
+
+def _analytical_standard_deviation_gradient(
+    weights: np.ndarray, net_returns: np.ndarray, **kwargs
+) -> np.ndarray:
+    """Analytical gradient of Standard Deviation.
+
+    SD = sqrt(var(r^T w)) with unbiased variance
+    ∇_w SD = (1 / ((T-1) * SD)) Σ_t (r_t^T w - μ)(r_t - mean(r))
+
+    Parameters
+    ----------
+    weights : ndarray of shape (n_assets,)
+        Portfolio weights.
+    net_returns : ndarray of shape (n_observations, n_assets)
+        Historical net returns. For single observations, automatically reshaped
+        from (n_assets,) to (1, n_assets) by MeasureObjective.grad().
+    **kwargs
+        Unused, included for signature consistency.
+
+    Returns
+    -------
+    ndarray of shape (n_assets,)
+        Gradient vector.
+    """
+    T = net_returns.shape[0]
+    if T == 1:
+        # Single observation proxy: |w^T r|
+        portfolio_return = net_returns[0] @ weights
+        return np.sign(portfolio_return) * net_returns[0]
+
+    portfolio_returns = net_returns @ weights
+    mean_portfolio = np.mean(portfolio_returns)
+    mean_asset = np.mean(net_returns, axis=0)
+    deviations = portfolio_returns - mean_portfolio
+    # Use unbiased variance (divide by T-1)
+    variance = np.sum(deviations**2) / (T - 1)
+    std = np.sqrt(variance + 1e-10)  # avoid division by zero
+
+    # Gradient: (1 / ((T-1) * std)) * Σ (r_t^p - μ)(r_t - mean(r))
+    grad = ((deviations[:, None]) * (net_returns - mean_asset)).sum(axis=0) / (
+        (T - 1) * std
+    )
+    return grad
+
+
+def _analytical_semi_deviation_gradient(
+    weights: np.ndarray, net_returns: np.ndarray, **kwargs
+) -> np.ndarray:
+    """Analytical gradient of Semi-Deviation (unbiased estimator).
+
+    SemiDev = sqrt(unbiased_semi_variance)
+    Uses chain rule: ∇_w SemiDev = (1 / (2 * SemiDev)) * ∇_w SemiVar
+
+    When min_acceptable_return is mean-dependent, accounts for chain rule.
+
+    Parameters
+    ----------
+    weights : ndarray of shape (n_assets,)
+        Portfolio weights.
+    net_returns : ndarray of shape (n_observations, n_assets)
+        Historical net returns. For single observations, automatically reshaped
+        from (n_assets,) to (1, n_assets) by MeasureObjective.grad().
     **kwargs
         Additional parameters (min_acceptable_return).
 
@@ -267,23 +389,30 @@ def _analytical_semi_variance_gradient(
     ndarray of shape (n_assets,)
         Gradient vector.
     """
-    min_acceptable_return = kwargs.get("min_acceptable_return", 0.0)
+    # Compute gradient of semi-variance (handles mean-dependent threshold)
+    grad_semi_var = _analytical_semi_variance_gradient(weights, net_returns, **kwargs)
+
+    # Compute semi-deviation value for chain rule
     T = net_returns.shape[0]
     portfolio_returns = net_returns @ weights
-    # Indicator for returns below threshold
-    below_threshold = portfolio_returns < min_acceptable_return
-    # Gradient: (2/T) sum over bad outcomes
-    grad = np.zeros_like(weights)
-    if np.any(below_threshold):
-        bad_returns = net_returns[below_threshold]
-        bad_portfolio_returns = portfolio_returns[below_threshold]
-        # Vectorized computation
-        deviations = bad_portfolio_returns - min_acceptable_return
-        grad = 2.0 * np.sum(deviations[:, np.newaxis] * bad_returns, axis=0) / T
+    min_acceptable_return_arg = kwargs.get("min_acceptable_return", None)
+
+    if min_acceptable_return_arg is None:
+        min_acceptable_return = np.mean(portfolio_returns)
+    else:
+        min_acceptable_return = min_acceptable_return_arg
+
+    downside = np.maximum(0, min_acceptable_return - portfolio_returns)
+    biased_semi_var = np.mean(downside**2)
+    semi_var = biased_semi_var * T / (T - 1) if T > 1 else biased_semi_var
+    semi_dev = np.sqrt(semi_var + CLIP_EPSILON)
+
+    # Chain rule: ∇SemiDev = (1 / (2*SemiDev)) * ∇SemiVar
+    grad = grad_semi_var / (2.0 * semi_dev)
     return grad
 
 
-def _analytical_mad_gradient(
+def _analytical_mean_absolute_deviation_gradient(
     weights: np.ndarray, net_returns: np.ndarray, **kwargs
 ) -> np.ndarray:
     """Analytical gradient of Mean Absolute Deviation.
@@ -296,7 +425,8 @@ def _analytical_mad_gradient(
     weights : ndarray of shape (n_assets,)
         Portfolio weights.
     net_returns : ndarray of shape (n_observations, n_assets)
-        Historical net returns.
+        Historical net returns. For single observations, automatically reshaped
+        from (n_assets,) to (1, n_assets) by MeasureObjective.grad().
     **kwargs
         Unused, included for signature consistency.
 
@@ -306,6 +436,13 @@ def _analytical_mad_gradient(
         Gradient vector.
     """
     T = net_returns.shape[0]
+    if T == 1:
+        # Single observation: use proxy |w^T r - mar|, gradient = sign(w^T r - mar) * r
+        min_acceptable_return = kwargs.get("min_acceptable_return", 0.0)
+        portfolio_return = net_returns[0] @ weights
+        sign = np.sign(portfolio_return - min_acceptable_return)
+        return sign * net_returns[0]
+
     portfolio_returns = net_returns @ weights
     mean_return = np.mean(portfolio_returns)
     deviations = portfolio_returns - mean_return
@@ -315,19 +452,24 @@ def _analytical_mad_gradient(
     return grad
 
 
-def _analytical_flpm_gradient(
+def _analytical_first_lower_partial_moment_gradient(
     weights: np.ndarray, net_returns: np.ndarray, **kwargs
 ) -> np.ndarray:
     """Analytical gradient of First Lower Partial Moment.
 
-    FLPM gradient: ∇_w FLPM = -(1/T) Σ_{t: r_t^T w < τ} r_t
+    FLPM = mean(max(0, τ - w^T r))
+
+    When τ = mean(w^T r), the gradient includes chain rule through the mean:
+    ∇_w FLPM = (1/T) Σ_{t: r_t^T w < μ} (∇μ - r_t)
+    where μ(w) = mean(w^T r) and ∇μ = mean(r).
 
     Parameters
     ----------
     weights : ndarray of shape (n_assets,)
         Portfolio weights.
     net_returns : ndarray of shape (n_observations, n_assets)
-        Historical net returns.
+        Historical net returns. For single observations, automatically reshaped
+        from (n_assets,) to (1, n_assets) by MeasureObjective.grad().
     **kwargs
         Additional parameters (min_acceptable_return).
 
@@ -336,14 +478,28 @@ def _analytical_flpm_gradient(
     ndarray of shape (n_assets,)
         Gradient vector.
     """
-    min_acceptable_return = kwargs.get("min_acceptable_return", 0.0)
     T = net_returns.shape[0]
     portfolio_returns = net_returns @ weights
+
+    # Check if min_acceptable_return is provided or defaults to mean
+    min_acceptable_return_arg = kwargs.get("min_acceptable_return", None)
+    is_mean_dependent = min_acceptable_return_arg is None
+
+    if is_mean_dependent:
+        min_acceptable_return = np.mean(portfolio_returns)
+        mean_gradient = np.mean(net_returns, axis=0)  # ∇_w mean(portfolio_returns)
+    else:
+        min_acceptable_return = min_acceptable_return_arg
+        mean_gradient = np.zeros(net_returns.shape[1])  # No dependency on w
+
     below_threshold = portfolio_returns < min_acceptable_return
     grad = np.zeros_like(weights)
     if np.any(below_threshold):
-        # Sum returns where portfolio return is below threshold
-        grad = -np.sum(net_returns[below_threshold], axis=0) / T
+        bad_returns = net_returns[below_threshold]
+        # Gradient with chain rule: Σ(∇τ - r_t) where threshold depends on w
+        # FLPM = mean(max(0, τ - r^T w)), so ∇FLPM = mean((∇τ - r) * indicator)
+        grad_terms = mean_gradient[np.newaxis, :] - bad_returns
+        grad = np.sum(grad_terms, axis=0) / T
     return grad
 
 
@@ -360,7 +516,8 @@ def _analytical_worst_realization_gradient(
     weights : ndarray of shape (n_assets,)
         Portfolio weights.
     net_returns : ndarray of shape (n_observations, n_assets)
-        Historical net returns.
+        Historical net returns. For single observations, automatically reshaped
+        from (n_assets,) to (1, n_assets) by MeasureObjective.grad().
     **kwargs
         Unused, included for signature consistency.
 
@@ -375,21 +532,23 @@ def _analytical_worst_realization_gradient(
     return -net_returns[worst_idx]
 
 
-def _analytical_gini_gradient(
+def _analytical_gini_mean_difference_gradient(
     weights: np.ndarray, net_returns: np.ndarray, **kwargs
 ) -> np.ndarray:
     """Analytical gradient of Gini Mean Difference.
 
     GMD gradient uses OWA (Ordered Weighted Averaging) weights.
     ∇_w GMD = Σ_t w_π(t) r_t
-    where π is the sorting permutation and w_k = (2k - T - 1)/T
+    where π is the sorting permutation and w_k = (4k - 2(T+1)) / (T(T-1))
+    This matches skfolio.measures.owa_gmd_weights.
 
     Parameters
     ----------
     weights : ndarray of shape (n_assets,)
         Portfolio weights.
     net_returns : ndarray of shape (n_observations, n_assets)
-        Historical net returns.
+        Historical net returns. For single observations, automatically reshaped
+        from (n_assets,) to (1, n_assets) by MeasureObjective.grad().
     **kwargs
         Unused, included for signature consistency.
 
@@ -399,14 +558,482 @@ def _analytical_gini_gradient(
         Gradient vector.
     """
     T = net_returns.shape[0]
+    if T == 1:
+        # Single observation: use proxy |w^T r|, gradient = sign(w^T r) * r
+        portfolio_return = net_returns[0] @ weights
+        sign = np.sign(portfolio_return)
+        return sign * net_returns[0]
+
     portfolio_returns = net_returns @ weights
     # Sort returns and get permutation
     sort_idx = np.argsort(portfolio_returns)
-    # OWA weights: w_k = (2k - T - 1) / T for k = 1, ..., T
-    owa_weights = (2.0 * np.arange(1, T + 1) - T - 1) / T
+    # Correct OWA weights: w_k = (4k - 2(T+1)) / (T(T-1))
+    # This matches skfolio.measures.owa_gmd_weights
+    owa_weights = (4.0 * np.arange(1, T + 1) - 2.0 * (T + 1)) / (T * (T - 1))
     # Apply OWA weights to sorted returns
     sorted_returns = net_returns[sort_idx]
     grad = sorted_returns.T @ owa_weights
+    return grad
+
+
+# ============================================================================
+# Helper functions for entropic risk measures (EVaR, EDaR, CDaR with drawdowns)
+# ============================================================================
+
+
+def _find_theta_star_empirical(
+    x: np.ndarray, beta: float = 0.95, tol: float = 1e-8, maxiter: int = 200
+) -> float:
+    """Find theta > 0 minimizing F(theta) = (1/theta)(log(mean(exp(theta*x))) - log(1-beta)).
+
+    Uses Newton's method with safe bracketing fallback.
+
+    Parameters
+    ----------
+    x : ndarray of shape (N,)
+        Loss or drawdown values (nonnegative).
+    beta : float, default=0.95
+        Confidence level.
+    tol : float, default=1e-8
+        Convergence tolerance for derivative.
+    maxiter : int, default=200
+        Maximum iterations.
+
+    Returns
+    -------
+    float
+        Optimal theta value.
+    """
+    x = np.asarray(x, dtype=float)
+    n = x.size
+    if n == 0:
+        return 1.0
+
+    # If all equal, any theta works
+    if np.allclose(x, x[0]):
+        return 1.0
+
+    log1mbeta = np.log(1.0 - beta)
+
+    def F_and_dF(theta: float):
+        """Compute F(theta) and dF/dtheta with numerical stability."""
+        a = theta * x
+        a_max = np.max(a)
+        shifted = np.exp(a - a_max)
+        M = shifted.mean() * np.exp(a_max)
+        M1 = (x * shifted).mean() * np.exp(a_max)
+        F = (np.log(M) - log1mbeta) / theta
+        dF = -(np.log(M) - log1mbeta) / (theta * theta) + (M1 / M) / theta
+        return F, dF
+
+    # Initialize bracket
+    theta = 1.0
+    F0, dF0 = F_and_dF(theta)
+    low = 1e-12
+    high = None
+    sign0 = np.sign(dF0)
+
+    # Find bracket where dF changes sign
+    for it in range(80):
+        theta_try = theta * (2.0**it)
+        F_try, dF_try = F_and_dF(theta_try)
+        if np.sign(dF_try) != sign0:
+            low = min(theta, theta_try)
+            high = max(theta, theta_try)
+            break
+
+    if high is None:
+        low = 1e-12
+        high = max(1.0, theta * (2.0**8))
+
+    # Newton with backtracking
+    theta_k = max(1e-8, min(1.0, (low + high) / 2.0))
+    for _ in range(maxiter):
+        Fk, dFk = F_and_dF(theta_k)
+        if abs(dFk) < tol:
+            return float(theta_k)
+
+        # Numerical second derivative
+        eps = 1e-6 * max(1.0, theta_k)
+        _, dF_plus = F_and_dF(theta_k + eps)
+        _, dF_minus = F_and_dF(theta_k - eps)
+        d2 = (dF_plus - dF_minus) / (2 * eps)
+
+        if d2 == 0 or not np.isfinite(d2):
+            theta_k = 0.5 * (low + high)
+            continue
+
+        delta = dFk / d2
+        theta_new = theta_k - delta
+
+        # Clamp to bracket
+        if theta_new <= low or theta_new >= high or not np.isfinite(theta_new):
+            theta_new = 0.5 * (theta_k + (high if dFk > 0 else low))
+
+        # Update bracket
+        F_new, dF_new = F_and_dF(theta_new)
+        if abs(dF_new) < tol:
+            return float(theta_new)
+
+        if np.sign(dF_new) == np.sign(dFk):
+            if dFk > 0:
+                high = theta_new
+            else:
+                low = theta_new
+        else:
+            if dFk > 0:
+                low = theta_new
+            else:
+                high = theta_new
+        theta_k = theta_new
+
+    return float(theta_k)
+
+
+def _wealth_and_dwealth(net_returns: np.ndarray, w: np.ndarray):
+    """Compute wealth S_t and derivatives dS_t/dw.
+
+    Parameters
+    ----------
+    net_returns : ndarray of shape (T, d)
+        Asset net returns.
+    w : ndarray of shape (d,)
+        Portfolio weights.
+
+    Returns
+    -------
+    S : ndarray of shape (T,)
+        Wealth levels S_t (assumes S_0 = 1).
+    dS : ndarray of shape (T, d)
+        Derivatives dS_t/dw.
+    """
+    net_returns = np.asarray(net_returns, dtype=float)
+    w = np.asarray(w, dtype=float)
+    T, d = net_returns.shape
+    one_plus = 1.0 + net_returns @ w  # shape (T,)
+
+    if np.any(one_plus <= 0):
+        # Fallback to direct product derivative (less stable)
+        S = np.ones(T, dtype=float)
+        dS = np.zeros((T, d), dtype=float)
+        prod = 1.0
+        for t in range(T):
+            prod *= one_plus[t]
+            S[t] = prod
+            deriv = np.zeros(d, dtype=float)
+            for s in range(t + 1):
+                excl = 1.0
+                for j in range(t + 1):
+                    if j == s:
+                        continue
+                    excl *= one_plus[j]
+                deriv += excl * net_returns[s]
+            dS[t] = deriv
+        return S, dS
+
+    # Use stable log-derivative formula
+    log_terms = np.log(one_plus)
+    S = np.exp(np.cumsum(log_terms))
+    inv_one_plus = 1.0 / one_plus
+    accum = np.zeros((d,), dtype=float)
+    dS = np.zeros((T, d), dtype=float)
+    for t in range(T):
+        accum += net_returns[t] * inv_one_plus[t]
+        dS[t, :] = S[t] * accum
+    return S, dS
+
+
+def _drawdowns_and_derivatives(
+    net_returns: np.ndarray, w: np.ndarray, compounded: bool = False
+):
+    """Compute D_t and ∂D_t/∂w for drawdowns.
+
+    Parameters
+    ----------
+    net_returns : ndarray of shape (T, d)
+        Asset net returns.
+    w : ndarray of shape (d,)
+        Portfolio weights.
+    compounded : bool, default=False
+        If True, use wealth-based drawdowns (multiplicative).
+        If False, use cumsum-based drawdowns (additive) - default matches skfolio.measures.
+
+    Returns
+    -------
+    D : ndarray of shape (T,)
+        Drawdown series.
+    dD : ndarray of shape (T, d)
+        Derivatives of drawdowns w.r.t. weights.
+    """
+    T, d = net_returns.shape
+
+    if compounded:
+        # Wealth-based (original implementation)
+        S, dS = _wealth_and_dwealth(net_returns, w)
+        running_max = np.empty(T, dtype=float)
+        argmax_idx = np.empty(T, dtype=int)
+        current_max = -np.inf
+        current_arg = -1
+
+        for t in range(T):
+            if S[t] > current_max:
+                current_max = S[t]
+                current_arg = t
+            running_max[t] = current_max
+            argmax_idx[t] = current_arg
+
+        D = running_max - S
+        dD = np.zeros_like(dS)
+        for t in range(T):
+            u = argmax_idx[t]
+            dD[t, :] = dS[u, :] - dS[t, :]
+        return D, dD
+    else:
+        # Cumsum-based (matches skfolio.measures default)
+        # C_t(w) = sum_{s<=t} r_s^T w
+        # dC_t/dw = sum_{s<=t} r_s
+        portfolio_returns = net_returns @ w  # (T,)
+        cum_returns = np.cumsum(portfolio_returns)  # (T,)
+
+        # Find running maximum and its index
+        running_max = np.empty(T, dtype=float)
+        argmax_idx = np.empty(T, dtype=int)
+        current_max = -np.inf
+        current_arg = -1
+
+        for t in range(T):
+            if cum_returns[t] > current_max:
+                current_max = cum_returns[t]
+                current_arg = t
+            running_max[t] = current_max
+            argmax_idx[t] = current_arg
+
+        # D_t = max_{s<=t} C_s - C_t
+        D = running_max - cum_returns
+
+        # dD_t/dw = dC_peak/dw - dC_t/dw
+        # where dC_s/dw = sum_{i<=s} r_i
+        dC = np.cumsum(net_returns, axis=0)  # (T, d): cumsum of returns
+        dD = np.zeros((T, d))
+        for t in range(T):
+            peak_idx = argmax_idx[t]
+            dD[t, :] = dC[peak_idx, :] - dC[t, :]
+
+        return D, dD
+
+
+def _analytical_evar_gradient(
+    weights: np.ndarray, net_returns: np.ndarray, **kwargs
+) -> np.ndarray:
+    """Analytical EVaR gradient using envelope theorem.
+
+    EVaR = min_theta (theta * log(E[exp(-r/theta)] / (1-beta)))
+    ∇EVaR = -Σ r_i * p_i where p_i ∝ exp(theta* * L_i) and L_i = -r_i^T w
+
+    Parameters
+    ----------
+    weights : ndarray of shape (n_assets,)
+        Portfolio weights.
+    net_returns : ndarray of shape (n_observations, n_assets)
+        Historical net returns.
+    **kwargs
+        Additional parameters (beta).
+
+    Returns
+    -------
+    ndarray of shape (n_assets,)
+        Gradient vector.
+    """
+    beta = kwargs.get("beta", 0.95)
+    R = np.asarray(net_returns, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    N, d = R.shape
+
+    # Losses L_i = -(r_i^T w)
+    L = -(R @ w)
+
+    # Find optimal theta
+    theta_star = _find_theta_star_empirical(L, beta=beta)
+
+    # Compute Gibbs weights p_i ∝ exp(theta* * L_i)
+    a = theta_star * L
+    a_max = np.max(a)
+    exp_shift = np.exp(a - a_max)
+    denom = exp_shift.sum()
+
+    if denom == 0:
+        return np.zeros_like(w)
+
+    p = exp_shift / denom
+    # Gradient: -Σ r_i * p_i
+    grad = -(R.T @ p)
+    return grad
+
+
+def _analytical_cdar_gradient(
+    weights: np.ndarray, net_returns: np.ndarray, **kwargs
+) -> np.ndarray:
+    """Analytical CDaR gradient (CVaR on drawdowns with fractional handling).
+
+    Uses cumsum-based drawdowns (compounded=False) to match skfolio.measures default.
+
+    Parameters
+    ----------
+    weights : ndarray of shape (n_assets,)
+        Portfolio weights.
+    net_returns : ndarray of shape (n_observations, n_assets)
+        Historical net returns.
+    **kwargs
+        Additional parameters (beta, compounded).
+
+    Returns
+    -------
+    ndarray of shape (n_assets,)
+        Gradient vector.
+    """
+    beta = kwargs.get("beta", 0.95)
+    compounded = kwargs.get("compounded", False)
+    R = np.asarray(net_returns, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    T, d = R.shape
+
+    if T == 0:
+        return np.zeros_like(w)
+
+    # Compute drawdowns and their derivatives (default: cumsum-based)
+    D, dD = _drawdowns_and_derivatives(R, w, compounded=compounded)
+
+    # Sort by drawdown (descending, largest first)
+    order = np.argsort(D)[::-1]
+    D_sorted = D[order]
+    dD_sorted = dD[order]
+
+    m = (1.0 - beta) * T
+    if m <= 0:
+        return np.zeros_like(w)
+
+    k = int(np.floor(m))
+    rem = m - k
+
+    # Accumulate gradient: sum first k fully, then fraction of (k+1)-th
+    grad = np.zeros(d, dtype=float)
+    if k > 0:
+        grad += dD_sorted[:k].sum(axis=0)
+    if rem > 0 and k < T:
+        grad += rem * dD_sorted[k]
+
+    # Normalize
+    grad = grad / ((1.0 - beta) * T)
+    return grad
+
+
+def _analytical_edar_gradient(
+    weights: np.ndarray, net_returns: np.ndarray, **kwargs
+) -> np.ndarray:
+    """Analytical EDaR gradient using envelope theorem on drawdowns.
+
+    Uses cumsum-based drawdowns (compounded=False) to match skfolio.measures default.
+
+    EDaR = min_theta (theta * log(E[exp(D_t/theta)] / (1-beta)))
+    ∇EDaR = Σ ∂D_t/∂w * p_t where p_t ∝ exp(theta* * D_t)
+
+    Parameters
+    ----------
+    weights : ndarray of shape (n_assets,)
+        Portfolio weights.
+    net_returns : ndarray of shape (n_observations, n_assets)
+        Historical net returns.
+    **kwargs
+        Additional parameters (beta, compounded).
+
+    Returns
+    -------
+    ndarray of shape (n_assets,)
+        Gradient vector.
+    """
+    beta = kwargs.get("beta", 0.95)
+    compounded = kwargs.get("compounded", False)
+    R = np.asarray(net_returns, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    T, d = R.shape
+
+    # Compute drawdowns and derivatives (default: cumsum-based)
+    D, dD = _drawdowns_and_derivatives(R, w, compounded=compounded)
+
+    # Find optimal theta
+    theta_star = _find_theta_star_empirical(D, beta=beta)
+
+    # Compute weights p_t ∝ exp(theta* * D_t)
+    a = theta_star * D
+    a_max = np.max(a)
+    exp_shift = np.exp(a - a_max)
+    denom = exp_shift.sum()
+
+    if denom == 0:
+        return np.zeros_like(w)
+
+    weights_t = exp_shift / denom
+    # Gradient: Σ dD_t * p_t
+    grad = dD.T @ weights_t
+    return grad
+
+
+def _analytical_cvar_gradient(
+    weights: np.ndarray, net_returns: np.ndarray, **kwargs
+) -> np.ndarray:
+    """Analytical gradient of CVaR (Conditional Value at Risk).
+
+    CVaR gradient with fractional tail handling matching skfolio.measures.cvar.
+
+    Formula: CVaR = -sum(ret[:ik]) / k + ret[ik] * (ik / k - 1)
+    where k = (1-β)*T and ik = ceil(k) - 1
+
+    Gradient accounts for fractional weighting of the marginal observation.
+
+    Parameters
+    ----------
+    weights : ndarray of shape (n_assets,)
+        Portfolio weights.
+    net_returns : ndarray of shape (n_observations, n_assets)
+        Historical net returns. For single observations, automatically reshaped
+        from (n_assets,) to (1, n_assets) by MeasureObjective.grad().
+    **kwargs
+        Additional parameters (beta).
+
+    Returns
+    -------
+    ndarray of shape (n_assets,)
+        Gradient vector (subgradient).
+
+    Notes
+    -----
+    This implements the exact gradient of the empirical CVaR formula used in
+    skfolio.measures.cvar, including proper handling of the fractional part.
+    """
+    beta = kwargs.get("beta", 0.95)
+    T = net_returns.shape[0]
+    k = (1 - beta) * T
+    if k <= 0:
+        return np.zeros(net_returns.shape[1])
+
+    ik = max(0, int(np.ceil(k) - 1))
+
+    portfolio_returns = net_returns @ weights
+    # Sort portfolio returns (ascending, worst first)
+    sort_idx = np.argsort(portfolio_returns)
+    sorted_returns = net_returns[sort_idx]
+
+    # Gradient components:
+    # d/dw [-sum(ret[:ik]) / k] = -sum(r[:ik]) / k
+    # d/dw [ret[ik] * (ik/k - 1)] = r[ik] * (ik/k - 1)
+
+    grad = np.zeros(net_returns.shape[1])
+    if ik > 0:
+        grad -= sorted_returns[:ik].sum(axis=0) / k
+    # Add contribution from marginal observation
+    if ik < T:
+        grad += sorted_returns[ik] * (ik / k - 1)
+
     return grad
 
 
@@ -414,6 +1041,7 @@ def _analytical_gini_gradient(
 MEASURE_PROPERTIES = {
     # Special measure for log-wealth (default objective)
     PerfMeasure.LOG_WEALTH: {
+        "measure_func": log_wealth,
         "convexity": "exp-concave",
         "sign": -1,  # maximize wealth = minimize negative log
         "notes": "1-exp-concave, O(log T) regret. Analytical gradient available.",
@@ -466,13 +1094,13 @@ MEASURE_PROPERTIES = {
         "measure_func": cvar,
         "convexity": "convex",
         "sign": 1,
-        "notes": "Convex, non-smooth. Uses autograd.",
+        "notes": "Convex, non-smooth (sorting). Analytical gradient available.",
     },
     RiskMeasure.EVAR: {
         "measure_func": evar,
         "convexity": "exp-concave",
         "sign": 1,
-        "notes": "Convex, exp-concave, smooth. Uses autograd.",
+        "notes": "Convex, exp-concave, smooth. Analytical gradient available (envelope theorem with theta optimization).",
     },
     RiskMeasure.WORST_REALIZATION: {
         "measure_func": worst_realization,
@@ -490,15 +1118,335 @@ MEASURE_PROPERTIES = {
         "measure_func": cdar,
         "convexity": "convex",
         "sign": 1,
-        "notes": "Convex, non-smooth. Uses autograd.",
+        "notes": "Convex, non-smooth. Analytical gradient available (CVaR on drawdowns with path derivatives).",
     },
     RiskMeasure.EDAR: {
         "measure_func": edar,
         "convexity": "exp-concave",
         "sign": 1,
-        "notes": "Convex, exp-concave, smooth. Uses autograd.",
+        "notes": "Convex, exp-concave, smooth. Analytical gradient available (envelope theorem on drawdowns).",
     },
 }
+
+
+# Individual measure functions for clarity and testability
+def _autograd_log_wealth(portfolio_returns: np.ndarray, **kwargs) -> anp.ndarray:
+    """Compute log-wealth."""
+    return anp.sum(anp.log(1.0 + portfolio_returns))
+
+
+def _autograd_mean(returns: np.ndarray, **kwargs) -> anp.ndarray:
+    """Compute mean (expected return)."""
+    return anp.mean(returns)
+
+
+def _autograd_variance(returns, **kwargs):
+    """Compute variance with T==1 proxy.
+
+    Uses unbiased estimator (ddof=1) to match skfolio.measures.variance default.
+    """
+    T = len(returns)
+    if T == 1:
+        # Single observation proxy: (w^T r)^2
+        return returns[0] ** 2
+    # True variance for time series (unbiased: divide by T-1)
+    mean_ret = anp.mean(returns)
+    return anp.sum((returns - mean_ret) ** 2) / (T - 1)
+
+
+def _autograd_standard_deviation(returns, **kwargs):
+    """Compute standard deviation with T==1 proxy.
+
+    Uses unbiased estimator (ddof=1) to match skfolio.measures.standard_deviation default.
+    """
+    T = len(returns)
+    if T == 1:
+        # Single observation proxy: |w^T r|
+        return anp.abs(returns[0])
+    # Use unbiased variance (divide by T-1)
+    mean_ret = anp.mean(returns)
+    var = anp.sum((returns - mean_ret) ** 2) / (T - 1)
+    return anp.sqrt(var + CLIP_EPSILON)
+
+
+def _autograd_semi_variance(returns, **kwargs):
+    """Compute semi-variance.
+
+    Uses unbiased estimator (correction factor T/(T-1)) to match skfolio.measures.semi_variance default.
+    Defaults to mean if min_acceptable_return is None.
+    """
+    min_acceptable_return = kwargs.get("min_acceptable_return", None)
+    if min_acceptable_return is None:
+        min_acceptable_return = anp.mean(returns)
+
+    downside = anp.maximum(0, min_acceptable_return - returns)
+    T = len(returns)
+    biased_semi_var = anp.mean(downside**2)
+
+    # Apply unbiased correction: T / (T - 1)
+    if T > 1:
+        return biased_semi_var * T / (T - 1)
+    return biased_semi_var
+
+
+def _autograd_semi_deviation(returns, **kwargs):
+    """Compute semi-deviation.
+
+    Uses unbiased estimator to match skfolio.measures.semi_deviation default.
+    Defaults to mean if min_acceptable_return is None.
+    """
+    # Compute unbiased semi-variance then take sqrt
+    semi_var = _autograd_semi_variance(returns, **kwargs)
+    return anp.sqrt(semi_var + CLIP_EPSILON)
+
+
+def _autograd_mean_absolute_deviation(returns, **kwargs):
+    """Compute mean absolute deviation with T==1 proxy."""
+    min_acceptable_return = kwargs.get("min_acceptable_return", 0)
+    T = len(returns)
+    if T == 1:
+        # Single observation proxy: |w^T r - mar|
+        return anp.abs(returns[0] - min_acceptable_return)
+    mean_ret = anp.mean(returns)
+    return anp.mean(anp.abs(returns - mean_ret))
+
+
+def _autograd_first_lower_partial_moment(returns, **kwargs):
+    """Compute first lower partial moment.
+
+    Defaults to mean if min_acceptable_return is None, matching skfolio.measures behavior.
+    """
+    min_acceptable_return = kwargs.get("min_acceptable_return", None)
+    if min_acceptable_return is None:
+        min_acceptable_return = anp.mean(returns)
+
+    downside = anp.maximum(0, min_acceptable_return - returns)
+    return anp.mean(downside)
+
+
+def _autograd_cvar(returns, **kwargs):
+    """Compute CVaR (Conditional Value at Risk).
+
+    Matches skfolio.measures.cvar formula exactly:
+    CVaR = -sum(ret[:ik]) / k + ret[ik] * (ik / k - 1)
+    where k = (1-β)*T and ik = ceil(k) - 1
+    """
+    beta = kwargs.get("beta", 0.95)
+    T = len(returns)
+    k = (1 - beta) * T
+    if k <= 0:
+        k = 1.0
+    ik = max(0, int(anp.ceil(k) - 1))
+    sorted_returns = anp.sort(returns)
+    # Formula from skfolio.measures.cvar (without sample weights)
+    return -anp.sum(sorted_returns[:ik]) / k + sorted_returns[ik] * (ik / k - 1)
+
+
+def _autograd_evar(returns, **kwargs):
+    """Compute EVaR (Entropic Value at Risk) using entropic risk measure.
+
+    EVaR = min_theta (theta * log(E[exp(-r/theta)] / (1-beta)))
+
+    We approximate the optimization by evaluating at multiple theta values
+    and taking the minimum. This is differentiable and provides good accuracy.
+
+    Parameters
+    ----------
+    portfolio_returns : array-like
+        Portfolio returns.
+    **kwargs
+        beta : float, default=0.95
+            Confidence level.
+
+    Returns
+    -------
+    float
+        EVaR estimate.
+
+    Notes
+    -----
+    We use a grid of theta values from max_loss/100 to max_loss/2 and take
+    the minimum entropic risk measure. This approximates the true EVaR
+    optimization while remaining differentiable.
+    """
+    beta = kwargs.get("beta", 0.95)
+
+    # Define grid of theta values based on data scale
+    max_loss = anp.max(-returns)
+    if max_loss <= 0:
+        max_loss = 1.0
+
+    # Grid of theta values (similar to scipy optimization bounds)
+    # Use logarithmic spacing from max_loss/100 to max_loss/2
+    # 20 points provides good approximation while remaining efficient
+    theta_min = max_loss / 100.0
+    theta_max = max_loss / 2.0
+    theta_candidates = anp.exp(anp.linspace(anp.log(theta_min), anp.log(theta_max), 20))
+
+    # Compute entropic risk measure for each theta
+    evar_values = []
+    for theta in theta_candidates:
+        exp_term = anp.exp(-returns / theta)
+        mean_exp = anp.mean(exp_term)
+        evar_val = theta * anp.log(mean_exp / (1.0 - beta))
+        evar_values.append(evar_val)
+
+    # Return minimum (closest to true EVaR)
+    return anp.min(anp.array(evar_values))
+
+
+def _autograd_worst_realization(returns, **kwargs):
+    """Compute worst realization (negative minimum return)."""
+    return -anp.min(returns)
+
+
+def _autograd_gini_mean_difference(returns, **kwargs):
+    """Compute Gini mean difference with T==1 proxy.
+
+    Uses the correct OWA weights formula from skfolio.measures:
+    w_k = (4k - 2(T+1)) / (T(T-1))
+    """
+    T = len(returns)
+    if T == 1:
+        # Single observation proxy: |w^T r|
+        return anp.abs(returns[0])
+    sorted_rets = anp.sort(returns)
+    # Correct OWA weights: w_k = (4k - 2(T+1)) / (T(T-1))
+    # This matches skfolio.measures.owa_gmd_weights
+    weights_owa = (4.0 * anp.arange(1, T + 1) - 2.0 * (T + 1)) / (T * (T - 1))
+    return anp.dot(weights_owa, sorted_rets)
+
+
+def smooth_max(a, b, beta=100.0):
+    """Smooth approximation of max(a,b). Higher beta = sharper approximation."""
+    return (1.0 / beta) * anp.log(anp.exp(beta * a) + anp.exp(beta * b))
+
+
+def smooth_cummax(x, beta=100.0):
+    """Differentiable smooth running maximum."""
+    out = anp.copy(x)
+    for i in range(1, len(x)):
+        out[i] = smooth_max(out[i - 1], x[i], beta)
+    return out
+
+
+def _autograd_get_drawdowns(returns, compounded=False, beta=None):
+    """Compute drawdowns with optional smooth approximation.
+
+    Parameters
+    ----------
+    returns : array-like
+        Portfolio returns.
+    compounded : bool, default=False
+        Whether returns are compounded.
+    beta : float or None, default=None
+        Smoothing parameter for differentiable cummax. If None, uses exact
+        cummax via np.maximum.accumulate (not differentiable).
+
+    Returns
+    -------
+    drawdowns : array-like
+        Drawdown series.
+    """
+    cumulative_returns = get_cumulative_returns(returns, compounded=compounded)
+    if beta is None:
+        # Use regular numpy for exact cummax (not differentiable)
+        running_max = np.maximum.accumulate(cumulative_returns)
+    else:
+        # Use smooth approximation (differentiable)
+        running_max = smooth_cummax(cumulative_returns, beta=beta)
+    if compounded:
+        drawdowns = cumulative_returns / running_max - 1
+    else:
+        drawdowns = cumulative_returns - running_max
+    return drawdowns
+
+
+def _autograd_cdar(returns, beta=0.95, compounded=False, smooth_beta=None):
+    """Compute CDaR (Conditional Drawdown at Risk).
+
+    Parameters
+    ----------
+    returns : array-like
+        Portfolio returns.
+    beta : float, default=0.95
+        Confidence level for CVaR on drawdowns.
+    compounded : bool, default=False
+        Whether returns are compounded.
+    smooth_beta : float or None, default=None
+        Smoothing parameter for differentiable cummax. If None, uses exact
+        cummax (not differentiable but numerically exact).
+
+    Notes
+    -----
+    For numerical accuracy in testing, use smooth_beta=None. For gradient
+    computation in OCO, use smooth_beta=1000 or higher for good approximation.
+    """
+    drawdowns = _autograd_get_drawdowns(
+        returns, compounded=compounded, beta=smooth_beta
+    )
+    return _autograd_cvar(drawdowns, beta=beta)
+
+
+def _autograd_edar(returns, beta=0.95, compounded=False, smooth_beta=None):
+    """Compute EDaR (Entropic Drawdown at Risk) - approximated via EVaR on drawdowns.
+
+    Parameters
+    ----------
+    returns : array-like
+        Portfolio returns.
+    beta : float, default=0.95
+        Confidence level for EVaR on drawdowns.
+    compounded : bool, default=False
+        Whether returns are compounded.
+    smooth_beta : float or None, default=None
+        Smoothing parameter for differentiable cummax. If None, uses exact
+        cummax (not differentiable but numerically exact).
+
+    Notes
+    -----
+    This approximates EDaR using CVaR on drawdowns (since true EVaR requires
+    optimization). For numerical accuracy in testing, use smooth_beta=None.
+    For gradient computation in OCO, use smooth_beta=1000 or higher.
+    """
+    drawdowns = _autograd_get_drawdowns(
+        returns, compounded=compounded, beta=smooth_beta
+    )
+    return _autograd_evar(drawdowns, beta=beta)
+
+
+def _get_autograd_measure_fn(measure: BaseMeasure, **kwargs):
+    match measure:
+        case PerfMeasure.LOG_WEALTH:
+            return partial(_autograd_log_wealth, **kwargs)
+        case PerfMeasure.MEAN:
+            return partial(_autograd_mean, **kwargs)
+        case RiskMeasure.VARIANCE:
+            return partial(_autograd_variance, **kwargs)
+        case RiskMeasure.STANDARD_DEVIATION:
+            return partial(_autograd_standard_deviation, **kwargs)
+        case RiskMeasure.SEMI_VARIANCE:
+            return partial(_autograd_semi_variance, **kwargs)
+        case RiskMeasure.SEMI_DEVIATION:
+            return partial(_autograd_semi_deviation, **kwargs)
+        case RiskMeasure.MEAN_ABSOLUTE_DEVIATION:
+            return partial(_autograd_mean_absolute_deviation, **kwargs)
+        case RiskMeasure.FIRST_LOWER_PARTIAL_MOMENT:
+            return partial(_autograd_first_lower_partial_moment, **kwargs)
+        case RiskMeasure.CVAR:
+            return partial(_autograd_cvar, **kwargs)
+        case RiskMeasure.EVAR:
+            return partial(_autograd_evar, **kwargs)
+        case RiskMeasure.WORST_REALIZATION:
+            return partial(_autograd_worst_realization, **kwargs)
+        case RiskMeasure.GINI_MEAN_DIFFERENCE:
+            return partial(_autograd_gini_mean_difference, **kwargs)
+        case RiskMeasure.CDAR:
+            return partial(_autograd_cdar, **kwargs)
+        case RiskMeasure.EDAR:
+            return partial(_autograd_edar, **kwargs)
+        case _:
+            raise ValueError(f"Unsupported measure: {measure}")
 
 
 @dataclass
@@ -559,145 +1507,92 @@ class MeasureObjective(BaseObjective):
                     "Set `use_autograd=True` or choose a different measure."
                 )
 
+    def _ensure_2d(self, net_returns: np.ndarray) -> np.ndarray:
+        """Convert 1D input to 2D (1, n_assets) for unified handling.
+
+        Parameters
+        ----------
+        net_returns : ndarray
+            Net returns array, either 1D (n_assets,) or 2D (n_observations, n_assets).
+
+        Returns
+        -------
+        ndarray
+            2D array of shape (n_observations, n_assets).
+        """
+        if net_returns.ndim == 1:
+            return net_returns.reshape(1, -1)
+        return net_returns
+
     def _loss_fn(self, weights, net_returns, **kwargs):
-        """Autograd-compatible loss computation.
+        """Autograd-compatible loss computation with unified 2D handling.
 
         Parameters
         ----------
         weights : array-like
             Portfolio weights.
         net_returns : array-like
-            Net returns of assets (not price relatives). Can be:
+            Net returns of assets (not price relatives).
             - 1D array of shape (n_assets,) for single observation
             - 2D array of shape (n_observations, n_assets) for time series
         **kwargs
             Additional parameters (e.g., beta for CVaR, min_acceptable_return, etc.).
         """
-        if self.measure == PerfMeasure.LOG_WEALTH:
-            # Log-wealth: -log(1 + w^T r_t) for single period
-            # where r_t are net returns
-            portfolio_net_return = anp.dot(weights, net_returns)
-            return -anp.log(1.0 + portfolio_net_return)
-        else:
-            # Compute portfolio returns using autograd-compatible operations
-            # If net_returns is 1D (single observation), portfolio_returns is scalar
-            # If net_returns is 2D (time series), portfolio_returns is 1D
-            if net_returns.ndim == 1:
-                # Single observation: net_returns shape (n_assets,)
-                portfolio_returns = anp.dot(weights, net_returns)
-                # For single observations, use simple proxies
-                return self._compute_measure_single(portfolio_returns, **kwargs)
-            else:
-                # Time series: net_returns shape (n_observations, n_assets)
-                portfolio_returns = anp.dot(net_returns, weights)
-                return self._compute_measure_timeseries(portfolio_returns, **kwargs)
+        # For all other measures: ensure 2D, then compute unified
+        net_returns_2d = self._ensure_2d(net_returns)
+        returns = anp.dot(net_returns_2d, weights)  # Shape: (T,)
+        return self._sign * _get_autograd_measure_fn(self.measure)(returns, **kwargs)
 
-    def _compute_measure_single(self, portfolio_return, **kwargs):
-        """Compute measure for single observation using autograd-compatible operations.
+    def _autograd_measure(self, returns, **kwargs):
+        """Dispatch to individual measure functions.
 
-        For single observations, we use simple approximations since measures
-        like variance are undefined for a single sample.
+        Parameters
+        ----------
+        portfolio_returns : array-like of shape (T,)
+            Portfolio returns over T observations.
+        **kwargs
+            Additional parameters (min_acceptable_return, beta, etc.).
+
+        Returns
+        -------
+        float
+            Measure value.
+
+        Notes
+        -----
+        For T=1, some measures use simplified proxies since statistical measures
+        like variance are undefined for a single sample. Each measure has its own
+        dedicated function for clarity and testability.
         """
-        min_acceptable_return = kwargs.get(
-            "min_acceptable_return", self.min_acceptable_return
-        )
-
         match self.measure:
+            case PerfMeasure.LOG_WEALTH:
+                return self._autograd_log_wealth(returns, **kwargs)
             case PerfMeasure.MEAN:
-                return self._sign * portfolio_return
+                return self._autograd_mean(returns, **kwargs)
             case RiskMeasure.VARIANCE:
-                # For single observation, use squared return as proxy
-                return self._sign * portfolio_return**2
+                return self._autograd_variance(returns, **kwargs)
             case RiskMeasure.STANDARD_DEVIATION:
-                return self._sign * anp.abs(portfolio_return)
+                return self._autograd_standard_deviation(returns, **kwargs)
             case RiskMeasure.SEMI_VARIANCE:
-                # Downside deviation squared
-                downside = anp.maximum(0, min_acceptable_return - portfolio_return)
-                return self._sign * downside**2
+                return self._autograd_semi_variance(returns, **kwargs)
             case RiskMeasure.SEMI_DEVIATION:
-                downside = anp.maximum(0, min_acceptable_return - portfolio_return)
-                return self._sign * downside
+                return self._autograd_semi_deviation(returns, **kwargs)
             case RiskMeasure.MEAN_ABSOLUTE_DEVIATION:
-                return self._sign * anp.abs(portfolio_return - min_acceptable_return)
+                return self._autograd_mad(returns, **kwargs)
             case RiskMeasure.FIRST_LOWER_PARTIAL_MOMENT:
-                downside = anp.maximum(0, min_acceptable_return - portfolio_return)
-                return self._sign * downside
-            case RiskMeasure.WORST_REALIZATION:
-                return self._sign * (-portfolio_return)
-            case _:
-                # For other measures that need time series, use absolute value as fallback
-                return self._sign * anp.abs(portfolio_return)
-
-    def _compute_measure_timeseries(self, portfolio_returns, **kwargs):
-        """Compute measure for time series using autograd-compatible operations."""
-        min_acceptable_return = kwargs.get(
-            "min_acceptable_return", self.min_acceptable_return
-        )
-        beta = kwargs.get("beta", self.cvar_beta)
-
-        match self.measure:
-            case PerfMeasure.MEAN:
-                return self._sign * anp.mean(portfolio_returns)
-            case RiskMeasure.VARIANCE:
-                # Use unbiased variance (ddof=1 equivalent)
-                mean_ret = anp.mean(portfolio_returns)
-                return self._sign * anp.mean((portfolio_returns - mean_ret) ** 2)
-            case RiskMeasure.STANDARD_DEVIATION:
-                mean_ret = anp.mean(portfolio_returns)
-                var = anp.mean((portfolio_returns - mean_ret) ** 2)
-                return self._sign * anp.sqrt(var + 1e-10)
-            case RiskMeasure.SEMI_VARIANCE:
-                downside = anp.maximum(0, min_acceptable_return - portfolio_returns)
-                return self._sign * anp.mean(downside**2)
-            case RiskMeasure.SEMI_DEVIATION:
-                downside = anp.maximum(0, min_acceptable_return - portfolio_returns)
-                return self._sign * anp.sqrt(anp.mean(downside**2) + 1e-10)
-            case RiskMeasure.MEAN_ABSOLUTE_DEVIATION:
-                mean_ret = anp.mean(portfolio_returns)
-                return self._sign * anp.mean(anp.abs(portfolio_returns - mean_ret))
-            case RiskMeasure.FIRST_LOWER_PARTIAL_MOMENT:
-                downside = anp.maximum(0, min_acceptable_return - portfolio_returns)
-                return self._sign * anp.mean(downside)
+                return self._autograd_flpm(returns, **kwargs)
             case RiskMeasure.CVAR:
-                # CVaR: mean of worst (1-beta) losses
-                k = int((1 - beta) * len(portfolio_returns))
-                if k == 0:
-                    k = 1
-                # Sort in descending order of losses (ascending returns)
-                sorted_returns = anp.sort(portfolio_returns)
-                return self._sign * (-anp.mean(sorted_returns[:k]))
+                return self._autograd_cvar(returns, **kwargs)
             case RiskMeasure.EVAR:
-                # EVAR: use the measure function directly (complex formula)
-                # For time series, approximate via CVaR-like computation
-                k = int((1 - beta) * len(portfolio_returns))
-                if k == 0:
-                    k = 1
-                sorted_returns = anp.sort(portfolio_returns)
-                return self._sign * (-anp.mean(sorted_returns[:k]))
+                return self._autograd_evar(returns, **kwargs)
             case RiskMeasure.WORST_REALIZATION:
-                return self._sign * (-anp.min(portfolio_returns))
+                return self._autograd_worst_realization(returns, **kwargs)
             case RiskMeasure.GINI_MEAN_DIFFERENCE:
-                n = len(portfolio_returns)
-                sorted_rets = anp.sort(portfolio_returns)
-                # OWA weights for Gini
-                weights_owa = (2.0 * anp.arange(1, n + 1) - n - 1) / n
-                return self._sign * anp.dot(weights_owa, sorted_rets)
-            case RiskMeasure.CDAR | RiskMeasure.EDAR:
-                # Compute drawdowns
-                cumulative_returns = anp.cumsum(portfolio_returns)
-                running_max = anp.maximum.accumulate(cumulative_returns)
-                drawdowns = running_max - cumulative_returns
-
-                if self.measure == RiskMeasure.CDAR:
-                    # CDaR: mean of worst (1-beta) drawdowns
-                    k = int((1 - beta) * len(drawdowns))
-                    if k == 0:
-                        k = 1
-                    sorted_dd = anp.sort(drawdowns)[::-1]  # descending
-                    return self._sign * anp.mean(sorted_dd[:k])
-                elif self.measure == RiskMeasure.EDAR:
-                    # EDAR: exponentially weighted worst drawdown (simplified)
-                    return self._sign * anp.max(drawdowns)
+                return self._autograd_gini(returns, **kwargs)
+            case RiskMeasure.CDAR:
+                return self._autograd_cdar(returns, **kwargs)
+            case RiskMeasure.EDAR:
+                return self._autograd_edar(returns, **kwargs)
             case _:
                 raise ValueError(f"Unsupported measure: {self.measure}")
 
@@ -721,42 +1616,42 @@ class MeasureObjective(BaseObjective):
             case RiskMeasure.VARIANCE:
                 base_grad_fn = _analytical_variance_gradient
 
+            case RiskMeasure.STANDARD_DEVIATION:
+                base_grad_fn = _analytical_standard_deviation_gradient
+
             case RiskMeasure.SEMI_VARIANCE:
+                base_grad_fn = _analytical_semi_variance_gradient
 
-                def semi_var_grad(weights, net_returns, **kwargs):
-                    mar = kwargs.get(
-                        "min_acceptable_return", self.min_acceptable_return
-                    )
-                    return _analytical_semi_variance_gradient(
-                        weights, net_returns, min_acceptable_return=mar
-                    )
-
-                base_grad_fn = semi_var_grad
+            case RiskMeasure.SEMI_DEVIATION:
+                base_grad_fn = _analytical_semi_deviation_gradient
 
             case RiskMeasure.MEAN_ABSOLUTE_DEVIATION:
-                base_grad_fn = _analytical_mad_gradient
+                base_grad_fn = _analytical_mean_absolute_deviation_gradient
 
             case RiskMeasure.FIRST_LOWER_PARTIAL_MOMENT:
-
-                def flpm_grad(weights, net_returns, **kwargs):
-                    mar = kwargs.get(
-                        "min_acceptable_return", self.min_acceptable_return
-                    )
-                    return _analytical_flpm_gradient(
-                        weights, net_returns, min_acceptable_return=mar
-                    )
-
-                base_grad_fn = flpm_grad
+                base_grad_fn = _analytical_first_lower_partial_moment_gradient
 
             case RiskMeasure.WORST_REALIZATION:
                 base_grad_fn = _analytical_worst_realization_gradient
 
             case RiskMeasure.GINI_MEAN_DIFFERENCE:
-                base_grad_fn = _analytical_gini_gradient
+                base_grad_fn = _analytical_gini_mean_difference_gradient
+
+            case RiskMeasure.CVAR:
+                base_grad_fn = _analytical_cvar_gradient
+
+            case RiskMeasure.EVAR:
+                base_grad_fn = _analytical_evar_gradient
+
+            case RiskMeasure.CDAR:
+                base_grad_fn = _analytical_cdar_gradient
+
+            case RiskMeasure.EDAR:
+                base_grad_fn = _analytical_edar_gradient
 
             case _:
                 # No analytical gradient available for this measure
-                return None
+                raise ValueError(f"No analytical gradient available for {self.measure}")
 
         # Wrap with sign multiplication to match loss function
         def signed_grad_fn(weights, net_returns, **kwargs):
@@ -765,14 +1660,14 @@ class MeasureObjective(BaseObjective):
         return signed_grad_fn
 
     def loss(self, weights: np.ndarray, net_returns: np.ndarray, **kwargs) -> float:
-        """Compute loss value.
+        """Compute loss value with unified 2D handling.
 
         Parameters
         ----------
         weights : ndarray of shape (n_assets,)
             Portfolio weights.
         net_returns : ndarray of shape (n_assets,) or (n_observations, n_assets)
-            Net returns of assets.
+            Net returns of assets. Automatically converted to 2D for consistency.
         **kwargs
             Additional measure-specific parameters (e.g., beta=0.95 for CVaR).
 
@@ -786,14 +1681,15 @@ class MeasureObjective(BaseObjective):
     def grad(
         self, weights: np.ndarray, net_returns: np.ndarray, **kwargs
     ) -> np.ndarray:
-        """Compute gradient of the loss.
+        """Compute gradient with unified 2D handling.
 
         Parameters
         ----------
         weights : ndarray of shape (n_assets,)
             Portfolio weights.
         net_returns : ndarray of shape (n_assets,) or (n_observations, n_assets)
-            Net returns of assets.
+            Net returns of assets. For analytical gradients of non-LOG_WEALTH measures,
+            automatically converted to 2D for consistent handling.
         **kwargs
             Additional measure-specific parameters (e.g., beta=0.95 for CVaR).
 
@@ -802,7 +1698,13 @@ class MeasureObjective(BaseObjective):
         ndarray of shape (n_assets,)
             Gradient vector.
         """
-        return self._grad_fn(weights, net_returns, **kwargs)
+        # For analytical gradients (except LOG_WEALTH): ensure 2D for consistency
+        # For autograd: handles both 1D and 2D internally via _loss_fn
+        net_returns_input = net_returns
+        if not self.use_autograd and self.measure != PerfMeasure.LOG_WEALTH:
+            net_returns_input = self._ensure_2d(net_returns)
+
+        return self._grad_fn(weights, net_returns_input, **kwargs)
 
 
 @dataclass

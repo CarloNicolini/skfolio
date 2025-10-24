@@ -84,44 +84,26 @@ class OnlineMixin:
 
 class OnlineParameterConstraintsMixin:
     _parameter_constraints: ClassVar[dict] = {
-        "learning_rate": [
-            Interval(Real, 0, None, closed="neither"),
-            callable,
-            StrOptions({"auto"}),
-        ],
-        "warm_start": ["boolean"],
+        "warm_start": [Interval(Integral, left=0, right=1, closed="both")],
         "initial_weights": ["array-like", None],
-        "initial_wealth": [Interval(Real, 0, None, closed="neither"), None],
+        # initial_wealth accepts: scalar float > 0, array of floats summing > 0, or None
+        "initial_wealth": [Interval(Real, left=0, closed="neither"), "array-like", None],
         "previous_weights": ["array-like", None],
-        "transaction_costs": [
-            Interval(Real, 0, None, closed="left"),
-            "array-like",
-            dict,
-            None,
-        ],
-        "management_fees": [
-            Interval(Real, 0, None, closed="left"),
-            "array-like",
-            dict,
-            None,
-        ],
-        "min_weights": [Interval(Real, 0, 1, closed="both"), "array-like", None],
-        "max_weights": [Interval(Real, 0, 1, closed="both"), "array-like", None],
-        "budget": [Interval(Real, 0, 1.0, closed="right"), None],
-        "max_turnover": [Interval(Real, 0, None, closed="left"), None],
-        "groups": ["array-like", dict, None],
+        "transaction_costs": [Interval(Real, left=0, closed="left"), dict, "array-like"],
+        "management_fees": [Interval(Real, left=0, closed="left"), dict, "array-like"],
+        "groups": [dict, "array-like", None],
         "linear_constraints": [list, None],
         "left_inequality": ["array-like", None],
         "right_inequality": ["array-like", None],
+        "max_turnover": [Interval(Real, left=0, closed="left"), None],
+        # Allow negative for shorting, > 1 for leverage
+        "min_weights": [Interval(Real, left=-np.inf, closed="neither"), dict, "array-like", None],
+        "max_weights": [Interval(Real, left=-np.inf, closed="neither"), dict, "array-like", None],
+        # Allow any real budget (None means no budget constraint)
+        "budget": [Interval(Real, left=-np.inf, closed="neither"), None],
         "X_tracking": ["array-like", None],
         "tracking_error_benchmark": ["array-like", None],
-        "max_tracking_error": [Interval(Real, 0, None, closed="neither"), None],
+        "max_tracking_error": [Interval(Real, left=0, closed="neither"), None],
         "covariance": ["array-like", None],
-        "variance_bound": [Interval(Real, 0, None, closed="neither"), None],
-        "portfolio_params": [dict, None],
-        "smooth_epsilon": [Interval(Real, 0, None, closed="neither")],
-        "adagrad_D": [Interval(Real, 0, None, closed="neither"), "array-like", None],
-        "adagrad_eps": [Interval(Real, 1e-12, 1e-3, closed="both"), None],
-        "eg_tilde": ["boolean"],
-        "eg_tilde_alpha": [Interval(Real, 0, 1, closed="both"), callable, None],
+        "variance_bound": [Interval(Real, left=0, closed="neither"), None],
     }

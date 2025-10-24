@@ -34,7 +34,7 @@ def log_wealth(
     value : float
         The log-wealth.
     """
-    return float(np.sum(np.log1p(returns)))
+    return np.sum(np.log1p(returns))
 
 
 def mean(

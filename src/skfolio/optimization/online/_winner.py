@@ -400,7 +400,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
 
         # Initialize objective function
         if not hasattr(self, "_objective_fn"):
-            self._objective_fn = create_objective(self.objective)
+            self._objective_fn = create_objective(self.objective, use_autograd=False)
 
         if self._ftrl_engine is None:
             mirror_map: BaseMirrorMap | None = None
