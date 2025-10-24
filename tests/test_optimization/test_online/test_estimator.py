@@ -60,7 +60,7 @@ def test_smooth_prediction(X_small):
     # Test that smooth prediction runs and produces different weights from vanilla
     est_vanilla = FollowTheWinner(strategy=FTWStrategy.EG, learning_rate=0.1)
     est_smooth = FollowTheWinner(
-        strategy=FTWStrategy.EG, learning_rate=0.1, grad_predictor=True
+        strategy=FTWStrategy.EG, learning_rate=0.1, grad_predictor="smooth"
     )
 
     est_vanilla.fit(X_small)
@@ -315,14 +315,14 @@ def test_smooth_prediction_accelerates_initial_adaptation():
         strategy=FTWStrategy.EG,
         update_mode="omd",
         learning_rate=0.3,
-        grad_predictor=False,
+        grad_predictor="last",
         warm_start=False,
     )
     opti = FollowTheWinner(
         strategy=FTWStrategy.EG,
         update_mode="omd",
         learning_rate=0.3,
-        grad_predictor=True,
+        grad_predictor="smooth",
         warm_start=False,
     )
 

@@ -28,6 +28,7 @@ from skfolio.optimization.online._mirror_maps import (
 from skfolio.optimization.online._mixins import (
     FTLStrategy,
     OLMARPredictor,
+    OnlineParameterConstraintsMixin,
     PAMRVariant,
     UpdateMode,
 )
@@ -266,6 +267,7 @@ class FollowTheLoser(OnlinePortfolioSelection):
     """
 
     _parameter_constraints: ClassVar[dict] = {
+        **OnlineParameterConstraintsMixin._parameter_constraints,
         # Strategy to replicate mean reversion algorithm
         "strategy": [
             StrOptions({m.value.lower() for m in FTLStrategy}),
@@ -293,7 +295,13 @@ class FollowTheLoser(OnlinePortfolioSelection):
         "epsilon": [Interval(Real, 0.0, None, closed="left")],
         "objective": [StrOptions({"hinge", "squared_hinge", "softplus"})],
         "beta": [Interval(Real, 0, None, closed="neither")],
+        "learning_rate": [
+            Interval(Real, 0, None, closed="neither"),
+            callable,
+            StrOptions({"auto"}),
+        ],
         "update_mode": [StrOptions({m.value.lower() for m in UpdateMode})],
+        "apply_fees_to_phi": ["boolean"],
         "mirror": [StrOptions({"euclidean", "entropy"})],
     }
 
@@ -436,25 +444,6 @@ class FollowTheLoser(OnlinePortfolioSelection):
         # Initialize strategy implementation
         if self._strategy_impl is None:
             self._strategy_impl = self._create_strategy(d)
-
-    def _compute_effective_relatives(self, gross_relatives: np.ndarray) -> np.ndarray:
-        """Apply management fees to gross relatives.
-
-        Parameters
-        ----------
-        gross_relatives : np.ndarray
-            Gross price relatives for one period.
-
-        Returns
-        -------
-        np.ndarray
-            Effective relatives after applying management fees multiplicatively.
-        """
-        effective_relatives = np.maximum(
-            gross_relatives * (1.0 - self._management_fees_arr),
-            CLIP_EPSILON,
-        )
-        return effective_relatives
 
     def _init_olmar_components(self, d: int) -> None:
         """Initialize OLMAR-specific components: predictor, objective, and engine.

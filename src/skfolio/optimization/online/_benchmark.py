@@ -19,7 +19,7 @@ import numpy as np
 import numpy.typing as npt
 
 import skfolio.typing as skt
-from skfolio.measures import RiskMeasure
+from skfolio.measures import PerfMeasure, RiskMeasure
 from skfolio.optimization._base import BaseOptimization
 from skfolio.optimization.convex._base import ObjectiveFunction
 from skfolio.optimization.convex._mean_risk import MeanRisk
@@ -75,10 +75,12 @@ class CRP(BaseOptimization, _OnceFittable):
         if self.weights is None:
             n = X.shape[1]
             self.weights_ = np.ones(n) / n
-            self.portfolio_params["name"] = "UCRP"
+            if self.portfolio_params is not None:
+                self.portfolio_params["name"] = "UCRP"
         else:
             self.weights_ = self.weights
-            self.portfolio_params["name"] = "CRP"
+            if self.portfolio_params is not None:
+                self.portfolio_params["name"] = "CRP"
         return self
 
     def fit(self, X: npt.ArrayLike, y: npt.ArrayLike | None = None):  # type: ignore[override]
@@ -108,28 +110,156 @@ class BestStock(BaseOptimization, _OnceFittable):
 class BCRP(MeanRisk, OnlineMixin):
     """Best Constant Rebalanced Portfolio (BCRP) in hindsight.
 
-    Maximizes cumulative log-wealth on the sample:
+    Optimizes portfolio weights on historical data using any convex objective:
+    - Risk minimization (variance, CVaR, CDaR, etc.)
+    - Log-wealth maximization (Kelly criterion)
+    - Mean-risk utility maximization
 
-        maximize    sum_t log((1 + r_t)^T w)
-        subject to  w in feasible set (simplex/bounds/budget/linear/etc.)
+    Parameters
+    ----------
+    objective_measure : RiskMeasure | PerfMeasure, default=PerfMeasure.LOG_WEALTH
+        The measure to optimize:
+
+        - If ``PerfMeasure.LOG_WEALTH``: maximizes cumulative log-wealth
+          ``sum_t log((1 + r_t)^T w)``
+        - If ``RiskMeasure``: uses specified ``objective_function``
+          (minimize risk, maximize utility, etc.)
+
+    objective_function : ObjectiveFunction, default=ObjectiveFunction.MAXIMIZE_RETURN
+        Objective function when using a RiskMeasure:
+
+        - ``MINIMIZE_RISK``: minimize the risk measure
+        - ``MAXIMIZE_UTILITY``: maximize mean - risk_aversion * risk
+        - ``MAXIMIZE_RATIO``: maximize Sharpe-like ratio
+
+        Ignored when ``objective_measure`` is ``LOG_WEALTH``.
+
+    risk_aversion : float, default=1.0
+        Risk aversion parameter for ``MAXIMIZE_UTILITY`` objective.
+        Higher values lead to more conservative portfolios.
+
+    l2_coef : float, default=0.0
+        L2 regularization coefficient for weight smoothness.
+
+    transaction_costs : float | dict | array-like, default=0.0
+        Transaction costs per asset (proportional).
+
+    management_fees : float | dict | array-like, default=0.0
+        Management fees per asset (per-period).
+
+    previous_weights : float | dict | array-like | None, default=None
+        Previous weights for computing transaction costs and turnover.
+
+    groups : dict | array-like | None, default=None
+        Asset groups for linear constraints.
+
+    linear_constraints : list[str] | None, default=None
+        Linear constraints on weights (e.g., ``"Equity >= 0.5"``).
+
+    left_inequality : array-like | None, default=None
+        Left-hand side matrix A for inequality Aw <= b.
+
+    right_inequality : array-like | None, default=None
+        Right-hand side vector b for inequality Aw <= b.
+
+    max_turnover : float | None, default=None
+        Maximum allowed turnover per period (L1 norm of weight changes).
+
+    min_weights : float | dict | array-like | None, default=0.0
+        Minimum weight per asset (lower bound).
+
+    max_weights : float | dict | array-like | None, default=1.0
+        Maximum weight per asset (upper bound).
+
+    budget : float | None, default=1.0
+        Investment budget (sum of weights). If None, no budget constraint.
+
+    solver : str, default="CLARABEL"
+        CVXPY solver to use.
+
+    solver_params : dict | None, default=None
+        Additional parameters passed to the solver.
+
+    scale_objective : float | None, default=None
+        Scale factor for the objective function.
+
+    scale_constraints : float | None, default=None
+        Scale factor for constraints.
+
+    save_problem : bool, default=False
+        If True, save the CVXPY problem in ``problem_`` attribute.
+
+    raise_on_failure : bool, default=True
+        If True, raise an error when optimization fails.
+
+    add_objective : callable | None, default=None
+        Custom objective term to add to the optimization.
+
+    add_constraints : callable | None, default=None
+        Custom constraints to add to the optimization.
+
+    portfolio_params : dict | None, default=None
+        Additional portfolio parameters.
+
+    Attributes
+    ----------
+    weights_ : ndarray of shape (n_assets,)
+        Optimized portfolio weights.
+
+    all_weights_ : ndarray of shape (T, n_assets)
+        Weights from ``fit_dynamic`` method (dynamic regret).
+
+    Examples
+    --------
+    >>> from skfolio.optimization.online import BCRP
+    >>> from skfolio.measures import RiskMeasure, PerfMeasure
+    >>> from skfolio.optimization.convex._base import ObjectiveFunction
+    >>> import numpy as np
+    >>>
+    >>> # Log-wealth maximization (default)
+    >>> bcrp_log = BCRP()
+    >>>
+    >>> # Variance minimization
+    >>> bcrp_var = BCRP(
+    ...     objective_measure=RiskMeasure.VARIANCE,
+    ...     objective_function=ObjectiveFunction.MINIMIZE_RISK
+    ... )
+    >>>
+    >>> # CVaR minimization
+    >>> bcrp_cvar = BCRP(
+    ...     objective_measure=RiskMeasure.CVAR,
+    ...     objective_function=ObjectiveFunction.MINIMIZE_RISK,
+    ...     cvar_beta=0.95
+    ... )
+    >>>
+    >>> # Mean-variance utility
+    >>> bcrp_utility = BCRP(
+    ...     objective_measure=RiskMeasure.VARIANCE,
+    ...     objective_function=ObjectiveFunction.MAXIMIZE_UTILITY,
+    ...     risk_aversion=2.0
+    ... )
+
+    References
+    ----------
+    .. [1] Li, B., & Hoi, S. C. H. (2013). Online Portfolio Selection: A Survey.
+           arXiv:1212.2129.
     """
 
     name: str = "BCRP"
     n_features_in_: int
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
     @staticmethod
-    def _log_wealth_expr(w: cp.Variable, estimator: BCRP) -> cp.Expression:
-        # Use returns estimated by the prior to build price relatives
+    def _log_wealth_expr(w: cp.Variable, estimator) -> cp.Expression:
+        """Log-wealth objective: sum_t log(r_t^T w)."""
         rd = estimator.prior_estimator_.return_distribution_
-        relatives = 1.0 + rd.returns  # TODO use the _to_relatives method here
-        # Portfolio gross relatives per period, then sum of logs
+        relatives = 1.0 + rd.returns
         return cp.sum(cp.log(relatives @ w))
 
     def __init__(
         self,
+        objective_measure: RiskMeasure | PerfMeasure = PerfMeasure.LOG_WEALTH,
+        objective_function: ObjectiveFunction = ObjectiveFunction.MAXIMIZE_RETURN,
+        risk_aversion: float = 1.0,
         l2_coef: float = 0.0,
         transaction_costs: skt.MultiInput = 0.0,
         management_fees: skt.MultiInput = 0.0,
@@ -151,10 +281,35 @@ class BCRP(MeanRisk, OnlineMixin):
         add_objective: skt.ExpressionFunction | None = None,
         add_constraints: skt.ExpressionFunction | None = None,
         portfolio_params: dict | None = None,
+        # Additional MeanRisk parameters for risk measures
+        cvar_beta: float = 0.95,
+        evar_beta: float = 0.95,
+        cdar_beta: float = 0.95,
+        edar_beta: float = 0.95,
+        min_acceptable_return: skt.Target | None = None,
+        risk_free_rate: float = 0.0,
     ):
+        # Determine configuration based on objective_measure
+        if objective_measure == PerfMeasure.LOG_WEALTH:
+            # Log-wealth maximization: override expected return with log-sum
+            risk_measure = RiskMeasure.VARIANCE  # Placeholder, not used
+            obj_func = ObjectiveFunction.MAXIMIZE_RETURN
+            overwrite_expected_return = BCRP._log_wealth_expr
+        else:
+            # Standard risk measure optimization
+            if not isinstance(objective_measure, RiskMeasure):
+                raise ValueError(
+                    f"objective_measure must be RiskMeasure or PerfMeasure.LOG_WEALTH, "
+                    f"got {type(objective_measure).__name__}"
+                )
+            risk_measure = objective_measure
+            obj_func = objective_function
+            overwrite_expected_return = None
+
         super().__init__(
-            objective_function=ObjectiveFunction.MAXIMIZE_RETURN,
-            risk_measure=RiskMeasure.VARIANCE,  # placeholder; not used in objective
+            objective_function=obj_func,
+            risk_measure=risk_measure,
+            risk_aversion=risk_aversion,
             min_weights=min_weights,
             max_weights=max_weights,
             budget=budget,
@@ -170,14 +325,21 @@ class BCRP(MeanRisk, OnlineMixin):
             solver_params=solver_params,
             scale_objective=scale_objective,
             scale_constraints=scale_constraints,
-            save_problem=True,
+            save_problem=save_problem,
             raise_on_failure=raise_on_failure,
             add_objective=add_objective,
             add_constraints=add_constraints,
-            overwrite_expected_return=BCRP._log_wealth_expr,
+            overwrite_expected_return=overwrite_expected_return,
             portfolio_params=portfolio_params,
+            cvar_beta=cvar_beta,
+            evar_beta=evar_beta,
+            cdar_beta=cdar_beta,
+            edar_beta=edar_beta,
+            min_acceptable_return=min_acceptable_return,
+            risk_free_rate=risk_free_rate,
         )
         self.max_turnover = max_turnover
+        self.objective_measure = objective_measure
 
     def partial_fit(self, X: npt.ArrayLike, y: npt.ArrayLike | None = None):
         return self.fit(X, y)

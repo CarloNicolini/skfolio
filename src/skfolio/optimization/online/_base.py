@@ -208,6 +208,39 @@ class OnlinePortfolioSelection(
         # Update wealth: W_{t+1} = W_t * net_return
         self.wealth_ *= max(net_return, 1e-16)  # Prevent negative/zero wealth
 
+    def _compute_effective_relatives(self, gross_relatives: np.ndarray) -> np.ndarray:
+        """Apply management fees to gross relatives.
+
+        Parameters
+        ----------
+        gross_relatives : np.ndarray
+            Gross price relatives for one period (shape: (n_assets,)).
+
+        Returns
+        -------
+        np.ndarray
+            Effective relatives after applying management fees multiplicatively.
+            If no fees configured, returns gross_relatives unchanged.
+
+        Notes
+        -----
+        Management fees are applied as multiplicative discount:
+        effective_relative_i = gross_relative_i * (1 - fee_i)
+        """
+        if not hasattr(self, "_management_fees_arr"):
+            return gross_relatives
+
+        # If fees are scalar zero, no adjustment needed
+        if np.isscalar(self._management_fees_arr):
+            if self._management_fees_arr <= 0:
+                return gross_relatives
+            return gross_relatives * (1.0 - self._management_fees_arr)
+
+        # Array of fees: element-wise multiplication
+        return gross_relatives * (
+            1.0 - np.asarray(self._management_fees_arr, dtype=float)
+        )
+
     def _validate_and_preprocess_partial_fit_input(
         self,
         X: npt.ArrayLike,

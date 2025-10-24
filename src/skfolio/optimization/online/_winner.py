@@ -1,9 +1,10 @@
 from collections.abc import Callable
+from numbers import Real
 from typing import Any, ClassVar, Literal
 
 import numpy as np
 import numpy.typing as npt
-from sklearn.utils._param_validation import StrOptions
+from sklearn.utils._param_validation import Interval, StrOptions
 
 import skfolio.typing as skt
 from skfolio.measures._enums import ExtraRiskMeasure, PerfMeasure, RiskMeasure
@@ -25,7 +26,10 @@ from skfolio.optimization.online._mirror_maps import (
     EuclideanMirrorMap,
     make_ada_barrons_mirror_map,
 )
-from skfolio.optimization.online._mixins import FTWStrategy
+from skfolio.optimization.online._mixins import (
+    FTWStrategy,
+    OnlineParameterConstraintsMixin,
+)
 from skfolio.optimization.online._prediction import LastGradPredictor, SmoothPredictor
 from skfolio.optimization.online._projection import IdentityProjector
 from skfolio.optimization.online._utils import CLIP_EPSILON
@@ -69,7 +73,13 @@ class FollowTheWinner(OnlinePortfolioSelection):
     cumulative_loss_: float
 
     _parameter_constraints: ClassVar[dict] = {
+        **OnlineParameterConstraintsMixin._parameter_constraints,
         "strategy": [StrOptions({m.value.lower() for m in FTWStrategy})],
+        "learning_rate": [
+            Interval(Real, 0, None, closed="neither"),
+            callable,
+            StrOptions({"auto"}),
+        ],
         "learning_rate_scale": [StrOptions({"theory", "moderate", "empirical"})],
         "objective": [
             StrOptions({m.value.lower() for m in RiskMeasure}),
@@ -78,6 +88,15 @@ class FollowTheWinner(OnlinePortfolioSelection):
         ],
         "update_mode": [StrOptions({"omd", "ftrl"})],
         "grad_predictor": [StrOptions({"last", "smooth"}), None],
+        "smooth_epsilon": [Interval(Real, 0, None, closed="neither")],
+        "adagrad_D": [Interval(Real, 0, None, closed="neither"), "array-like", None],
+        "adagrad_eps": [Interval(Real, 1e-12, 1e-3, closed="both"), None],
+        "eg_tilde": ["boolean"],
+        "eg_tilde_alpha": [Interval(Real, 0, 1, closed="both"), callable, None],
+        "adabarrons_barrier_coef": [Interval(Real, 0, None, closed="neither")],
+        "adabarrons_alpha": [Interval(Real, 0, None, closed="neither")],
+        "adabarrons_euclidean_coef": [Interval(Real, 0, None, closed="neither")],
+        "adabarrons_beta": [Interval(Real, 0, None, closed="neither")],
     }
 
     def __init__(
@@ -136,7 +155,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
             - 'prod': Soft-Bayes Product algorithm (Burg entropy)
             - 'adagrad': Adaptive Gradient with diagonal preconditioning
             - 'adabarrons': Ada-BARRONS with adaptive barrier and second-order updates
-            - 'sword', 'sword_var': SWORD-Var (variation-adaptive)
+            - 'sword_var': SWORD-Var (variation-adaptive)
             - 'sword_small': SWORD-Small (AdaGrad geometry with optimistic gradients)
             - 'sword_best': SWORD-Best (meta-aggregation of Var + Small)
             - 'sword_pp': SWORD++ (meta-aggregation of Var + Small + EG)
@@ -155,12 +174,12 @@ class FollowTheWinner(OnlinePortfolioSelection):
                 Only convex objectives guarantee convergence to global optimum.
                 Non-convex measures may converge to local optima.
 
-        learning_rate : float | Callable[[int], float] | "auto", default=0.05
+        learning_rate : float | Callable[[int], float] | "auto", default="auto"
             Learning rate :math:`\eta_t` for the optimization step.
 
             - float: Constant :math:`\eta`
             - Callable: Time-varying :math:`\eta(t)`
-            - **"auto"**: Empirically-validated rate per strategy (default: "empirical" scale)
+            - **"auto"** (default): Empirically-validated rate per strategy (scale set by learning_rate_scale)
 
             For EG, the learning rate acts as an inverse temperature parameter.
             As :math:`\eta \to 0`, converges to uniform weights; as :math:`\eta \to \infty`,
@@ -524,25 +543,6 @@ class FollowTheWinner(OnlinePortfolioSelection):
 
         # Mark overall init complete
         self._is_initialized = True
-
-    def _compute_effective_relatives(self, gross_relatives: np.ndarray) -> np.ndarray:
-        """Apply management fees to gross relatives.
-
-        Parameters
-        ----------
-        gross_relatives : np.ndarray
-            Gross price relatives for one period.
-
-        Returns
-        -------
-        np.ndarray
-            Effective relatives after applying management fees.
-        """
-        # Apply management fees multiplicatively to gross relatives for Kelly-like gradients
-        effective_relatives = np.maximum(
-            gross_relatives * (1 - self._management_fees_arr), CLIP_EPSILON
-        )
-        return effective_relatives
 
     def _compute_portfolio_gradient(
         self, effective_relatives: np.ndarray
