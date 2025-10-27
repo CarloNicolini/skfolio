@@ -38,6 +38,7 @@ while reducing the risk of data leakage and overfitting.
 
     Install <install>
     Optimization <optimization>
+    Online <online>
     Portfolio <portfolio>
     Population <population>
     Prior <prior>

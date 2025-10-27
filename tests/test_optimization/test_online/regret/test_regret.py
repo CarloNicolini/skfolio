@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 
 from skfolio.optimization.online import BCRP, FTWStrategy, FollowTheWinner
+from skfolio.optimization.online._base import BaseOptimization
 from skfolio.optimization.online._mixins import RegretType
 from skfolio.optimization.online._regret import _running_regret, regret
 
@@ -13,7 +14,9 @@ from skfolio.optimization.online._regret import _running_regret, regret
 )
 @pytest.mark.parametrize("regret_type", [RegretType.STATIC, RegretType.DYNAMIC])
 def test_shapes_and_finiteness(X_small, avg_flag, regret_type):
-    est = FollowTheWinner(strategy=FTWStrategy.EG, eta=0.05, warm_start=False)
+    est = FollowTheWinner(
+        strategy=FTWStrategy.EG, learning_rate="auto", warm_start=False
+    )
     r = regret(
         estimator=est,
         X=X_small,
@@ -28,7 +31,9 @@ def test_shapes_and_finiteness(X_small, avg_flag, regret_type):
 
 
 def test_running_vs_final_average_agreement_at_T(X_small):
-    est = FollowTheWinner(strategy=FTWStrategy.EG, eta=0.05, warm_start=False)
+    est = FollowTheWinner(
+        strategy=FTWStrategy.EG, learning_rate="auto", warm_start=False
+    )
     # cumulative
     r_cum = regret(est, X_small, comparator=BCRP(), average=False)
     # running average (R_t / t)
@@ -42,7 +47,9 @@ def test_running_vs_final_average_agreement_at_T(X_small):
 
 
 def test_windowed_running_and_final_average(X_small):
-    est = FollowTheWinner(strategy=FTWStrategy.EG, eta=0.05, warm_start=False)
+    est = FollowTheWinner(
+        strategy=FTWStrategy.EG, learning_rate="auto", warm_start=False
+    )
     w = 10
     r_win = regret(est, X_small, comparator=BCRP(), average=False, window=w)
     r_win_run = regret(est, X_small, comparator=BCRP(), average="running", window=w)
@@ -58,7 +65,9 @@ def test_windowed_running_and_final_average(X_small):
 
 
 def test_comparator_instance_required(X_small):
-    est = FollowTheWinner(strategy=FTWStrategy.EG, eta=0.05, warm_start=False)
+    est = FollowTheWinner(
+        strategy=FTWStrategy.EG, learning_rate="auto", warm_start=False
+    )
     # Should accept instance or None (defaults to BCRP())
     r1 = regret(est, X_small, comparator=BCRP())
     r2 = regret(est, X_small, comparator=None)
@@ -66,7 +75,9 @@ def test_comparator_instance_required(X_small):
 
 
 def test_invalid_window_raises(X_small):
-    est = FollowTheWinner(strategy=FTWStrategy.EG, eta=0.05, warm_start=False)
+    est = FollowTheWinner(
+        strategy=FTWStrategy.EG, learning_rate="auto", warm_start=False
+    )
     with pytest.raises(ValueError):
         regret(est, X_small, comparator=BCRP(), window=0)
     with pytest.raises(ValueError):
@@ -79,12 +90,11 @@ def test_dynamic_without_fit_dynamic_raises(X_small):
 
     # Build a simple dummy instance with no fit_dynamic attribute
     comp = object()
-    est = FollowTheWinner(strategy=FTWStrategy.EG, eta=0.05, warm_start=False)
+    est = FollowTheWinner(
+        strategy=FTWStrategy.EG, learning_rate="auto", warm_start=False
+    )
     with pytest.raises(ValueError):
         regret(est, X_small, comparator=comp, regret_type=RegretType.DYNAMIC)
-
-
-from skfolio.optimization.online._base import BaseOptimization
 
 
 class DummyEstimator(BaseOptimization):
