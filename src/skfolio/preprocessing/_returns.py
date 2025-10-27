@@ -1,6 +1,6 @@
 """Preprocessing module to transform X to returns."""
 
-# Copyright (c) 2023
+# Copyright (c) 2023-2025
 # Author: Hugo Delatte <delatte.hugo@gmail.com>
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -98,7 +98,7 @@ def prices_to_returns(
             raise TypeError("`y` must be a DataFrame")
         df = X.join(y, how=join)
 
-    n_observations, n_assets = X.shape
+    _, n_assets = X.shape
 
     # Remove observations with missing X above threshold
     if nan_threshold is not None:

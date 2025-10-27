@@ -1,6 +1,6 @@
 """Empirical Uncertainty Set estimators."""
 
-# Copyright (c) 2023
+# Copyright (c) 2023-2025
 # Author: Hugo Delatte <delatte.hugo@gmail.com>
 # SPDX-License-Identifier: BSD-3-Clause
 # Implementation derived from:
@@ -76,6 +76,9 @@ class EmpiricalMuUncertaintySet(BaseMuUncertaintySet):
     .. [1]  "Robustness properties of mean-variance portfolios",
         Optimization: A Journal of Mathematical Programming and Operations Research,
         Schöttle & Werner (2009).
+
+    .. [2] "Portfolio Optimization: Theory and Application", Chapter 14,
+        Daniel P. Palomar (2025)
     """
 
     def __init__(
@@ -191,6 +194,9 @@ class EmpiricalCovarianceUncertaintySet(BaseCovarianceUncertaintySet):
     .. [1]  "Robustness properties of mean-variance portfolios",
         Optimization: A Journal of Mathematical Programming and Operations Research,
         Schöttle & Werner (2009).
+
+    .. [2] "Portfolio Optimization: Theory and Application", Chapter 14,
+        Daniel P. Palomar (2025)
     """
 
     def __init__(

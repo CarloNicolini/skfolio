@@ -1,8 +1,10 @@
 """Distributionally Robust CVaR Optimization estimator."""
 
-# Copyright (c) 2023
+# Copyright (c) 2023-2025
 # Author: Hugo Delatte <delatte.hugo@gmail.com>
 # SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
 
 import cvxpy as cp
 import numpy as np
@@ -56,7 +58,7 @@ class DistributionallyRobustCVaR(ConvexOptimization):
         If a float is provided, it is applied to each asset.
         `None` is equivalent to `-np.Inf` (no lower bound).
         If a dictionary is provided, its (key/value) pair must be the
-        (asset name/asset minium weight) and the input `X` of the `fit` method must
+        (asset name/asset minimum weight) and the input `X` of the `fit` method must
         be a DataFrame with the assets names in columns.
         When using a dictionary, assets values that are not provided are assigned
         a minimum weight of `0.0`.
@@ -168,12 +170,12 @@ class DistributionallyRobustCVaR(ConvexOptimization):
     add_constraints : Callable[[cp.Variable], cp.Expression|list[cp.Expression]], optional
         Add a custom constraint or a list of constraints to the existing constraints.
         It is a function that must take as argument the weights `w` and returns a
-        CVPXY expression or a list of CVPXY expressions.
+        CVXPY expression or a list of CVXPY expressions.
 
     overwrite_expected_return : Callable[[cp.Variable], cp.Expression], optional
         Overwrite the expected return :math:`\mu \cdot w` with a custom expression.
         It is a function that must take as argument the weights `w` and returns a
-        CVPXY expression.
+        CVXPY expression.
 
     solver : str, default="CLARABEL"
         The solver to use. The default is "CLARABEL" which is written in Rust and has
@@ -184,7 +186,7 @@ class DistributionallyRobustCVaR(ConvexOptimization):
 
     solver_params : dict, optional
         Solver parameters. For example, `solver_params=dict(verbose=True)`.
-        The default (`None`) is use `{"tol_gap_abs": 1e-9, "tol_gap_rel": 1e-9}`
+        The default (`None`) is to use `{"tol_gap_abs": 1e-9, "tol_gap_rel": 1e-9}`
         for the solver "CLARABEL" and the CVXPY default otherwise.
         For more details about solver arguments, check the CVXPY documentation:
         https://www.cvxpy.org/tutorial/advanced/index.html#setting-solver-options
@@ -203,15 +205,33 @@ class DistributionallyRobustCVaR(ConvexOptimization):
         If this is set to True, the CVXPY Problem is saved in `problem_`.
         The default is `False`.
 
-    raise_on_failure : bool, default=True
-        If this is set to True, an error is raised when the optimization fail otherwise
-        it passes with a warning.
+    portfolio_params : dict, optional
+        Portfolio parameters forwarded to the resulting `Portfolio` in `predict`.
+        If not provided and if available on the estimator, the following
+        attributes are propagated to the portfolio by default: `name`,
+        `transaction_costs`, `management_fees`, `previous_weights` and `risk_free_rate`.
 
-    portfolio_params :  dict, optional
-        Portfolio parameters passed to the portfolio evaluated by the `predict` and
-        `score` methods. If not provided, the `name`, `transaction_costs`,
-        `management_fees`, `previous_weights` and `risk_free_rate` are copied from the
-        optimization model and passed to the portfolio.
+    fallback : BaseOptimization | "previous_weights" | list[BaseOptimization | "previous_weights"], optional
+        Fallback estimator or a list of estimators to try, in order, when the primary
+        optimization raises during `fit`. Alternatively, use `"previous_weights"`
+        (alone or in a list) to fall back to the estimator's `previous_weights`.
+        When a fallback succeeds, its fitted `weights_` are copied back to the primary
+        estimator so that `fit` still returns the original instance. For traceability,
+        `fallback_` stores the successful estimator (or the string `"previous_weights"`)
+         and `fallback_chain_` stores each attempt with the associated outcome.
+
+    previous_weights : float | dict[str, float] | array-like of shape (n_assets,), optional
+        When `fallback="previous_weights"`, failures will fall back to these weights if
+        provided.
+
+    raise_on_failure : bool, default=True
+        Controls error handling when fitting fails.
+        If True, any failure during `fit` is raised immediately, no `weights_` are
+        set and subsequent calls to `predict` will raise a `NotFittedError`.
+        If False, errors are not raised; instead, a warning is emitted, `weights_`
+        is set to `None` and subsequent calls to `predict` will return a
+        `FailedPortfolio`. When fallbacks are specified, this behavior applies only
+        after all fallbacks have been exhausted.
 
     Attributes
     ----------
@@ -234,6 +254,27 @@ class DistributionallyRobustCVaR(ConvexOptimization):
     feature_names_in_ : ndarray of shape (`n_features_in_`,)
         Names of assets seen during `fit`. Defined only when `X`
         has assets names that are all strings.
+
+    fallback_ : BaseOptimization | "previous_weights" | None
+        The fallback estimator instance, or the string `"previous_weights"`, that
+        produced the final result. `None` if no fallback was used.
+
+    fallback_chain_ : list[tuple[str, str]] | None
+        Sequence describing the optimization fallback attempts. Each element is a
+        pair `(estimator_repr, outcome)` where `estimator_repr` is the string
+        representation of the primary estimator or a fallback (e.g. `"EqualWeighted()"`,
+        `"previous_weights"`), and `outcome` is `"success"` if that step produced
+        a valid solution, otherwise the stringified error message. For successful
+        fits without any fallback, this is `None`.
+
+    error_ : str | list[str] | None
+        Captured error message(s) when `fit` fails. For multi-portfolio outputs
+        (`weights_` is 2D), this is a list aligned with portfolios.
+
+    Notes
+    -----
+    All estimators should specify all parameters as explicit keyword arguments in
+    `__init__` (no `*args` or `**kwargs`), following scikit-learn conventions.
 
     References
     ----------
@@ -268,11 +309,13 @@ class DistributionallyRobustCVaR(ConvexOptimization):
         scale_objective: float | None = None,
         scale_constraints: float | None = None,
         save_problem: bool = False,
-        raise_on_failure: bool = True,
         add_objective: skt.ExpressionFunction | None = None,
         add_constraints: skt.ExpressionFunction | None = None,
         overwrite_expected_return: skt.ExpressionFunction | None = None,
         portfolio_params: dict | None = None,
+        fallback: skt.Fallback = None,
+        previous_weights: skt.MultiInput | None = None,
+        raise_on_failure: bool = True,
     ):
         super().__init__(
             risk_measure=RiskMeasure.CVAR,
@@ -295,18 +338,20 @@ class DistributionallyRobustCVaR(ConvexOptimization):
             scale_objective=scale_objective,
             scale_constraints=scale_constraints,
             save_problem=save_problem,
-            raise_on_failure=raise_on_failure,
             add_objective=add_objective,
             add_constraints=add_constraints,
             overwrite_expected_return=overwrite_expected_return,
             portfolio_params=portfolio_params,
+            fallback=fallback,
+            previous_weights=previous_weights,
+            raise_on_failure=raise_on_failure,
         )
         self.risk_aversion = risk_aversion
         self.wasserstein_ball_radius = wasserstein_ball_radius
 
     def fit(
         self, X: npt.ArrayLike, y: npt.ArrayLike | None = None, **fit_params
-    ) -> "DistributionallyRobustCVaR":
+    ) -> DistributionallyRobustCVaR:
         """Fit the Distributionally Robust CVaR Optimization estimator.
 
         Parameters

@@ -22,14 +22,14 @@ jobs:
     concurrency: release
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0  # Enable full git history for sitemap last-updated detection
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.13'
 
       - name: Install the latest version of uv
         uses: astral-sh/setup-uv@v4
@@ -50,7 +50,7 @@ jobs:
         uses: actions/configure-pages@v5
 
       - name: Upload Documentation Site Artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
         with:
           path: docs/_build
 

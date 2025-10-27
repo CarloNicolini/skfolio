@@ -1,9 +1,11 @@
 import datetime as dt
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from skfolio import (
+    FailedPortfolio,
     MultiPeriodPortfolio,
     PerfMeasure,
     Population,
@@ -50,8 +52,10 @@ def small_population(X):
     n_assets = X.shape[1]
     population = Population(
         [
-            Portfolio(X=X, weights=rand_weights(n=n_assets, zeros=n_assets - 10))
-            for _ in range(10)
+            Portfolio(
+                X=X, weights=rand_weights(n=n_assets, zeros=n_assets - 10, seed=i)
+            )
+            for i in range(10)
         ]
     )
     return population
@@ -83,6 +87,12 @@ def multi_period_portfolio(X):
         )
         multi_period_portfolio.append(portfolio)
     return multi_period_portfolio
+
+
+@pytest.fixture(scope="function")
+def failed_portfolio(X):
+    failed_portfolio = FailedPortfolio(X)
+    return failed_portfolio
 
 
 def test_magic_methods(population):
@@ -177,7 +187,11 @@ def test_slicing(population, multi_period_portfolio):
     assert mpp == multi_period_portfolio
 
 
-def test_population_plot_cumulative_returns(population):
+def test_population_cumulative_returns(population):
+    assert isinstance(population.cumulative_returns_df(), pd.DataFrame)
+    assert isinstance(
+        population.cumulative_returns_df(use_tag_in_column_name=False), pd.DataFrame
+    )
     assert population[:2].plot_cumulative_returns()
 
     with pytest.raises(ValueError):
@@ -186,6 +200,16 @@ def test_population_plot_cumulative_returns(population):
     population.set_portfolio_params(compounded=True)
     assert population[:2].plot_cumulative_returns()
     assert population[:2].plot_cumulative_returns(log_scale=True)
+
+
+def test_population_drawdowns(population):
+    assert isinstance(population.drawdowns_df(), pd.DataFrame)
+    assert isinstance(
+        population.drawdowns_df(use_tag_in_column_name=False), pd.DataFrame
+    )
+    assert population[:2].plot_drawdowns()
+    population.set_portfolio_params(compounded=True)
+    assert population[:2].plot_drawdowns()
 
 
 def test_population_rolling_measure(small_population):
@@ -210,3 +234,89 @@ def test_portfolio_contribution(small_population):
     assert contribution.shape[0] <= 20
 
     assert small_population.plot_contribution(measure=RiskMeasure.STANDARD_DEVIATION)
+
+
+def test_plot_distribution(population):
+    assert population.plot_distribution(measure_list=[RiskMeasure.STANDARD_DEVIATION])
+    assert population.plot_distribution(
+        measure_list=[RiskMeasure.STANDARD_DEVIATION, RatioMeasure.SHARPE_RATIO]
+    )
+
+    for i in range(len(population)):
+        population[i].tag = f"Tag_{int(i > len(population) / 2)}"
+
+    assert population.plot_distribution(
+        measure_list=[RiskMeasure.STANDARD_DEVIATION], tag_list=["Tag_0", "Tag_1"]
+    )
+    assert population.plot_distribution(
+        measure_list=[RiskMeasure.STANDARD_DEVIATION, RatioMeasure.SHARPE_RATIO],
+        tag_list=["Tag_0", "Tag_1"],
+    )
+
+
+def test_boxplot(population):
+    assert population.boxplot_measure(measure=RiskMeasure.STANDARD_DEVIATION)
+
+    for i in range(len(population)):
+        population[i].tag = f"Tag_{int(i > len(population) / 2)}"
+
+    assert population.boxplot_measure(
+        measure=RatioMeasure.SHARPE_RATIO, tag_list=["Tag_0", "Tag_1"]
+    )
+
+
+def test_population_failed_portfolio(small_population, failed_portfolio):
+    pop = small_population
+    pop[5] = failed_portfolio
+    assert len(pop) == 10
+
+    assert not np.isnan(pop.cumulative_returns_df()).all().all()
+    assert not np.isnan(pop.drawdowns_df()).all().all()
+    fronts = pop.non_denominated_sort()
+    assert fronts == [[5, 6, 8], [1, 3, 4], [9, 7], [2], [0]]
+    np.testing.assert_almost_equal(
+        pop.measures(measure=RatioMeasure.SHARPE_RATIO),
+        [
+            0.0325762,
+            0.05448077,
+            0.04138013,
+            0.05535799,
+            0.05914441,
+            np.nan,
+            0.05972074,
+            0.05036052,
+            0.06193033,
+            0.04598217,
+        ],
+    )
+    np.testing.assert_almost_equal(
+        pop.measures_mean(measure=RatioMeasure.SHARPE_RATIO), 0.051214808
+    )
+    np.testing.assert_almost_equal(
+        pop.measures_std(measure=RatioMeasure.SHARPE_RATIO), 0.0091293978
+    )
+    assert pop.sort_measure(measure=RatioMeasure.SHARPE_RATIO)
+    assert pop.sort_measure(measure=RatioMeasure.SHARPE_RATIO, reverse=True)
+    assert pop.quantile(measure=RatioMeasure.SHARPE_RATIO, q=0.05)
+    assert pop.min_measure(measure=RatioMeasure.SHARPE_RATIO)
+    assert pop.max_measure(measure=RatioMeasure.SHARPE_RATIO)
+    assert isinstance(pop.summary(), pd.DataFrame)
+    summary = pop.summary(formatted=False)
+    assert not np.isnan(summary.values[:, 6:]).any()
+    assert np.isnan(summary.values[:-1, 5]).all()
+
+    comp = pop.composition()
+    assert not np.isnan(comp.values[:, 6:]).any()
+    assert np.isnan(comp.values[:, 5]).all()
+    contrib = pop.contribution(measure=RatioMeasure.SHARPE_RATIO)
+    assert not np.isnan(contrib.values[:, 6:]).any()
+    assert np.isnan(contrib.values[:, 5]).all()
+    assert pop.plot_distribution(measure_list=[RatioMeasure.SHARPE_RATIO])
+    assert pop.boxplot_measure(measure=RatioMeasure.SHARPE_RATIO)
+    assert pop.plot_cumulative_returns()
+    assert pop.plot_drawdowns()
+    assert pop.plot_composition()
+    assert pop.plot_contribution(measure=RatioMeasure.SHARPE_RATIO)
+    assert pop.plot_measures(x=PerfMeasure.MEAN, y=RiskMeasure.STANDARD_DEVIATION)
+    assert pop.plot_rolling_measure(measure=RatioMeasure.SHARPE_RATIO)
+    assert pop.plot_returns_distribution()

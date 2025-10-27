@@ -1,12 +1,15 @@
 """Mean Risk Optimization estimator."""
 
-import warnings
-
-# Copyright (c) 2023
+# Copyright (c) 2023-2025
 # Author: Hugo Delatte <delatte.hugo@gmail.com>
 # SPDX-License-Identifier: BSD-3-Clause
 # The optimization features are derived
 # from Riskfolio-Lib, Copyright (c) 2020-2023, Dany Cajas, Licensed under BSD 3 clause.
+
+from __future__ import annotations
+
+import warnings
+
 import cvxpy as cp
 import numpy as np
 import numpy.typing as npt
@@ -22,7 +25,6 @@ from skfolio.prior import BasePrior, EmpiricalPrior
 from skfolio.uncertainty_set import BaseCovarianceUncertaintySet, BaseMuUncertaintySet
 from skfolio.utils.tools import args_names, check_estimator
 
-# noinspection PyUnresolvedReferences
 _NON_ANNUALIZED_RISK_MEASURES = [rm for rm in RiskMeasure if not rm.is_annualized]
 
 
@@ -156,7 +158,7 @@ class MeanRisk(ConvexOptimization):
         If a float is provided, it is applied to each asset.
         `None` is equivalent to `-np.Inf` (no lower bound).
         If a dictionary is provided, its (key/value) pair must be the
-        (asset name/asset minium weight) and the input `X` of the `fit` method must
+        (asset name/asset minimum weight) and the input `X` of the `fit` method must
         be a DataFrame with the assets names in columns.
         When using a dictionary, assets values that are not provided are assigned
         a minimum weight of `0.0`.
@@ -262,7 +264,7 @@ class MeanRisk(ConvexOptimization):
 
         .. math:: expected\_return = \mu^{T} \cdot w - total\_cost
 
-        with :math:`\mu` the vector af assets' expected returns and :math:`w` the
+        with :math:`\mu` the vector of assets' expected returns and :math:`w` the
         vector of assets weights.
 
         If a float is provided, it is applied to each asset.
@@ -290,7 +292,7 @@ class MeanRisk(ConvexOptimization):
 
         .. math:: expected\_return = \mu^{T} \cdot w - total\_fee
 
-        with :math:`\mu` the vector af assets expected returns and :math:`w` the vector
+        with :math:`\mu` the vector of assets' expected returns and :math:`w` the vector
         of assets weights.
 
         If a float is provided, it is applied to each asset.
@@ -322,6 +324,8 @@ class MeanRisk(ConvexOptimization):
         (asset name/asset previous weight) and the input `X` of the `fit` method must
         be a DataFrame with the assets names in columns.
         The default (`None`) means no previous weights.
+        Additionally, when `fallback="previous_weights"`, failures will fall back to
+        these weights if provided.
 
     l1_coef : float, default=0.0
         L1 regularization coefficient.
@@ -506,12 +510,12 @@ class MeanRisk(ConvexOptimization):
     add_constraints : Callable[[cp.Variable], cp.Expression|list[cp.Expression]], optional
         Add a custom constraint or a list of constraints to the existing constraints.
         It is a function that must take as argument the weights `w` and returns a
-        CVPXY expression or a list of CVPXY expressions.
+        CVXPY expression or a list of CVXPY expressions.
 
     overwrite_expected_return : Callable[[cp.Variable], cp.Expression], optional
         Overwrite the expected return :math:`\mu \cdot w` with a custom expression.
         It is a function that must take as argument the weights `w` and returns a
-        CVPXY expression.
+        CVXPY expression.
 
     solver : str, default="CLARABEL"
         The solver to use. The default is "CLARABEL" which is written in Rust and has
@@ -542,15 +546,29 @@ class MeanRisk(ConvexOptimization):
         If this is set to True, the CVXPY Problem is saved in `problem_`.
         The default is `False`.
 
-    raise_on_failure : bool, default=True
-        If this is set to True, an error is raised when the optimization fail otherwise
-        it passes with a warning.
+    portfolio_params : dict, optional
+        Portfolio parameters forwarded to the resulting `Portfolio` in `predict`.
+        If not provided and if available on the estimator, the following
+        attributes are propagated to the portfolio by default: `name`,
+        `transaction_costs`, `management_fees`, `previous_weights` and `risk_free_rate`.
 
-    portfolio_params :  dict, optional
-        Portfolio parameters passed to the portfolio evaluated by the `predict` and
-        `score` methods. If not provided, the `name`, `transaction_costs`,
-        `management_fees`, `previous_weights` and `risk_free_rate` are copied from the
-        optimization model and passed to the portfolio.
+    fallback : BaseOptimization | "previous_weights" | list[BaseOptimization | "previous_weights"], optional
+        Fallback estimator or a list of estimators to try, in order, when the primary
+        optimization raises during `fit`. Alternatively, use `"previous_weights"`
+        (alone or in a list) to fall back to the estimator's `previous_weights`.
+        When a fallback succeeds, its fitted `weights_` are copied back to the primary
+        estimator so that `fit` still returns the original instance. For traceability,
+        `fallback_` stores the successful estimator (or the string `"previous_weights"`)
+         and `fallback_chain_` stores each attempt with the associated outcome.
+
+    raise_on_failure : bool, default=True
+        Controls error handling when fitting fails.
+        If True, any failure during `fit` is raised immediately, no `weights_` are
+        set and subsequent calls to `predict` will raise a `NotFittedError`.
+        If False, errors are not raised; instead, a warning is emitted, `weights_`
+        is set to `None` and subsequent calls to `predict` will return a
+        `FailedPortfolio`. When fallbacks are specified, this behavior applies only
+        after all fallbacks have been exhausted.
 
     Attributes
     ----------
@@ -579,6 +597,32 @@ class MeanRisk(ConvexOptimization):
     feature_names_in_ : ndarray of shape (`n_features_in_`,)
         Names of assets seen during `fit`. Defined only when `X`
         has assets names that are all strings.
+
+    fallback_ : BaseOptimization | "previous_weights" | None
+        The fallback estimator instance, or the string `"previous_weights"`, that
+        produced the final result. `None` if no fallback was used.
+
+    fallback_chain_ : list[tuple[str, str]] | None
+        Sequence describing the optimization fallback attempts. Each element is a
+        pair `(estimator_repr, outcome)` where `estimator_repr` is the string
+        representation of the primary estimator or a fallback (e.g. `"EqualWeighted()"`,
+        `"previous_weights"`), and `outcome` is `"success"` if that step produced
+        a valid solution, otherwise the stringified error message. For successful
+        fits without any fallback, this is `None`.
+
+    error_ : str | list[str] | None
+        Captured error message(s) when `fit` fails. For multi-portfolio outputs
+        (`weights_` is 2D), this is a list aligned with portfolios.
+
+    Notes
+    -----
+    All estimators should specify all parameters as explicit keyword arguments in
+    `__init__` (no `*args` or `**kwargs`), following scikit-learn conventions.
+
+    References
+    ----------
+    .. [1] "Portfolio Optimization: Theory and Application", Chapter 7, 10, 13 and 14,
+        Daniel P. Palomar (2025)
     """
 
     def __init__(
@@ -641,11 +685,12 @@ class MeanRisk(ConvexOptimization):
         scale_objective: float | None = None,
         scale_constraints: float | None = None,
         save_problem: bool = False,
-        raise_on_failure: bool = True,
         add_objective: skt.ExpressionFunction | None = None,
         add_constraints: skt.ExpressionFunction | None = None,
         overwrite_expected_return: skt.ExpressionFunction | None = None,
         portfolio_params: dict | None = None,
+        fallback: skt.Fallback = None,
+        raise_on_failure: bool = True,
     ):
         super().__init__(
             risk_measure=risk_measure,
@@ -683,11 +728,12 @@ class MeanRisk(ConvexOptimization):
             scale_objective=scale_objective,
             scale_constraints=scale_constraints,
             save_problem=save_problem,
-            raise_on_failure=raise_on_failure,
             add_objective=add_objective,
             add_constraints=add_constraints,
             overwrite_expected_return=overwrite_expected_return,
             portfolio_params=portfolio_params,
+            fallback=fallback,
+            raise_on_failure=raise_on_failure,
         )
         self.objective_function = objective_function
         self.risk_aversion = risk_aversion
@@ -729,7 +775,6 @@ class MeanRisk(ConvexOptimization):
                 )
 
     def get_metadata_routing(self):
-        # noinspection PyTypeChecker
         router = (
             super()
             .get_metadata_routing()
@@ -746,7 +791,7 @@ class MeanRisk(ConvexOptimization):
 
     def fit(
         self, X: npt.ArrayLike, y: npt.ArrayLike | None = None, **fit_params
-    ) -> "MeanRisk":
+    ) -> MeanRisk:
         """Fit the Mean-Risk Optimization estimator.
 
         Parameters
@@ -779,7 +824,7 @@ class MeanRisk(ConvexOptimization):
         )
         self.prior_estimator_.fit(X, y, **routed_params.prior_estimator.fit)
         return_distribution = self.prior_estimator_.return_distribution_
-        n_observations, n_assets = return_distribution.returns.shape
+        _, n_assets = return_distribution.returns.shape
 
         # set solvers params
         match self.solver:
@@ -860,7 +905,6 @@ class MeanRisk(ConvexOptimization):
         if self.mu_uncertainty_set_estimator is None:
             mu_uncertainty_set = cp.Constant(0)
         else:
-            # noinspection PyTypeChecker
             self.mu_uncertainty_set_estimator_ = sk.clone(
                 self.mu_uncertainty_set_estimator
             )
@@ -925,9 +969,7 @@ class MeanRisk(ConvexOptimization):
         # Efficient frontier
         if self.efficient_frontier_size is not None:
             # We find the lower and upper bounds of the expected returns.
-            # noinspection PyTypeChecker
             model: MeanRisk = sk.clone(self)
-            # noinspection PyTypeChecker
             model.set_params(
                 objective_function=ObjectiveFunction.MINIMIZE_RISK,
                 efficient_frontier_size=None,
@@ -935,7 +977,6 @@ class MeanRisk(ConvexOptimization):
             )
             model.fit(X, y, **fit_params)
             min_return = model.problem_values_["expected_return"]
-            # noinspection PyTypeChecker
             model.set_params(objective_function=ObjectiveFunction.MAXIMIZE_RETURN)
             model.fit(X, y, **fit_params)
             max_return = model.problem_values_["expected_return"]
@@ -986,7 +1027,6 @@ class MeanRisk(ConvexOptimization):
                     elif arg_name == "factor":
                         args[arg_name] = factor
                     elif arg_name == "covariance_uncertainty_set":
-                        # noinspection PyTypeChecker
                         self.covariance_uncertainty_set_estimator_ = sk.clone(
                             self.covariance_uncertainty_set_estimator
                         )

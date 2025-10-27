@@ -1,15 +1,17 @@
 """Tools module."""
 
-import math
-import random
-import warnings
 
-# Copyright (c) 2023
+# Copyright (c) 2023-2025
 # Author: Hugo Delatte <delatte.hugo@gmail.com>
 # SPDX-License-Identifier: BSD-3-Clause
 # Implementation derived from:
+# Precise, Copyright (c) 2021, Peter Cotton.
 # Riskfolio-Lib, Copyright (c) 2020-2023, Dany Cajas, Licensed under BSD 3 clause.
 # Statsmodels, Copyright (C) 2006, Jonathan E. Taylor, Licensed under BSD 3 clause.
+
+import math
+import random
+import warnings
 from enum import auto
 
 import cvxpy as cp
@@ -34,13 +36,16 @@ __all__ = [
     "corr_to_cov",
     "cov_nearest",
     "cov_to_corr",
+    "inverse_multiply",
     "is_cholesky_dec",
     "minimize_relative_weight_deviation",
+    "multiply_by_inverse",
     "n_bins_freedman",
     "n_bins_knuth",
     "rand_weights",
     "rand_weights_dirichlet",
     "sample_unique_subsets",
+    "symmetric_step_up_matrix",
 ]
 
 
@@ -146,8 +151,8 @@ def rand_weights_dirichlet(n: int) -> np.array:
     return np.random.dirichlet(np.ones(n))
 
 
-def rand_weights(n: int, zeros: int = 0) -> np.array:
-    """Produces n random weights that sum to one from an uniform distribution
+def rand_weights(n: int, zeros: int = 0, seed: int | None = None) -> np.ndarray:
+    """Produces n random weights that sum to one from a uniform distribution
     (non-uniform distribution over a simplex).
 
     Parameters
@@ -158,16 +163,21 @@ def rand_weights(n: int, zeros: int = 0) -> np.array:
     zeros : int, default=0
         The number of weights to randomly set to zeros.
 
+    seed : int or None, default=None
+        Seed for reproducibility. If None, use an unseeded generator.
+
     Returns
     -------
     weights : ndarray of shape (n, )
         The vector of weights.
     """
-    k = np.random.rand(n)
+    rng = np.random.default_rng(seed)
+
+    k = rng.random(n)
     if zeros > 0:
-        zeros_idx = np.random.choice(n, zeros, replace=False)
+        zeros_idx = rng.choice(n, zeros, replace=False)
         k[zeros_idx] = 0
-    return k / sum(k)
+    return k / k.sum()
 
 
 def is_cholesky_dec(x: np.ndarray) -> bool:
@@ -327,7 +337,7 @@ def cov_nearest(
     matrix using the initial standard deviation.
 
     Cholesky decomposition can fail for symmetric positive definite (SPD) matrix due
-    to floating point error and inversely, Cholesky decomposition can success for
+    to floating point error and inversely, Cholesky decomposition can succeed for
     non-SPD matrix. Therefore, we need to test for both. We always start by testing
     for Cholesky decomposition which is significantly faster than checking for positive
     eigenvalues.
@@ -338,13 +348,13 @@ def cov_nearest(
         Covariance matrix.
 
     higham : bool, default=False
-        If this is set to True, the Higham & Nick (2002) algorithm [1]_ is used,
+        If this is set to True, the Higham (2002) algorithm [1]_ is used,
         otherwise the eigenvalues are clipped to threshold above zeros (1e-13).
-        The default (`False`) is to use the clipping method as the Higham & Nick
+        The default (`False`) is to use the clipping method as the Higham
         algorithm can be slow for large datasets.
 
     higham_max_iteration : int, default=100
-        Maximum number of iteration of the Higham & Nick (2002) algorithm.
+        Maximum number of iterations of the Higham (2002) algorithm.
         The default value is `100`.
 
     warn : bool, default=False
@@ -360,7 +370,7 @@ def cov_nearest(
     ----------
     .. [1] "Computing the nearest correlation matrix - a problem from finance"
         IMA Journal of Numerical Analysis
-        Higham & Nick (2002)
+        Higham (2002)
     """
     assert_is_square(cov)
     assert_is_symmetric(cov)
@@ -454,7 +464,6 @@ def compute_optimal_n_clusters(distance: np.ndarray, linkage_matrix: np.ndarray)
     .. math:: D_{i} = \sum_{u \in C_{i}} \sum_{v \in C_{i}} d(u,v)
 
     with :math:`d(u,v)` the distance between u and v.
-
 
     Parameters
     ----------
@@ -712,3 +721,82 @@ def sample_unique_subsets(
         subsets[i, :] = combination_by_index(rank, n, k)
 
     return subsets
+
+
+def inverse_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Multiply the inverse of matrix a by matrix b.
+    We use np.linalg.solve as it tends to produce more accurate results than
+    np.linalg.inv.
+
+    Parameters
+    ----------
+    a : ndarray of shape (n, n)
+        Square matrix.
+
+    b : ndarray of shape (n, m)
+        Matrix.
+
+    Returns
+    -------
+    m : ndarray of shape (n, m)
+        The inverse of matrix a multiplied by matrix b.
+    """
+    assert_is_square(a)
+    if a.shape[1] != b.shape[0]:
+        raise ValueError("Wrong dimension")
+    return np.linalg.solve(a, b)
+
+
+def multiply_by_inverse(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Multiply matrix a by the inverse of matrix b.
+    We use np.linalg.solve as it tends to produce more accurate results than
+    np.linalg.inv.
+
+    Parameters
+    ----------
+    a : ndarray of shape (n, m)
+        Matrix.
+
+    b : ndarray of shape (n, n)
+        Square matrix.
+
+    Returns
+    -------
+    m : ndarray of shape (n, m)
+        The matrix a multiplied by the inverse of matrix b.
+    """
+    return inverse_multiply(b.T, a.T).T
+
+
+def symmetric_step_up_matrix(n1: int, n2: int) -> np.ndarray:
+    """Compute the Symmetric step-up matrix M such that `M @ np.ones(n2) = np.ones(n1)`.
+
+    Parameters
+    ----------
+    n1 : int
+        First dimension.
+
+    n2 : int
+        Second dimension.
+
+    Returns
+    -------
+    m : ndarray of shape (n1, n2)
+        The Symmetric step-up matrix.
+    """
+    assert abs(n1 - n2) <= 1
+
+    if n1 == n2:
+        return np.eye(n1)
+
+    if n1 < n2:
+        return symmetric_step_up_matrix(n2, n1).T * n1 / n2
+
+    m = np.zeros((n1, n2))
+    j_row = np.ones((1, n2)) / n2
+    e = np.eye(n2)
+    for j in range(n1):
+        mj = np.concatenate([e[:j], j_row, e[j:]], axis=0)
+        m += mj / n1
+
+    return m

@@ -2,7 +2,7 @@
 A population is a collection of portfolios.
 """
 
-# Copyright (c) 2023
+# failure_proba
 # Author: Hugo Delatte <delatte.hugo@gmail.com>
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -17,7 +17,7 @@ import scipy.interpolate as sci
 
 import skfolio.typing as skt
 from skfolio.measures import RatioMeasure
-from skfolio.portfolio import BasePortfolio, MultiPeriodPortfolio
+from skfolio.portfolio import BasePortfolio, FailedPortfolio, MultiPeriodPortfolio
 from skfolio.utils.figure import kde_trace
 from skfolio.utils.sorting import non_denominated_sort
 from skfolio.utils.tools import deduplicate_names, optimal_rounding_decimals
@@ -122,6 +122,99 @@ class Population(list):
             "Portfolio or MultiPeriodPortfolio"
             f", got {type(item).__name__}"
         )
+
+    def _validate_compounded(self) -> bool:
+        """
+        Determine whether all portfolios in the population use compounded returns.
+
+        Returns
+        -------
+        bool
+            True if all portfolios are compounded, False if all are non-compounded.
+
+        Raises
+        ------
+        ValueError
+            If the population is empty, or if it mixes compounded and non-compounded
+            portfolios.
+        """
+        compounded = [ptf.compounded for ptf in self]
+
+        if not compounded:
+            raise ValueError("Cannot determine compounded status: population is empty.")
+
+        compounded = set(compounded)
+        if len(compounded) > 1:
+            raise ValueError(
+                "Population contains a mix of compounded and non-compounded portfolios."
+                " Ensure consistency, for example with "
+                "`population.set_portfolio_params(compounded=False)`."
+            )
+
+        return compounded.pop()
+
+    def cumulative_returns_df(
+        self, use_tag_in_column_name: bool = True
+    ) -> pd.DataFrame:
+        """DataFrame of cumulative returns for each portfolio in the population.
+        Non-compounded (arithmetic) cumulative returns start at 0.
+        Compounded (geometric) cumulative returns are expressed as a wealth index,
+        starting at 1.0 (i.e., the value of $1 invested).
+
+        Parameters
+        ----------
+        use_tag_in_column_name : bool, default=True
+            Whether to include the portfolio tag in the DataFrame column names.
+            If True, each column name will use the portfolio name followed by its tag;
+            if False, only the portfolio name will be used.
+
+        Returns
+        -------
+        cumulative_returns : DataFrame
+            Cumulative returns DataFrame.
+        """
+        self._validate_compounded()
+        cumulative_returns = []
+        names = []
+        for ptf in self:
+            cumulative_returns.append(ptf.cumulative_returns_df)
+            names.append(
+                _ptf_name_with_tag(ptf) if use_tag_in_column_name else ptf.name
+            )
+        df = pd.concat(cumulative_returns, axis=1)
+        # Sort index because pd.concat unsort NaNs at the end
+        df.sort_index(inplace=True)
+        df.columns = deduplicate_names(names)
+        return df
+
+    def drawdowns_df(self, use_tag_in_column_name: bool = True) -> pd.DataFrame:
+        """DataFrame of drawdowns for each portfolio in the population.
+
+        Parameters
+        ----------
+        use_tag_in_column_name : bool, default=True
+            Whether to include the portfolio tag in the DataFrame column names.
+            If True, each column name will use the portfolio name followed by its tag;
+            if False, only the portfolio name will be used.
+
+        Returns
+        -------
+        drawdowns : DataFrame
+            Drawdowns DataFrame.
+        """
+        self._validate_compounded()
+        drawdowns = []
+        names = []
+        for ptf in self:
+            drawdowns.append(ptf.drawdowns_df)
+            names.append(
+                _ptf_name_with_tag(ptf) if use_tag_in_column_name else ptf.name
+            )
+        df = pd.concat(drawdowns, axis=1)
+        # Sort index because pd.concat unsort NaNs at the end
+        df.sort_index(inplace=True)
+        df.columns = deduplicate_names(names)
+        return df
 
     def non_denominated_sort(self, first_front_only: bool = False) -> list[list[int]]:
         """Fast non-dominated sorting.
@@ -236,7 +329,7 @@ class Population(list):
         value : float
             The mean of portfolios measures.
         """
-        return self.measures(measure=measure).mean()
+        return np.nanmean(self.measures(measure=measure), axis=0)
 
     def measures_std(
         self,
@@ -255,7 +348,7 @@ class Population(list):
         value : float
             The standard-deviation of portfolios measures.
         """
-        return self.measures(measure=measure).std()
+        return np.nanstd(self.measures(measure=measure), axis=0)
 
     def sort_measure(self, measure: skt.Measure, reverse: bool = False) -> "Population":
         """Sort the population by a given portfolio measure.
@@ -275,7 +368,7 @@ class Population(list):
         """
         return self.__class__(
             sorted(
-                self,
+                [x for x in self if not isinstance(x, FailedPortfolio)],
                 key=lambda x: x.__getattribute__(measure.value),
                 reverse=reverse,
             )
@@ -361,6 +454,15 @@ class Population(list):
         -------
         summary : pandas DataFrame
             The population's portfolios summary
+
+        Notes
+        -----
+        This method returns a static pandas DataFrame. For interactive exploration
+        (e.g., sortable/filterable/clickable tables or visual summaries), you may want
+        to use libraries such as `ipydatagrid`, `D-Tale`, or `Lux` in a Jupyter
+        environment, or `dash_table` / `streamlit.dataframe` when building dashboards.
+        For example, you can explore the summary with D-Tale:
+        `dtale.show(population.summary().T)`
         """
         df = pd.concat(
             [p.summary(formatted=formatted) for p in self],
@@ -400,8 +502,10 @@ class Population(list):
             res.append(comp)
 
         df = pd.concat(res, axis=1)
+        # Leave columns of only NaNs untouched
+        mask = ~df.isna().all(axis=0)
+        df.loc[:, mask] = df.loc[:, mask].fillna(0)
         df.columns = deduplicate_names(list(df.columns))
-        df.fillna(0, inplace=True)
         return df
 
     def contribution(
@@ -450,8 +554,10 @@ class Population(list):
             res.append(contribution)
 
         df = pd.concat(res, axis=1)
+        # Leave columns of only NaNs untouched
+        mask = ~df.isna().all(axis=0)
+        df.loc[:, mask] = df.loc[:, mask].fillna(0)
         df.columns = deduplicate_names(list(df.columns))
-        df.fillna(0, inplace=True)
         return df
 
     def rolling_measure(
@@ -513,20 +619,35 @@ class Population(list):
             Returns the plotly Figure object.
         """
         n = len(measure_list)
-        values = []
-        labels = []
-        for measure in measure_list:
-            if tag_list is not None:
-                for tag in tag_list:
-                    values.append(self.filter(tags=tag).measures(measure=measure))
-                    labels.append(tag if n == 1 else f"{measure} - {tag}")
-            else:
-                values.append(self.measures(measure=measure))
-                labels.append(measure.value)
 
-        df = pd.DataFrame(np.array(values).T, columns=labels).melt(
-            var_name="Population"
-        )
+        if tag_list is None:
+            df = pd.concat(
+                [
+                    pd.DataFrame(
+                        {
+                            "Population": measure.value,
+                            "value": self.measures(measure=measure),
+                        }
+                    )
+                    for measure in measure_list
+                ],
+                ignore_index=True,
+            )
+        else:
+            df = pd.concat(
+                [
+                    pd.DataFrame(
+                        {
+                            "Population": tag if n == 1 else f"{measure} - {tag}",
+                            "value": self.filter(tags=tag).measures(measure=measure),
+                        }
+                    )
+                    for measure in measure_list
+                    for tag in tag_list
+                ],
+                ignore_index=True,
+            )
+
         fig = px.histogram(
             df,
             color="Population",
@@ -541,22 +662,83 @@ class Population(list):
         )
         return fig
 
+    def boxplot_measure(
+        self,
+        measure: skt.Measure,
+        tag_list: list[str] | None = None,
+        points: str | bool = "all",
+    ) -> go.Figure:
+        """Plot a box plot of a measure's distribution, optionally split by tags.
+
+        If no tags are provided, the function draws a single box showing the
+        population distribution of `measure`. If `tag_list` is provided, it draws
+        one box per tag using values from the portfolio filtered by each tag.
+
+        Parameters
+        ----------
+        measure : Measure
+            The measure to plot.
+
+        tag_list : list[str], optional
+            For each tag in this list, filter the portfolio by that tag and plot a
+            separate box. If None or empty, plot a single overall distribution.
+
+        points : {'all', 'outliers', 'suspectedoutliers', False}, default 'all'
+            Passed to `plotly.express.box(..., points=...)` to control which points
+            are shown.
+
+        Returns
+        -------
+        go.Figure
+            The Plotly figure.
+
+        Examples
+        --------
+        >>> fig = population.boxplot_measure(measure=RiskMeasure.STANDARD_DEVIATION)
+        >>> fig = population.plot_measure_box(
+        ...     measure=RatioMeasure.SHARPE_RATIO,
+        ...     tag_list=["Benchmark", "Risk Parity Model"]
+        ... )
+        """
+        if tag_list is None:
+            y = None
+            df = pd.DataFrame(self.measures(measure=measure), columns=["value"])
+        else:
+            y = "Population"
+            df = pd.concat(
+                [
+                    pd.DataFrame(
+                        {
+                            y: tag,
+                            "value": self.filter(tags=tag).measures(measure=measure),
+                        }
+                    )
+                    for tag in tag_list
+                ],
+                ignore_index=True,
+            )
+
+        fig = px.box(df, x="value", y=y, color=y, points=points)
+        fig.update_layout(title_text=f"Box plot of {measure}", xaxis_title=str(measure))
+        return fig
+
     def plot_cumulative_returns(
         self,
         log_scale: bool = False,
         idx: slice | np.ndarray | None = None,
         use_tag_in_legend: bool = True,
     ) -> go.Figure:
-        """Plot the population's portfolios cumulative returns.
-        Non-compounded cumulative returns start at 0.
-        Compounded cumulative returns are rescaled to start at 1000.
+        """Plot the cumulative returns of the population's portfolios.
+        Non-compounded (arithmetic) cumulative returns start at 0.
+        Compounded (geometric) cumulative returns are expressed as a wealth index,
+        starting at 1.0 (i.e., the value of $1 invested).
 
         Parameters
         ----------
         log_scale : bool, default=False
             If set to True, the cumulative returns are displayed with a
-            logarithm scale on the y-axis and rebased at 1000. The cumulative returns
-            must be compounded otherwise an exception is raise.
+            logarithm scale on the y-axis. The cumulative returns must be compounded
+            otherwise an exception is raise.
 
         idx : slice | array, optional
             Indexes or slice of the observations to plot.
@@ -575,25 +757,9 @@ class Population(list):
         if idx is None:
             idx = slice(None)
 
-        cumulative_returns = []
-        names = []
-        compounded = []
-        for ptf in self:
-            cumulative_returns.append(ptf.cumulative_returns_df)
-            names.append(_ptf_name_with_tag(ptf) if use_tag_in_legend else ptf.name)
-            compounded.append(ptf.compounded)
-        compounded = set(compounded)
-
-        if len(compounded) == 2:
-            raise ValueError(
-                "Some portfolios cumulative returns are compounded while some "
-                "are non-compounded. You can change the compounded with"
-                "`population.set_portfolio_params(compounded=False)`",
-            )
+        compounded = self._validate_compounded()
         title = "Cumulative Returns"
-        compounded = compounded.pop()
         if compounded:
-            yaxis_title = f"{title} (rebased at 1000)"
             if log_scale:
                 title = f"{title} (compounded & log scaled)"
             else:
@@ -606,27 +772,66 @@ class Population(list):
                     "You can change to compounded with "
                     "`set_portfolio_params(compounded=True)`"
                 )
-            yaxis_title = title
             title = f"{title} (non-compounded)"
 
-        df = pd.concat(cumulative_returns, axis=1).iloc[:, idx]
-        # Sort index because pd.concat unsort NaNs at the end
-        df.sort_index(inplace=True)
-        df.columns = deduplicate_names(names)
-
-        fig = df.plot(backend="plotly")
+        df = self.cumulative_returns_df(use_tag_in_column_name=use_tag_in_legend)
+        fig = df.iloc[idx].plot(backend="plotly")
         fig.update_layout(
             title=title,
             xaxis_title="Observations",
-            yaxis_title=yaxis_title,
+            yaxis_title="Cumulative Returns",
             legend_title_text="Portfolios",
         )
         if compounded:
-            fig.update_yaxes(tickformat=".0f")
+            fig.update_yaxes(tickformat=".2f")
         else:
             fig.update_yaxes(tickformat=".2%")
         if log_scale:
             fig.update_yaxes(type="log")
+        return fig
+
+    def plot_drawdowns(
+        self,
+        idx: slice | np.ndarray | None = None,
+        use_tag_in_legend: bool = True,
+    ) -> go.Figure:
+        """Plot the drawdowns of the population's portfolios.
+
+        Parameters
+        ----------
+        idx : slice | array, optional
+            Indexes or slice of the observations to plot.
+            The default (`None`) is to take all observations.
+
+        use_tag_in_legend : bool, default=True
+            Whether to include the portfolio tag in legend entries.
+            If True, each legend label will show the portfolio name followed by its tag;
+            if False, only the portfolio name will be displayed.
+
+        Returns
+        -------
+        plot : Figure
+            Returns the plot Figure object.
+        """
+        if idx is None:
+            idx = slice(None)
+
+        compounded = self._validate_compounded()
+        title = "Drawdowns"
+        if compounded:
+            title = f"{title} (compounded returns)"
+        else:
+            title = f"{title} (non-compounded returns)"
+
+        df = self.drawdowns_df(use_tag_in_column_name=use_tag_in_legend)
+        fig = df.iloc[idx].plot(backend="plotly")
+        fig.update_layout(
+            title=title,
+            xaxis_title="Observations",
+            yaxis_title="Drawdowns",
+            legend_title_text="Portfolios",
+        )
+        fig.update_yaxes(tickformat=".1%")
         return fig
 
     def plot_composition(self, display_sub_ptf_name: bool = True) -> go.Figure:
@@ -777,7 +982,12 @@ class Population(list):
         hover_data = {str(k): v for k, v in hover_data.items()}
 
         df = pd.DataFrame(res, columns=columns)
-        df["tag"] = df["tag"].astype(str).replace("None", "")
+        if pd.isnull(df["tag"]).all():
+            del hover_data["tag"]
+            tag = None
+        else:
+            tag = "tag"
+            df["tag"] = df["tag"].astype(str).replace("None", "")
 
         if show_fronts:
             fronts = self.non_denominated_sort(first_front_only=False)
@@ -789,7 +999,7 @@ class Population(list):
         elif color_scale is not None:
             color = str(color_scale)
         else:
-            color = "tag"
+            color = tag
 
         if z is not None:
             if to_surface:
@@ -856,7 +1066,7 @@ class Population(list):
                     hover_name="name",
                     hover_data=hover_data,
                     color=color,
-                    symbol="tag",
+                    symbol=tag,
                 )
                 fig.update_traces(marker_size=8)
                 fig.update_layout(
@@ -886,9 +1096,15 @@ class Population(list):
                 hover_name="name",
                 hover_data=hover_data,
                 color=color,
-                symbol="tag",
+                symbol=tag,
             )
             fig.update_traces(marker_size=10)
+
+            if color_scale is None:
+                legend = dict(title=None, yanchor="top", y=0.98, xanchor="left", x=1.02)
+            else:
+                legend = dict(title=None, yanchor="top", y=0.98, xanchor="left", x=0.02)
+
             fig.update_layout(
                 title=title,
                 xaxis={
@@ -899,7 +1115,7 @@ class Population(list):
                     "title": str(y),
                     "tickformat": ",.1%" if not y.is_ratio else None,
                 },
-                legend=dict(yanchor="top", y=0.96, xanchor="left", x=1.25),
+                legend=legend,
             )
         return fig
 
@@ -972,6 +1188,8 @@ class Population(list):
         colors = px.colors.qualitative.Plotly
 
         for i, ptf in enumerate(self):
+            if isinstance(ptf, FailedPortfolio):
+                continue
             color = colors[i % len(colors)]
             returns = ptf.returns
             traces.append(

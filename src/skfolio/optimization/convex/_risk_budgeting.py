@@ -1,10 +1,13 @@
 """Risk Budgeting Optimization estimator."""
 
-# Copyright (c) 2023
+# Copyright (c) 2025
 # Author: Hugo Delatte <delatte.hugo@gmail.com>
 # SPDX-License-Identifier: BSD-3-Clause
-# The optimization features are derived
+# Some optimization features are derived
 # from Riskfolio-Lib, Copyright (c) 2020-2023, Dany Cajas, Licensed under BSD 3 clause.
+# Credits: Daniel P. Palomar (improvements)
+
+from __future__ import annotations
 
 import cvxpy as cp
 import numpy as np
@@ -24,20 +27,21 @@ class RiskBudgeting(ConvexOptimization):
 
     The Risk Budgeting estimator solves the below convex problem:
 
-        .. math::   \begin{cases}
-                    \begin{aligned}
-                    &\min_{w} & & risk_{i}(w) \\
-                    &\text{s.t.} & & b^T \cdot log(w) \ge c \\
-                    & & & w^T \cdot \mu \ge min\_return \\
-                    & & & A \cdot w \ge b \\
-                    & & & w \ge 0
-                    \end{aligned}
-                    \end{cases}
+        .. math::  \begin{cases}
+                   \begin{aligned}
+                   & \min_{w,s} && \mathrm{Risk}(w) \\
+                   & \text{s.t.} && budget^{\top}\log(w) \ge 0 \\
+                   &             && \mathbf{1}^{\top} w = s \\
+                   &             && expected\_return(w) \ge s\, min\_return \\
+                   &             && A w \le s\, b \\
+                   &             && w \ge 0
+                   \end{aligned}
+                   \end{cases}
 
-    with :math:`b` the risk budget vector and :math:`c` an auxiliary variable of
-    the log barrier.
+    with :math:`budget` the risk budget vector and :math:`min\_return` the minimum
+    expected return constraint.
 
-    And :math:`risk_{i}` a risk measure among:
+    And :math:`Risk` a risk measure among:
 
         * Mean Absolute Deviation
         * First Lower Partial Moment
@@ -82,7 +86,7 @@ class RiskBudgeting(ConvexOptimization):
             * AVERAGE_DRAWDOWN
             * EDAR
             * ULCER_INDEX
-            * GINI_MEAN_DIFFERENCE_RATIO
+            * GINI_MEAN_DIFFERENCE
 
         The default is `RiskMeasure.VARIANCE`.
 
@@ -106,7 +110,7 @@ class RiskBudgeting(ConvexOptimization):
         If a float is provided, it is applied to each asset.
         `None` is equivalent to `-np.Inf` (no lower bound).
         If a dictionary is provided, its (key/value) pair must be the
-        (asset name/asset minium weight) and the input `X` of the `fit` method must
+        (asset name/asset minimum weight) and the input `X` of the `fit` method must
         be a DataFrame with the assets names in columns.
         When using a dictionary, assets values that are not provided are assigned
         a minimum weight of `0.0`.
@@ -151,7 +155,7 @@ class RiskBudgeting(ConvexOptimization):
 
         .. math:: expected\_return = \mu^{T} \cdot w - total\_cost
 
-        with :math:`\mu` the vector af assets' expected returns and :math:`w` the
+        with :math:`\mu` the vector of assets' expected returns and :math:`w` the
         vector of assets weights.
 
         If a float is provided, it is applied to each asset.
@@ -179,7 +183,7 @@ class RiskBudgeting(ConvexOptimization):
 
         .. math:: expected\_return = \mu^{T} \cdot w - total\_fee
 
-        with :math:`\mu` the vector af assets expected returns and :math:`w` the vector
+        with :math:`\mu` the vector of assets' expected returns and :math:`w` the vector
         of assets weights.
 
         If a float is provided, it is applied to each asset.
@@ -211,6 +215,8 @@ class RiskBudgeting(ConvexOptimization):
         (asset name/asset previous weight) and the input `X` of the `fit` method must
         be a DataFrame with the assets names in columns.
         The default (`None`) means no previous weights.
+        Additionally, when `fallback="previous_weights"`, failures will fall back to
+        these weights if provided.
 
     linear_constraints : array-like of shape (n_constraints,), optional
         Linear constraints.
@@ -272,15 +278,9 @@ class RiskBudgeting(ConvexOptimization):
 
     cvar_beta : float, default=0.95
         CVaR (Conditional Value at Risk) confidence level.
-
-    evar_beta : float, default=0
-        EVaR (Entropic Value at Risk) confidence level.
-
-    cvar_beta : float, default=0.95
-        CVaR (Conditional Value at Risk) confidence level.
         The default value is `0.95`.
 
-    evar_beta : float, default=0
+    evar_beta : float, default=0.95
         EVaR (Entropic Value at Risk) confidence level.
         The default value is `0.95`.
 
@@ -300,12 +300,12 @@ class RiskBudgeting(ConvexOptimization):
     add_constraints : Callable[[cp.Variable], cp.Expression|list[cp.Expression]], optional
         Add a custom constraint or a list of constraints to the existing constraints.
         It is a function that must take as argument the weights `w` and returns a
-        CVPXY expression or a list of CVPXY expressions.
+        CVXPY expression or a list of CVXPY expressions.
 
     overwrite_expected_return : Callable[[cp.Variable], cp.Expression], optional
         Overwrite the expected return :math:`\mu \cdot w` with a custom expression.
         It is a function that must take as argument the weights `w` and returns a
-        CVPXY expression.
+        CVXPY expression.
 
     solver : str, default="CLARABEL"
         The solver to use. The default is "CLARABEL" which is written in Rust and has
@@ -335,15 +335,29 @@ class RiskBudgeting(ConvexOptimization):
         If this is set to True, the CVXPY Problem is saved in `problem_`.
         The default is `False`.
 
-    raise_on_failure : bool, default=True
-        If this is set to True, an error is raised when the optimization fail otherwise
-        it passes with a warning.
+    portfolio_params : dict, optional
+        Portfolio parameters forwarded to the resulting `Portfolio` in `predict`.
+        If not provided and if available on the estimator, the following
+        attributes are propagated to the portfolio by default: `name`,
+        `transaction_costs`, `management_fees`, `previous_weights` and `risk_free_rate`.
 
-    portfolio_params :  dict, optional
-        Portfolio parameters passed to the portfolio evaluated by the `predict` and
-        `score` methods. If not provided, the `name`, `transaction_costs`,
-        `management_fees`, `previous_weights` and `risk_free_rate` are copied from the 
-        optimization model and passed to the portfolio.
+    fallback : BaseOptimization | "previous_weights" | list[BaseOptimization | "previous_weights"], optional
+        Fallback estimator or a list of estimators to try, in order, when the primary
+        optimization raises during `fit`. Alternatively, use `"previous_weights"` 
+        (alone or in a list) to fall back to the estimator's `previous_weights`.
+        When a fallback succeeds, its fitted `weights_` are copied back to the primary 
+        estimator so that `fit` still returns the original instance. For traceability, 
+        `fallback_` stores the successful estimator (or the string `"previous_weights"`)
+         and `fallback_chain_` stores each attempt with the associated outcome.
+
+    raise_on_failure : bool, default=True
+        Controls error handling when fitting fails.
+        If True, any failure during `fit` is raised immediately, no `weights_` are
+        set and subsequent calls to `predict` will raise a `NotFittedError`.
+        If False, errors are not raised; instead, a warning is emitted, `weights_`
+        is set to `None` and subsequent calls to `predict` will return a
+        `FailedPortfolio`. When fallbacks are specified, this behavior applies only
+        after all fallbacks have been exhausted.
 
     Attributes
     ----------
@@ -366,6 +380,35 @@ class RiskBudgeting(ConvexOptimization):
     feature_names_in_ : ndarray of shape (`n_features_in_`,)
         Names of assets seen during `fit`. Defined only when `X`
         has assets names that are all strings.
+
+    fallback_ : BaseOptimization | "previous_weights" | None
+        The fallback estimator instance, or the string `"previous_weights"`, that
+        produced the final result. `None` if no fallback was used.
+
+    fallback_chain_ : list[tuple[str, str]] | None
+        Sequence describing the optimization fallback attempts. Each element is a
+        pair `(estimator_repr, outcome)` where `estimator_repr` is the string
+        representation of the primary estimator or a fallback (e.g. `"EqualWeighted()"`,
+        `"previous_weights"`), and `outcome` is `"success"` if that step produced
+        a valid solution, otherwise the stringified error message. For successful
+        fits without any fallback, this is `None`.
+
+    error_ : str | list[str] | None
+        Captured error message(s) when `fit` fails. For multi-portfolio outputs
+        (`weights_` is 2D), this is a list aligned with portfolios.
+
+    Notes
+    -----
+    All estimators should specify all parameters as explicit keyword arguments in
+    `__init__` (no `*args` or `**kwargs`), following scikit-learn conventions.
+
+    References
+    ----------
+    .. [1] "Constrained Risk Budgeting Portfolios: Theory, Algorithms, Applications",
+        Journal of Portfolio Management, Richard, J.-C., & Roncalli, T. (2019)
+
+    .. [2] "Portfolio Optimization: Theory and Application", Chapter 11,
+        Daniel P. Palomar (2025)
     """
 
     def __init__(
@@ -399,6 +442,7 @@ class RiskBudgeting(ConvexOptimization):
         add_constraints: skt.ExpressionFunction | None = None,
         overwrite_expected_return: skt.ExpressionFunction | None = None,
         portfolio_params: dict | None = None,
+        fallback: skt.Fallback = None,
     ):
         super().__init__(
             risk_measure=risk_measure,
@@ -424,16 +468,17 @@ class RiskBudgeting(ConvexOptimization):
             scale_objective=scale_objective,
             scale_constraints=scale_constraints,
             save_problem=save_problem,
-            raise_on_failure=raise_on_failure,
             add_objective=add_objective,
             add_constraints=add_constraints,
             overwrite_expected_return=overwrite_expected_return,
             portfolio_params=portfolio_params,
+            fallback=fallback,
+            raise_on_failure=raise_on_failure,
         )
         self.min_return = min_return
         self.risk_budget = risk_budget
 
-    def fit(self, X: npt.ArrayLike, y=None, **fit_params) -> "RiskBudgeting":
+    def fit(self, X: npt.ArrayLike, y=None, **fit_params) -> RiskBudgeting:
         """Fit the Risk Budgeting Optimization estimator.
 
         Parameters
@@ -444,7 +489,6 @@ class RiskBudgeting(ConvexOptimization):
         y : array-like of shape (n_observations, n_factors), optional
             Price returns of factors.
             The default is `None`.
-
 
         Returns
         -------
@@ -468,7 +512,7 @@ class RiskBudgeting(ConvexOptimization):
         )
         self.prior_estimator_.fit(X, y, **routed_params.prior_estimator.fit)
         return_distribution = self.prior_estimator_.return_distribution_
-        n_observations, n_assets = return_distribution.returns.shape
+        _, n_assets = return_distribution.returns.shape
 
         # set solvers params
         if self.solver == "CLARABEL":
@@ -496,7 +540,6 @@ class RiskBudgeting(ConvexOptimization):
         # Variables
         w = cp.Variable(n_assets)
         factor = cp.Variable()
-        c = cp.Variable(nonneg=True)
 
         # Expected returns
         expected_return = (
@@ -508,10 +551,7 @@ class RiskBudgeting(ConvexOptimization):
         )
 
         # risk budgeting constraint
-        constraints = [
-            risk_budget @ cp.log(w) * self._scale_constraints
-            >= c * self._scale_constraints
-        ]
+        constraints = [risk_budget @ cp.log(w) * self._scale_constraints >= 0]
 
         # weight constraints
         constraints += self._get_weight_constraints(
