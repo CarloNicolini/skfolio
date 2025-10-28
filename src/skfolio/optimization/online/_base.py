@@ -171,6 +171,8 @@ class OnlinePortfolioSelection(
         trade_weights: np.ndarray,
         effective_relatives: np.ndarray,
         previous_weights: np.ndarray | None,
+        *,
+        drift_aware: bool = True,
     ) -> None:
         """Update wealth after observing period returns.
 
@@ -195,7 +197,15 @@ class OnlinePortfolioSelection(
         if previous_weights is not None and hasattr(self, "_transaction_costs_arr"):
             prev_arr = np.asarray(previous_weights, dtype=float)
             if prev_arr.shape == trade_weights.shape:
-                turnover = np.abs(trade_weights - prev_arr)
+                # Drift-aware previous holdings: \tilde w_{t-1} = (w_{t-1} ⊙ x_t) / (w_{t-1}^T x_t)
+                if drift_aware:
+                    denom = float(np.dot(prev_arr, effective_relatives))
+                    if denom <= 0:
+                        denom = 1e-16
+                    prev_drifted = (prev_arr * effective_relatives) / denom
+                    turnover = np.abs(trade_weights - prev_drifted)
+                else:
+                    turnover = np.abs(trade_weights - prev_arr)
                 # Total cost as fraction of portfolio
                 if np.isscalar(self._transaction_costs_arr):
                     txn_cost = float(self._transaction_costs_arr * np.sum(turnover))

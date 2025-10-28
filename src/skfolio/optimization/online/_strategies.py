@@ -117,16 +117,24 @@ class PAMRStrategy(BaseStrategy):
         # Actually, let's compute directly for clarity
         c = x_t - np.mean(x_t)
 
-        # Add transaction cost subgradient to direction
-        if self.transaction_costs_arr is not None:
+        # Optional turnover penalty (gated): default off
+        if (
+            getattr(self, "penalize_turnover", False)
+            and self.transaction_costs_arr is not None
+        ):
             prev = projector.config.previous_weights
             if prev is not None:
                 prev_arr = np.asarray(prev, dtype=float)
                 if prev_arr.shape == trade_w.shape:
-                    delta = trade_w - prev_arr
+                    rel = x_t
+                    denom = float(np.dot(prev_arr, rel))
+                    if denom <= 0:
+                        denom = 1e-16
+                    prev_drifted = (prev_arr * rel) / denom
+                    delta = trade_w - prev_drifted
                     tc_grad = self.transaction_costs_arr * np.sign(delta)
                     c = c + tc_grad
-                    c = c - np.mean(c)  # Re-center
+                    c = c - np.mean(c)
 
         c_norm_sq = float(np.dot(c, c))
 
@@ -182,18 +190,24 @@ class PAMRStrategy(BaseStrategy):
                 stacklevel=2,
             )
 
-        # Add transaction cost subgradient
-        if self.transaction_costs_arr is not None:
+        # Optional turnover penalty (gated): default off
+        if (
+            getattr(self, "penalize_turnover", False)
+            and self.transaction_costs_arr is not None
+        ):
             prev = projector.config.previous_weights
             if prev is not None:
                 prev_arr = np.asarray(prev, dtype=float)
                 if prev_arr.shape == trade_w.shape:
-                    delta = trade_w - prev_arr
+                    rel = x_t
+                    denom = float(np.dot(prev_arr, rel))
+                    if denom <= 0:
+                        denom = 1e-16
+                    prev_drifted = (prev_arr * rel) / denom
+                    delta = trade_w - prev_drifted
                     g += self.transaction_costs_arr * np.sign(delta)
 
-        # TODO this assignment is a bit ugly, we should refactor the engine interface?
         projector.config.previous_weights = trade_w
-
         return self.engine.step(g)
 
 
@@ -392,16 +406,24 @@ class OLMARStrategy(BaseStrategy):
         # Center for simplex tangent space
         c = g - np.mean(g)
 
-        # Add transaction cost subgradient to direction
-        if self.transaction_costs_arr is not None:
+        # Optional turnover penalty (gated): default off
+        if (
+            getattr(self, "penalize_turnover", False)
+            and self.transaction_costs_arr is not None
+        ):
             prev = projector.config.previous_weights
             if prev is not None:
                 prev_arr = np.asarray(prev, dtype=float)
                 if prev_arr.shape == trade_w.shape:
-                    delta = trade_w - prev_arr
+                    rel = phi_eff
+                    denom = float(np.dot(prev_arr, rel))
+                    if denom <= 0:
+                        denom = 1e-16
+                    prev_drifted = (prev_arr * rel) / denom
+                    delta = trade_w - prev_drifted
                     tc_grad = self.transaction_costs_arr * np.sign(delta)
                     c = c + tc_grad
-                    c = c - np.mean(c)  # Re-center
+                    c = c - np.mean(c)
 
         c_norm_sq = float(np.dot(c, c))
         if c_norm_sq <= 1e-16:
@@ -427,13 +449,21 @@ class OLMARStrategy(BaseStrategy):
         if isinstance(self.engine.map, EuclideanMirrorMap):
             g -= np.mean(g)
 
-        # Add transaction cost subgradient
-        if self.transaction_costs_arr is not None:
+        # Optional turnover penalty (gated): default off
+        if (
+            getattr(self, "penalize_turnover", False)
+            and self.transaction_costs_arr is not None
+        ):
             prev = projector.config.previous_weights
             if prev is not None:
                 prev_arr = np.asarray(prev, dtype=float)
                 if prev_arr.shape == trade_w.shape:
-                    delta = trade_w - prev_arr
+                    rel = phi_eff
+                    denom = float(np.dot(prev_arr, rel))
+                    if denom <= 0:
+                        denom = 1e-16
+                    prev_drifted = (prev_arr * rel) / denom
+                    delta = trade_w - prev_drifted
                     g += self.transaction_costs_arr * np.sign(delta)
 
         projector.config.previous_weights = trade_w

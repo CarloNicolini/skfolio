@@ -576,11 +576,20 @@ class FollowTheWinner(OnlinePortfolioSelection):
         # Compute gradient using objective function (log-wealth by default, or custom risk/perf measure)
         gradient = self._objective_fn.grad(self.weights_, effective_net_returns)
 
-        # Add L1 turnover subgradient for transaction costs: grad C_t(b) = c * sign(b - b_prev)
-        if self.transaction_costs and self.previous_weights is not None:
+        # Optional: add L1 turnover subgradient (gated by flag penalize_turnover)
+        if (
+            getattr(self, "penalize_turnover", False)
+            and self.transaction_costs
+            and self.previous_weights is not None
+        ):
             prev = np.asarray(self.previous_weights, dtype=float)
             if prev.shape == self.weights_.shape:
-                delta = self.weights_ - prev
+                # Drift-aware delta: w_t - \tilde w_{t-1}
+                denom = float(np.dot(prev, effective_relatives))
+                if denom <= 0:
+                    denom = 1e-16
+                prev_drifted = (prev * effective_relatives) / denom
+                delta = self.weights_ - prev_drifted
                 gradient += self._transaction_costs_arr * np.sign(delta)
 
         return gradient
