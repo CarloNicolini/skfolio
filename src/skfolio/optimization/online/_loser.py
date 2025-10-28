@@ -662,11 +662,11 @@ class FollowTheLoser(OnlinePortfolioSelection):
 
         # Update state
         self.weights_ = next_w
-        self.previous_weights = trade_w.copy()
         self.loss_ = self._compute_loss(trade_w, x_t)
 
         # Update wealth tracking
         if hasattr(self, "_wealth_initialized") and self._wealth_initialized:
+            # Use the true previous trade weights for cost computation (from last round)
             prev_weights = self.previous_weights if self._t > 0 else None
             self._update_wealth(
                 trade_weights=trade_w,
@@ -674,6 +674,8 @@ class FollowTheLoser(OnlinePortfolioSelection):
                 previous_weights=prev_weights,
             )
 
+        # Record current trade weights as previous for next round
+        self.previous_weights = trade_w.copy()
         self._t += 1
         return self
 

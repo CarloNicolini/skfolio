@@ -271,7 +271,7 @@ class BaseMirrorMap(ABC):
         """
         return w
 
-    def __add__(self, other: "BaseMirrorMap") -> "CompositeMirrorMap":
+    def __add__(self, other: BaseMirrorMap) -> CompositeMirrorMap:
         r"""
         Compose two mirror maps by summing their potentials.
 
@@ -353,8 +353,14 @@ class EntropyMirrorMap(BaseMirrorMap):
         return softmax(z - 1.0, axis=0)
 
     def project_geom(self, w: np.ndarray) -> np.ndarray:
-        """Ensure unit sum for simplex."""
-        return w / np.sum(w)
+        """Ensure unit sum and non-negativity for simplex stability."""
+        w = np.maximum(w, 0.0)
+        s = float(np.sum(w))
+        if s <= 0:
+            # fallback to uniform if numerical issues produce non-positive vector
+            d = w.shape[0]
+            return np.ones(d, dtype=float) / d
+        return w / s
 
 
 class BurgMirrorMap(BaseMirrorMap):
@@ -1118,7 +1124,7 @@ class CompositeMirrorMap(DynamicMirrorMap):
                 out.append(c)
         return out
 
-    def __add__(self, other: BaseMirrorMap) -> "CompositeMirrorMap":
+    def __add__(self, other: BaseMirrorMap) -> CompositeMirrorMap:
         """Flatten on addition."""
         new_comps = self.components_.copy()
         if isinstance(other, CompositeMirrorMap):

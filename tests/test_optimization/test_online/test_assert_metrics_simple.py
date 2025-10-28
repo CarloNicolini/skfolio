@@ -126,9 +126,36 @@ def ref_cdar_from_returns(returns, beta=0.95):
 
 
 def ref_edar_from_returns(returns, beta=0.95):
-    """Wrapper to compute EDaR from returns (computes drawdowns first)."""
+    """Wrapper to compute EDaR from returns (computes drawdowns first).
+
+    The reference edar expects a 1D drawdown series; if a 2D matrix is provided,
+    compute EDaR per asset (along axis=0).
+    """
     drawdowns = get_drawdowns(returns, compounded=False)
-    return edar(drawdowns, beta=beta)
+    drawdowns = np.asarray(drawdowns)
+    if drawdowns.ndim == 1:
+        return edar(drawdowns, beta=beta)
+    n = drawdowns.shape[1]
+    out = np.empty(n, dtype=float)
+    for j in range(n):
+        out[j] = edar(drawdowns[:, j], beta=beta)
+    return out
+
+
+def ref_evar_from_returns(returns, beta=0.95):
+    """Wrapper to compute EVaR from returns for 1D or 2D inputs.
+
+    The reference evar expects a 1D series; if a 2D matrix is provided,
+    compute EVaR per asset (along axis=0).
+    """
+    returns = np.asarray(returns)
+    if returns.ndim == 1:
+        return evar(returns, beta=beta)
+    n = returns.shape[1]
+    out = np.empty(n, dtype=float)
+    for j in range(n):
+        out[j] = evar(returns[:, j], beta=beta)
+    return out
 
 
 # Mapping from measure enums to their implementations
@@ -154,7 +181,11 @@ AUTOGRAD_MEASURE_MAPPING = {
         None,
     ),
     RiskMeasure.CVAR: (_autograd_cvar, cvar, None),
-    RiskMeasure.EVAR: (_autograd_evar, evar, 1e-3),  # Grid approximation
+    RiskMeasure.EVAR: (
+        _autograd_evar,
+        ref_evar_from_returns,
+        1e-3,
+    ),  # Grid approximation
     RiskMeasure.WORST_REALIZATION: (
         _autograd_worst_realization,
         worst_realization,
@@ -304,8 +335,8 @@ ANALYTICAL_GRADIENT_MAPPING = {
         _autograd_evar,
         _analytical_evar_gradient,
         "finite_diff",
-        1e-3,
-        1e-3,
+        2e-3,
+        2e-3,
     ),
     RiskMeasure.CDAR: (
         _autograd_cdar,

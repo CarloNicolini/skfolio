@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from skfolio.measures._enums import PerfMeasure
 from tests.test_optimization.test_online.utils import (
     assert_simplex_trajectory,
     make_stationary_returns,
@@ -280,25 +281,31 @@ def test_learning_rate_callable(X_small):
 
 
 @pytest.mark.parametrize(
-    "objective, ftrl_flag, min_final_weight",
+    "strategy, ftrl_flag, min_final_weight",
     [
-        (FTWStrategy.EG, False, 0.95),
-        (FTWStrategy.EG, True, 0.95),
-        (FTWStrategy.OGD, False, 0.80),
-        (FTWStrategy.ADAGRAD, False, 0.85),
-        (FTWStrategy.ADABARRONS, True, 0.85),
+        (FTWStrategy.EG, "omd", 0.95),
+        (FTWStrategy.EG, "ftrl", 0.95),
+        (FTWStrategy.OGD, "omd", 0.80),
+        (FTWStrategy.ADAGRAD, "omd", 0.85),
+        (FTWStrategy.ADABARRONS, "ftrl", 0.85),
     ],
 )
 def test_convergence_to_best_asset_under_stationary_env(
-    objective, ftrl_flag, min_final_weight
+    strategy, ftrl_flag, min_final_weight
 ):
     # In a stationary environment with one dominant asset, OPS should converge most mass to it.
     X = make_stationary_returns(T=250, gap=0.01, n=2)
+    # for making the adabarrons converge to the best asset fast we decrease the barrier coefficient, increase the euclidean coefficient and set the beta to a very small value
     est = FollowTheWinner(
-        strategy=objective,
+        objective=PerfMeasure.LOG_WEALTH,
+        strategy=strategy,
+        adabarrons_alpha=0.1,
+        adabarrons_euclidean_coef=0.1,
+        adabarrons_beta=1e-6,
         update_mode=ftrl_flag,
-        learning_rate=0.2,
-        warm_start=False,
+        learning_rate=10,
+        grad_predictor="last",
+        warm_start=True,
     )
     est.fit(X)
     W = est.all_weights_

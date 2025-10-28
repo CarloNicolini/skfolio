@@ -60,6 +60,7 @@ See OCO/gradients_risk_metrics.md for detailed mathematical formulations.
 # Author: Hugo Delatte <delatte.hugo@gmail.com>
 # License: BSD 3 clause
 
+from typing import Any
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -447,8 +448,10 @@ def _analytical_mean_absolute_deviation_gradient(
     mean_return = np.mean(portfolio_returns)
     deviations = portfolio_returns - mean_return
     signs = np.sign(deviations)
-    # Gradient: (1/T) Σ sign(deviation) * r_t
-    grad = (net_returns.T @ signs) / T
+    # Chain rule: d/dw |p_t - μ| = sign(p_t - μ) * (r_t - mean(r))
+    mean_asset = np.mean(net_returns, axis=0)
+    centered = net_returns - mean_asset
+    grad = (centered.T @ signs) / T
     return grad
 
 
@@ -1136,185 +1139,278 @@ def _autograd_log_wealth(portfolio_returns: np.ndarray, **kwargs) -> anp.ndarray
 
 
 def _autograd_mean(returns: np.ndarray, **kwargs) -> anp.ndarray:
-    """Compute mean (expected return)."""
-    return anp.mean(returns)
+    """Autograd-compatible mean matching skfolio.measures.mean.
+
+    Shapes
+    - Input: (T,) or (T, n)
+    - Output: scalar if 1D, (n,) if 2D (reduce along axis=0)
+
+    Reference
+    - skfolio.measures.mean
+    """
+    return anp.mean(returns) if returns.ndim == 1 else anp.mean(returns, axis=0)
 
 
 def _autograd_variance(returns, **kwargs):
-    """Compute variance with T==1 proxy.
+    """Autograd-compatible variance matching skfolio.measures.variance.
 
-    Uses unbiased estimator (ddof=1) to match skfolio.measures.variance default.
+    - Unbiased (ddof=1) for T>1; axis=0 for matrix inputs
+    - T==1 proxy: returns[0]**2 (per-asset if 2D)
+
+    Shapes
+    - Input: (T,) or (T, n)
+    - Output: scalar if 1D, (n,) if 2D
+
+    Reference
+    - skfolio.measures.variance
     """
-    T = len(returns)
-    if T == 1:
-        # Single observation proxy: (w^T r)^2
-        return returns[0] ** 2
-    # True variance for time series (unbiased: divide by T-1)
-    mean_ret = anp.mean(returns)
-    return anp.sum((returns - mean_ret) ** 2) / (T - 1)
+    T = returns.shape[0]
+    if returns.ndim == 1:
+        if T == 1:
+            return returns[0] ** 2
+        m = anp.mean(returns)
+        return anp.sum((returns - m) ** 2) / (T - 1)
+    else:
+        if T == 1:
+            return returns[0] ** 2
+        m = anp.mean(returns, axis=0)
+        return anp.sum((returns - m) ** 2, axis=0) / (T - 1)
 
 
 def _autograd_standard_deviation(returns, **kwargs):
-    """Compute standard deviation with T==1 proxy.
+    """Autograd-compatible standard deviation matching skfolio.measures.standard_deviation.
 
-    Uses unbiased estimator (ddof=1) to match skfolio.measures.standard_deviation default.
+    - Unbiased variance under sqrt; axis=0 for matrix inputs
+    - T==1 proxy: |returns[0]| (per-asset if 2D)
+
+    Shapes
+    - Input: (T,) or (T, n)
+    - Output: scalar if 1D, (n,) if 2D
+
+    Reference
+    - skfolio.measures.standard_deviation
     """
-    T = len(returns)
-    if T == 1:
-        # Single observation proxy: |w^T r|
-        return anp.abs(returns[0])
-    # Use unbiased variance (divide by T-1)
-    mean_ret = anp.mean(returns)
-    var = anp.sum((returns - mean_ret) ** 2) / (T - 1)
-    return anp.sqrt(var + CLIP_EPSILON)
+    T = returns.shape[0]
+    if returns.ndim == 1:
+        if T == 1:
+            return anp.abs(returns[0])
+        m = anp.mean(returns)
+        var = anp.sum((returns - m) ** 2) / (T - 1)
+        return anp.sqrt(var + CLIP_EPSILON)
+    else:
+        if T == 1:
+            return anp.abs(returns[0])
+        m = anp.mean(returns, axis=0)
+        var = anp.sum((returns - m) ** 2, axis=0) / (T - 1)
+        return anp.sqrt(var + CLIP_EPSILON)
 
 
 def _autograd_semi_variance(returns, **kwargs):
-    """Compute semi-variance.
+    """Autograd-compatible semi-variance matching skfolio.measures.semi_variance.
 
-    Uses unbiased estimator (correction factor T/(T-1)) to match skfolio.measures.semi_variance default.
-    Defaults to mean if min_acceptable_return is None.
+    - Unbiased factor T/(T-1); MAR defaults per-asset for 2D; axis=0
+
+    Shapes
+    - Input: (T,) or (T, n)
+    - Output: scalar if 1D, (n,) if 2D
+
+    Reference
+    - skfolio.measures.semi_variance
     """
-    min_acceptable_return = kwargs.get("min_acceptable_return", None)
-    if min_acceptable_return is None:
-        min_acceptable_return = anp.mean(returns)
-
-    downside = anp.maximum(0, min_acceptable_return - returns)
-    T = len(returns)
-    biased_semi_var = anp.mean(downside**2)
-
-    # Apply unbiased correction: T / (T - 1)
-    if T > 1:
-        return biased_semi_var * T / (T - 1)
-    return biased_semi_var
+    T = returns.shape[0]
+    mar = kwargs.get("min_acceptable_return", None)
+    if returns.ndim == 1:
+        if mar is None:
+            mar = anp.mean(returns)
+        downside = anp.maximum(0, mar - returns)
+        biased_sv = anp.mean(downside**2)
+        return biased_sv * T / (T - 1) if T > 1 else biased_sv
+    else:
+        if mar is None:
+            mar = anp.mean(returns, axis=0)
+        downside = anp.maximum(0, mar - returns)
+        biased_sv = anp.mean(downside**2, axis=0)
+        return biased_sv * T / (T - 1) if T > 1 else biased_sv
 
 
 def _autograd_semi_deviation(returns, **kwargs):
-    """Compute semi-deviation.
+    """Autograd-compatible semi-deviation (sqrt of semi-variance).
 
-    Uses unbiased estimator to match skfolio.measures.semi_deviation default.
-    Defaults to mean if min_acceptable_return is None.
+    Shapes
+    - Input: (T,) or (T, n)
+    - Output: scalar if 1D, (n,) if 2D
+
+    Reference
+    - skfolio.measures.semi_deviation
     """
-    # Compute unbiased semi-variance then take sqrt
     semi_var = _autograd_semi_variance(returns, **kwargs)
-    return anp.sqrt(semi_var + CLIP_EPSILON)
+    return anp.sqrt(semi_var)
 
 
 def _autograd_mean_absolute_deviation(returns, **kwargs):
-    """Compute mean absolute deviation with T==1 proxy."""
-    min_acceptable_return = kwargs.get("min_acceptable_return", 0)
-    T = len(returns)
-    if T == 1:
-        # Single observation proxy: |w^T r - mar|
-        return anp.abs(returns[0] - min_acceptable_return)
-    mean_ret = anp.mean(returns)
-    return anp.mean(anp.abs(returns - mean_ret))
+    """Autograd-compatible MAD matching skfolio.measures.mean_absolute_deviation.
+
+    - MAR defaults per-asset for 2D; axis=0 reduction
+
+    Shapes
+    - Input: (T,) or (T, n)
+    - Output: scalar if 1D, (n,) if 2D
+
+    Reference
+    - skfolio.measures.mean_absolute_deviation
+    """
+    T = returns.shape[0]
+    if returns.ndim == 1:
+        if T == 1:
+            mar = kwargs.get("min_acceptable_return", 0.0)
+            return anp.abs(returns[0] - mar)
+        m = anp.mean(returns)
+        return anp.mean(anp.abs(returns - m))
+    else:
+        if T == 1:
+            mar = kwargs.get("min_acceptable_return", anp.zeros(returns.shape[1]))
+            return anp.abs(returns[0] - mar)
+        m = anp.mean(returns, axis=0)
+        return anp.mean(anp.abs(returns - m), axis=0)
 
 
 def _autograd_first_lower_partial_moment(returns, **kwargs):
-    """Compute first lower partial moment.
+    """Autograd-compatible FLPM matching skfolio.measures.first_lower_partial_moment.
 
-    Defaults to mean if min_acceptable_return is None, matching skfolio.measures behavior.
+    - MAR defaults per-asset for 2D; axis=0 reduction
+
+    Shapes
+    - Input: (T,) or (T, n)
+    - Output: scalar if 1D, (n,) if 2D
+
+    Reference
+    - skfolio.measures.first_lower_partial_moment
     """
-    min_acceptable_return = kwargs.get("min_acceptable_return", None)
-    if min_acceptable_return is None:
-        min_acceptable_return = anp.mean(returns)
-
-    downside = anp.maximum(0, min_acceptable_return - returns)
-    return anp.mean(downside)
+    mar = kwargs.get("min_acceptable_return", None)
+    if returns.ndim == 1:
+        if mar is None:
+            mar = anp.mean(returns)
+        downside = anp.maximum(0, mar - returns)
+        return anp.mean(downside)
+    else:
+        if mar is None:
+            mar = anp.mean(returns, axis=0)
+        downside = anp.maximum(0, mar - returns)
+        return anp.mean(downside, axis=0)
 
 
 def _autograd_cvar(returns, **kwargs):
-    """Compute CVaR (Conditional Value at Risk).
+    """Autograd-compatible CVaR matching skfolio.measures.cvar.
 
-    Matches skfolio.measures.cvar formula exactly:
-    CVaR = -sum(ret[:ik]) / k + ret[ik] * (ik / k - 1)
-    where k = (1-β)*T and ik = ceil(k) - 1
+    - Empirical CVaR with fractional handling; axis=0 for matrix inputs
+
+    Shapes
+    - Input: (T,) or (T, n)
+    - Output: scalar if 1D, (n,) if 2D
+
+    Reference
+    - skfolio.measures.cvar
     """
     beta = kwargs.get("beta", 0.95)
-    T = len(returns)
-    k = (1 - beta) * T
+    T = returns.shape[0]
+    k = (1.0 - beta) * T
     if k <= 0:
         k = 1.0
-    ik = max(0, int(anp.ceil(k) - 1))
-    sorted_returns = anp.sort(returns)
-    # Formula from skfolio.measures.cvar (without sample weights)
-    return -anp.sum(sorted_returns[:ik]) / k + sorted_returns[ik] * (ik / k - 1)
+    ik = anp.maximum(0, anp.ceil(k) - 1).astype(int)
+    if returns.ndim == 1:
+        sorted_ret = anp.sort(returns)
+        return -anp.sum(sorted_ret[:ik]) / k + sorted_ret[ik] * (ik / k - 1.0)
+    else:
+        sorted_ret = anp.sort(returns, axis=0)
+        head_sum = (
+            anp.sum(sorted_ret[:ik, :], axis=0)
+            if ik > 0
+            else anp.zeros(sorted_ret.shape[1])
+        )
+        return -head_sum / k + sorted_ret[ik, :] * (ik / k - 1.0)
 
 
 def _autograd_evar(returns, **kwargs):
-    """Compute EVaR (Entropic Value at Risk) using entropic risk measure.
+    """Autograd-friendly EVaR via smooth-min over a theta grid (axis-aware).
 
-    EVaR = min_theta (theta * log(E[exp(-r/theta)] / (1-beta)))
+    - Uses a log-sum-exp softmin over a logarithmic grid of theta values to
+      approximate min_theta phi(theta), where
+      phi(theta) = theta * (log(mean(exp(-returns/theta))) - log(1-beta)).
+    - Fully differentiable through autograd (anp operations only).
 
-    We approximate the optimization by evaluating at multiple theta values
-    and taking the minimum. This is differentiable and provides good accuracy.
+    Shapes
+    - Input: (T,) or (T, n)
+    - Output: scalar if 1D, (n,) if 2D
 
-    Parameters
-    ----------
-    portfolio_returns : array-like
-        Portfolio returns.
-    **kwargs
-        beta : float, default=0.95
-            Confidence level.
-
-    Returns
-    -------
-    float
-        EVaR estimate.
-
-    Notes
-    -----
-    We use a grid of theta values from max_loss/100 to max_loss/2 and take
-    the minimum entropic risk measure. This approximates the true EVaR
-    optimization while remaining differentiable.
+    Reference
+    - skfolio.measures.evar
     """
+    returns = anp.asarray(returns)
     beta = kwargs.get("beta", 0.95)
 
-    # Define grid of theta values based on data scale
+    # Construct theta grid based on scale of losses
     max_loss = anp.max(-returns)
-    if max_loss <= 0:
-        max_loss = 1.0
-
-    # Grid of theta values (similar to scipy optimization bounds)
-    # Use logarithmic spacing from max_loss/100 to max_loss/2
-    # 20 points provides good approximation while remaining efficient
-    theta_min = max_loss / 100.0
+    max_loss = anp.where(max_loss <= 0, 1.0, max_loss)
+    theta_min = max_loss / 200.0
     theta_max = max_loss / 2.0
-    theta_candidates = anp.exp(anp.linspace(anp.log(theta_min), anp.log(theta_max), 20))
+    thetas = anp.exp(anp.linspace(anp.log(theta_min), anp.log(theta_max), 256))
 
-    # Compute entropic risk measure for each theta
-    evar_values = []
-    for theta in theta_candidates:
-        exp_term = anp.exp(-returns / theta)
-        mean_exp = anp.mean(exp_term)
-        evar_val = theta * anp.log(mean_exp / (1.0 - beta))
-        evar_values.append(evar_val)
-
-    # Return minimum (closest to true EVaR)
-    return anp.min(anp.array(evar_values))
+    # Compute phi(theta) for each theta
+    if returns.ndim == 1:
+        phi_vals = []
+        for theta in thetas:
+            exp_term = anp.exp(-returns / theta)
+            mean_exp = anp.mean(exp_term)
+            phi_vals.append(theta * (anp.log(mean_exp) - anp.log(1.0 - beta)))
+        phi = anp.stack(phi_vals, axis=0)
+        return anp.min(phi)
+    else:
+        phi_cols = []
+        for theta in thetas:
+            exp_term = anp.exp(-returns / theta)  # (T, n)
+            mean_exp = anp.mean(exp_term, axis=0)  # (n,)
+            phi_cols.append(theta * (anp.log(mean_exp) - anp.log(1.0 - beta)))
+        phi = anp.stack(phi_cols, axis=0)  # (N, n)
+        return anp.min(phi, axis=0)
 
 
 def _autograd_worst_realization(returns, **kwargs):
-    """Compute worst realization (negative minimum return)."""
-    return -anp.min(returns)
+    """Autograd-compatible worst realization matching skfolio.measures.worst_realization.
+
+    Shapes
+    - Input: (T,) or (T, n)
+    - Output: scalar if 1D, (n,) if 2D
+
+    Reference
+    - skfolio.measures.worst_realization
+    """
+    return -anp.min(returns) if returns.ndim == 1 else -anp.min(returns, axis=0)
 
 
 def _autograd_gini_mean_difference(returns, **kwargs):
-    """Compute Gini mean difference with T==1 proxy.
+    """Autograd-compatible GMD matching skfolio.measures.gini_mean_difference.
 
-    Uses the correct OWA weights formula from skfolio.measures:
-    w_k = (4k - 2(T+1)) / (T(T-1))
+    - Uses OWA weights; sorts along time (axis=0); axis=0 reduction for 2D
+
+    Shapes
+    - Input: (T,) or (T, n)
+    - Output: scalar if 1D, (n,) if 2D
+
+    Reference
+    - skfolio.measures.gini_mean_difference
     """
-    T = len(returns)
-    if T == 1:
-        # Single observation proxy: |w^T r|
-        return anp.abs(returns[0])
-    sorted_rets = anp.sort(returns)
-    # Correct OWA weights: w_k = (4k - 2(T+1)) / (T(T-1))
-    # This matches skfolio.measures.owa_gmd_weights
-    weights_owa = (4.0 * anp.arange(1, T + 1) - 2.0 * (T + 1)) / (T * (T - 1))
-    return anp.dot(weights_owa, sorted_rets)
+    T = returns.shape[0]
+    if returns.ndim == 1:
+        if T == 1:
+            return anp.abs(returns[0])
+        w = (4.0 * anp.arange(1, T + 1) - 2.0 * (T + 1)) / (T * (T - 1))
+        return anp.dot(w, anp.sort(returns))
+    else:
+        if T == 1:
+            return anp.abs(returns[0])
+        w = (4.0 * anp.arange(1, T + 1) - 2.0 * (T + 1)) / (T * (T - 1))
+        sorted_rets = anp.sort(returns, axis=0)
+        return anp.dot(w, sorted_rets)
 
 
 def smooth_max(a, b, beta=100.0):
@@ -1418,33 +1514,33 @@ def _autograd_edar(returns, beta=0.95, compounded=False, smooth_beta=None):
 def _get_autograd_measure_fn(measure: BaseMeasure, **kwargs):
     match measure:
         case PerfMeasure.LOG_WEALTH:
-            return partial(_autograd_log_wealth, **kwargs)
+            return partial[Any](_autograd_log_wealth, **kwargs)
         case PerfMeasure.MEAN:
-            return partial(_autograd_mean, **kwargs)
+            return partial[Any](_autograd_mean, **kwargs)
         case RiskMeasure.VARIANCE:
-            return partial(_autograd_variance, **kwargs)
+            return partial[Any](_autograd_variance, **kwargs)
         case RiskMeasure.STANDARD_DEVIATION:
-            return partial(_autograd_standard_deviation, **kwargs)
+            return partial[Any](_autograd_standard_deviation, **kwargs)
         case RiskMeasure.SEMI_VARIANCE:
-            return partial(_autograd_semi_variance, **kwargs)
+            return partial[Any](_autograd_semi_variance, **kwargs)
         case RiskMeasure.SEMI_DEVIATION:
-            return partial(_autograd_semi_deviation, **kwargs)
+            return partial[Any](_autograd_semi_deviation, **kwargs)
         case RiskMeasure.MEAN_ABSOLUTE_DEVIATION:
-            return partial(_autograd_mean_absolute_deviation, **kwargs)
+            return partial[Any](_autograd_mean_absolute_deviation, **kwargs)
         case RiskMeasure.FIRST_LOWER_PARTIAL_MOMENT:
-            return partial(_autograd_first_lower_partial_moment, **kwargs)
+            return partial[Any](_autograd_first_lower_partial_moment, **kwargs)
         case RiskMeasure.CVAR:
-            return partial(_autograd_cvar, **kwargs)
+            return partial[Any](_autograd_cvar, **kwargs)
         case RiskMeasure.EVAR:
-            return partial(_autograd_evar, **kwargs)
+            return partial[Any](_autograd_evar, **kwargs)
         case RiskMeasure.WORST_REALIZATION:
-            return partial(_autograd_worst_realization, **kwargs)
+            return partial[Any](_autograd_worst_realization, **kwargs)
         case RiskMeasure.GINI_MEAN_DIFFERENCE:
-            return partial(_autograd_gini_mean_difference, **kwargs)
+            return partial[Any](_autograd_gini_mean_difference, **kwargs)
         case RiskMeasure.CDAR:
-            return partial(_autograd_cdar, **kwargs)
+            return partial[Any](_autograd_cdar, **kwargs)
         case RiskMeasure.EDAR:
-            return partial(_autograd_edar, **kwargs)
+            return partial[Any](_autograd_edar, **kwargs)
         case _:
             raise ValueError(f"Unsupported measure: {measure}")
 

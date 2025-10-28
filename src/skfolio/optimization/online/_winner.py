@@ -141,6 +141,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
         max_tracking_error: float | None = None,
         covariance: npt.ArrayLike | None = None,
         variance_bound: float | None = None,
+        use_autograd: bool = False,
         portfolio_params: dict | None = None,
     ):
         r"""Follow-The-Winner online portfolio selection estimator.
@@ -321,6 +322,9 @@ class FollowTheWinner(OnlinePortfolioSelection):
         variance_bound : float | None, default=None
             Maximum allowed portfolio variance.
 
+        use_autograd : bool, default=False
+            Whether to use autograd for computation of objective measures with respect to weights. Only for debugging purposes.
+
         portfolio_params : dict | None, default=None
             Additional portfolio parameters passed to base class.
 
@@ -388,6 +392,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
         self.max_tracking_error = max_tracking_error
         self.covariance = covariance
         self.variance_bound = variance_bound
+        self.use_autograd = use_autograd
 
         # Internal state (initialized deterministically)
         self._ftrl_engine: FirstOrderOCO | None = None
@@ -419,7 +424,9 @@ class FollowTheWinner(OnlinePortfolioSelection):
 
         # Initialize objective function
         if not hasattr(self, "_objective_fn"):
-            self._objective_fn = create_objective(self.objective, use_autograd=False)
+            self._objective_fn = create_objective(
+                self.objective, use_autograd=self.use_autograd
+            )
 
         if self._ftrl_engine is None:
             mirror_map: BaseMirrorMap | None = None
@@ -532,7 +539,10 @@ class FollowTheWinner(OnlinePortfolioSelection):
                     skip_auto_update=skip_auto_update,
                 )
 
-        if not self._weights_initialized or not self.warm_start:
+        # Initialize weights only once per fit/streaming session.
+        # When warm_start=False, resetting is handled at the beginning of fit()
+        # via _reset_state_for_fit; we must not reinitialize at every partial_fit call.
+        if not self._weights_initialized:
             self._initialize_weights(num_assets)
             # Initialize wealth tracking
             if not self._wealth_initialized:
@@ -666,7 +676,8 @@ class FollowTheWinner(OnlinePortfolioSelection):
         final_return = np.dot(self.weights_, effective_relatives)
         self.loss_ = -np.log(np.maximum(final_return, CLIP_EPSILON))
         self.cumulative_loss_ += self.loss_
-        self.previous_weights = self._last_trade_weights_.copy()
+        # Note: previous_weights assignment is handled after wealth update to ensure
+        # transaction costs in wealth use the true previous trade weights.
         self._t += 1
 
     def partial_fit(
@@ -726,17 +737,22 @@ class FollowTheWinner(OnlinePortfolioSelection):
         # (barrier with weights, full quadratic with gradients)
         self._update_adabarrons_components(self.weights_, gradient)
 
+        # Capture previous trade weights for cost computation BEFORE we mutate previous_weights
+        prev_for_cost = self.previous_weights if self._t > 0 else None
+
         # Step 7: Update internal state and compute loss
         self._finalize_partial_fit_state(effective_relatives)
 
-        # Step 8: Update wealth tracking
+        # Step 8: Update wealth tracking (use prev_for_cost from before this step)
         if hasattr(self, "_wealth_initialized") and self._wealth_initialized:
-            prev_weights = self.previous_weights if self._t > 1 else None
             self._update_wealth(
                 trade_weights=self._last_trade_weights_,
                 effective_relatives=effective_relatives,
-                previous_weights=prev_weights,
+                previous_weights=prev_for_cost,
             )
+
+        # Step 9: Now record previous trade weights for next round's gradient/cost logic
+        self.previous_weights = self._last_trade_weights_.copy()
 
         return self
 

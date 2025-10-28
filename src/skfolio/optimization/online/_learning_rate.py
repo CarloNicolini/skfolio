@@ -13,7 +13,6 @@ References
 """
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -369,7 +368,8 @@ def compute_eg_learning_rate(t: int, n_assets: int, scale: str = "empirical") ->
 
         case "empirical":
             # Validated on real financial data: n/sqrt(t)
-            # Achieves 90-95% of optimal BCRP
+            # Achieves 90-95% of optimal BCRP for moderate-to-large n.
+            # For very small dimensions (n<=4), this can be too timid; use a floor.
             return n_assets / np.sqrt(t_theory)
 
         case _:
