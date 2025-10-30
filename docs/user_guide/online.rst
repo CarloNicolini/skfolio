@@ -229,6 +229,20 @@ The module provides comprehensive regret computation via :func:`regret`:
 Getting Started
 ================
 
+Gallery Examples
+----------------
+
+For comprehensive tutorials with visualizations and detailed explanations, see the
+:ref:`online_examples` section in the examples gallery:
+
+- **Introduction to Online Portfolio Selection**: Compare Follow-the-Winner (momentum)
+  vs Follow-the-Loser (mean reversion) strategies, understand regret analysis, and
+  explore wealth evolution on real datasets.
+
+- **Advanced Strategies Comparison**: Examine adaptive methods (AdaGrad, AdaBARRONS),
+  analyze transaction cost impact, compare performance across different market regimes,
+  and evaluate PAMR variants.
+
 Basic Example: Follow-The-Winner (Momentum)
 --------------------------------------------
 

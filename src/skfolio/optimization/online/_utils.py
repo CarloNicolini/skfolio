@@ -1,3 +1,9 @@
+"""Utility functions for online portfolio selection."""
+
+# Copyright (c) 2025
+# Author: Carlo Nicolini <nicolini.carlo@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
+
 from itertools import combinations
 
 import numpy as np
@@ -115,64 +121,3 @@ def validate_weights(
                     f"max_turnover violated: L1={l1:.12g} > {float(max_turnover):.12g}"
                 )
     return violations
-
-
-def integer_simplex_grid(n_assets: int, m: int) -> np.ndarray:
-    r"""
-    Generate all compositions of integer m into n_assets nonnegative parts.
-
-    This function generates a grid of integer points that sum to m, distributed
-    across n_assets components. Each point represents a valid allocation where
-    all components are non-negative integers.
-
-    Parameters
-    ----------
-    n_assets : int
-        Number of assets (components) in each composition.
-    m : int
-        Target sum for each composition.
-
-    Returns
-    -------
-    np.ndarray of shape (n_compositions, n_assets)
-        Array where each row is a composition of m into n_assets parts.
-        All entries are non-negative integers that sum to m.
-
-    Notes
-    -----
-    This function implements the "stars and bars" combinatorial method to
-    enumerate all ways to distribute m identical items into n_assets distinct
-    bins. The total number of compositions is C(m + n_assets - 1, n_assets - 1).
-
-    Used primarily for generating expert portfolios in Universal Portfolio
-    algorithms, where each composition represents a discrete allocation
-    strategy on the probability simplex.
-
-    Examples
-    --------
-    >>> integer_simplex_grid(2, 3)
-    array([[3., 0.],
-           [2., 1.],
-           [1., 2.],
-           [0., 3.]])
-    """
-    if n_assets <= 0 or m <= 0:
-        return np.zeros((0, 0), dtype=float)
-    comb = np.fromiter(
-        (
-            c
-            for bars in combinations(range(m + n_assets - 1), n_assets - 1)
-            for c in bars
-        ),
-        dtype=np.int64,
-    )
-    if comb.size == 0:
-        # n_assets == 1 -> single point (m)
-        return np.array([[float(m)]], dtype=float)
-    comb = comb.reshape(-1, n_assets - 1)
-    padded = np.empty((comb.shape[0], n_assets + 1), dtype=np.int64)
-    padded[:, 0] = -1
-    padded[:, 1:-1] = comb
-    padded[:, -1] = m + n_assets - 1
-    points = np.diff(padded, axis=1) - 1
-    return points.astype(float)

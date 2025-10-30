@@ -1,7 +1,8 @@
-"""
-Mean-reversion portfolio selection strategies.
-Unified interface for OLMAR, PAMR, and CWMR strategies with both passive-aggressive and mirror-descent update modes.
-"""
+"""Mean-reversion (follow the loser) portfolio selection strategies."""
+
+# Copyright (c) 2025
+# Author: Carlo Nicolini <nicolini.carlo@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
 

@@ -1,5 +1,9 @@
 """Online optimization algorithms, benchmarks, and regret utilities."""
 
+# Copyright (c) 2025
+# Author: Carlo Nicolini <nicolini.carlo@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
+
 from skfolio.optimization.online._benchmark import BCRP, CRP, UCRP, BestStock
 from skfolio.optimization.online._loser import (
     FTLStrategy,

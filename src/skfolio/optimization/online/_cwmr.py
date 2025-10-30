@@ -1,9 +1,8 @@
-"""
-Confidence-Weighted Mean Reversion (CWMR) module.
+"""Confidence-Weighted Mean Reversion (CWMR) module."""
 
-This module contains all CWMR-specific functions for the mean-reversion
-portfolio selection strategy.
-"""
+# Copyright (c) 2025
+# Author: Carlo Nicolini <nicolini.carlo@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
 

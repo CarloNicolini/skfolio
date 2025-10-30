@@ -1,9 +1,8 @@
-"""
-Strategy classes for mean-reversion portfolio selection.
+"""Strategy classes for mean-reversion portfolio selection."""
 
-Each strategy (PAMR, OLMAR, CWMR) is implemented as a separate class
-that handles both PA and MD update modes.
-"""
+# Copyright (c) 2025
+# Author: Carlo Nicolini <nicolini.carlo@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
 

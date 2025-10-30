@@ -1,16 +1,8 @@
-"""Benchmarks for online portfolio selection.
+"""Benchmark estimators for online portfolio selection."""
 
-Implements:
-- CRP: Constant Rebalanced Portfolio with fixed weights (UCRP when uniform).
-- BCRP: Best Constant Rebalanced Portfolio in hindsight, maximizing
-  sum_t log(b^T x_t) over the simplex.
-
-References
-----------
-- Li, B., & Hoi, S. C. H. (2013). Online Portfolio Selection: A Survey.
-  arXiv:1212.2129 (`https://arxiv.org/abs/1212.2129`).
-- Notes in `OCO/benchmarks.md`.
-"""
+# Copyright (c) 2025
+# Author: Carlo Nicolini <nicolini.carlo@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
 
@@ -25,9 +17,6 @@ from skfolio.optimization.convex._base import ObjectiveFunction
 from skfolio.optimization.convex._mean_risk import MeanRisk
 from skfolio.optimization.online._mixins import OnlineMixin
 from skfolio.optimization.online._utils import net_to_relatives
-
-# Keep a direct reference to cp to satisfy static linters
-assert cp is not None
 
 
 class _OnceFittable:
@@ -57,9 +46,22 @@ class CRP(BaseOptimization, _OnceFittable):
         Uniform Constant Rebalanced Portfolio (UCRP).
     portfolio_params : dict, optional
         Portfolio parameters propagated to the produced portfolio.
+
+    Attributes
+    ----------
+    weights_ : ndarray of shape (n_assets,)
+        Portfolio weights.
+
+    wealth_ : float
+        Final portfolio wealth after all periods.
+
+    all_wealth_ : ndarray of shape (T+1,)
+        Wealth history: wealth_[0] is initial wealth (1.0), wealth_[t] is wealth after period t.
+
+    all_weights_ : ndarray of shape (T, n_assets)
+        Weight history: weights used at the start of each period (before observing returns).
     """
 
-    weights_: np.ndarray
     n_features_in_: int
 
     def __init__(
@@ -84,7 +86,45 @@ class CRP(BaseOptimization, _OnceFittable):
         return self
 
     def fit(self, X: npt.ArrayLike, y: npt.ArrayLike | None = None):  # type: ignore[override]
-        return self.partial_fit(X, y)
+        """Fit the CRP/UCRP and compute wealth trajectory.
+
+        Parameters
+        ----------
+        X : array-like of shape (T, n_assets)
+            Net returns per period.
+        y : Ignored
+            Present for API consistency.
+
+        Returns
+        -------
+        self
+            The estimator instance.
+        """
+        X_arr = np.asarray(X, dtype=float)
+
+        # Set weights
+        self.partial_fit(X_arr, y)
+
+        # Compute wealth trajectory
+        relatives = net_to_relatives(X_arr)  # (T, n_assets)
+        T = relatives.shape[0]
+
+        # Initialize wealth tracking
+        self.wealth_ = 1.0
+        wealth_history = [self.wealth_]
+        weight_history = []
+
+        # Compute wealth evolution (constant rebalanced portfolio)
+        for t in range(T):
+            weight_history.append(self.weights_.copy())
+            portfolio_return = np.dot(self.weights_, relatives[t])
+            self.wealth_ *= portfolio_return
+            wealth_history.append(self.wealth_)
+
+        self.all_wealth_ = np.array(wealth_history, dtype=float)
+        self.all_weights_ = np.vstack(weight_history)
+
+        return self
 
 
 # utility class for UCRP
@@ -93,6 +133,31 @@ class UCRP(CRP):
 
 
 class BestStock(BaseOptimization, _OnceFittable):
+    """Best Stock (ex-post).
+
+    Invests all capital in the single asset with highest cumulative log-return.
+    This is a hindsight benchmark showing the best possible single-asset performance.
+
+    Parameters
+    ----------
+    portfolio_params : dict, optional
+        Portfolio parameters propagated to the produced portfolio.
+
+    Attributes
+    ----------
+    weights_ : ndarray of shape (n_assets,)
+        Portfolio weights (one-hot vector with 1.0 on best asset).
+
+    wealth_ : float
+        Final portfolio wealth after all periods.
+
+    all_wealth_ : ndarray of shape (T+1,)
+        Wealth history: wealth_[0] is initial wealth (1.0), wealth_[t] is wealth after period t.
+
+    all_weights_ : ndarray of shape (T, n_assets)
+        Weight history: weights used at the start of each period (before observing returns).
+    """
+
     def __init__(self, portfolio_params: dict | None = None):
         super().__init__(portfolio_params=portfolio_params)
 
@@ -104,7 +169,45 @@ class BestStock(BaseOptimization, _OnceFittable):
         return self
 
     def fit(self, X: npt.ArrayLike, y: npt.ArrayLike | None = None):
-        return self.partial_fit(X, y)
+        """Fit BestStock and compute wealth trajectory.
+
+        Parameters
+        ----------
+        X : array-like of shape (T, n_assets)
+            Net returns per period.
+        y : Ignored
+            Present for API consistency.
+
+        Returns
+        -------
+        self
+            The estimator instance.
+        """
+        X_arr = np.asarray(X, dtype=float)
+
+        # Set weights (identifies best stock in hindsight)
+        self.partial_fit(X_arr, y)
+
+        # Compute wealth trajectory
+        relatives = net_to_relatives(X_arr)  # (T, n_assets)
+        T = relatives.shape[0]
+
+        # Initialize wealth tracking
+        self.wealth_ = 1.0
+        wealth_history = [self.wealth_]
+        weight_history = []
+
+        # Compute wealth evolution (all capital in best stock)
+        for t in range(T):
+            weight_history.append(self.weights_.copy())
+            portfolio_return = np.dot(self.weights_, relatives[t])
+            self.wealth_ *= portfolio_return
+            wealth_history.append(self.wealth_)
+
+        self.all_wealth_ = np.array(wealth_history, dtype=float)
+        self.all_weights_ = np.vstack(weight_history)
+
+        return self
 
 
 class BCRP(MeanRisk, OnlineMixin):
@@ -206,8 +309,15 @@ class BCRP(MeanRisk, OnlineMixin):
     weights_ : ndarray of shape (n_assets,)
         Optimized portfolio weights.
 
+    wealth_ : float
+        Final portfolio wealth after all periods.
+
+    all_wealth_ : ndarray of shape (T+1,)
+        Wealth history: wealth_[0] is initial wealth (1.0), wealth_[t] is wealth after period t.
+
     all_weights_ : ndarray of shape (T, n_assets)
-        Weights from ``fit_dynamic`` method (dynamic regret).
+        Weight history from ``fit`` method. For ``fit_dynamic``, contains weights
+        from each expanding window (dynamic regret).
 
     Examples
     --------
@@ -344,38 +454,98 @@ class BCRP(MeanRisk, OnlineMixin):
     def partial_fit(self, X: npt.ArrayLike, y: npt.ArrayLike | None = None):
         return self.fit(X, y)
 
+    def fit(self, X: npt.ArrayLike, y: npt.ArrayLike | None = None, **fit_params):
+        """Fit BCRP and compute wealth trajectory.
+
+        Parameters
+        ----------
+        X : array-like of shape (T, n_assets)
+            Net returns per period.
+        y : Ignored
+            Present for API consistency.
+        **fit_params
+            Additional fit parameters.
+
+        Returns
+        -------
+        self
+            The estimator instance.
+        """
+        # Call parent fit (MeanRisk)
+        super().fit(X, y, **fit_params)
+
+        # Add wealth tracking
+        X_arr = np.asarray(X, dtype=float)
+        relatives = net_to_relatives(X_arr)  # (T, n_assets)
+        T = relatives.shape[0]
+
+        # Initialize wealth tracking
+        self.wealth_ = 1.0
+        wealth_history = [self.wealth_]
+        weight_history = []
+
+        # Compute wealth evolution with constant optimal weights
+        for t in range(T):
+            weight_history.append(self.weights_.copy())
+            portfolio_return = np.dot(self.weights_, relatives[t])
+            self.wealth_ *= portfolio_return
+            wealth_history.append(self.wealth_)
+
+        self.all_wealth_ = np.array(wealth_history, dtype=float)
+        self.all_weights_ = np.vstack(weight_history)
+
+        return self
+
     def fit_dynamic(
         self, X: npt.ArrayLike, y: npt.ArrayLike | None = None, **fit_params
     ) -> MeanRisk:
-        """
+        """Fit over increasingly large folds and compute wealth trajectory.
+
         Helper method to fit over increasingly large folds of data from t=1 to T.
         Useful for use with regret calculation in dynamic regret settings.
 
         Parameters
         ----------
-        X : npt.ArrayLike
-            _description_
-        y : npt.ArrayLike | None, optional
-            _description_, by default None
+        X : array-like of shape (T, n_assets)
+            Net returns per period.
+        y : Ignored
+            Present for API consistency.
+        **fit_params
+            Additional fit parameters.
 
         Returns
         -------
-        MeanRisk
-            _description_
+        self
+            The estimator instance with all_weights_ and all_wealth_ attributes.
         """
         X_arr = np.asarray(X, dtype=float)
         if X_arr.ndim != 2:
             raise ValueError("X must be 2D array of shape (T, n_assets)")
         T, n = X_arr.shape
+
+        relatives = net_to_relatives(X_arr)
+
         weights_list: list[np.ndarray] = []
+        wealth_history = [1.0]  # Initial wealth
+        current_wealth = 1.0
+
         for t in range(1, T + 1):
             if t == 1:
                 weights_list.append(BestStock().fit(X_arr[:t, :]).weights_.copy())
             else:
                 # Fit on prefix up to time t (inclusive)
-                self.fit(X_arr[:t, :], y)
+                super().fit(X_arr[:t, :], y, **fit_params)
                 weights_list.append(self.weights_.copy())
+
+            # Update wealth for this period
+            portfolio_return = np.dot(weights_list[-1], relatives[t - 1])
+            current_wealth *= portfolio_return
+            wealth_history.append(current_wealth)
+
         self.all_weights_ = np.vstack(weights_list)
+        self.all_wealth_ = np.array(wealth_history, dtype=float)
+        self.wealth_ = current_wealth
+
         return self
 
 

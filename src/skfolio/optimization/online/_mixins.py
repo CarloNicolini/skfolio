@@ -1,9 +1,14 @@
+"""Mixins for online portfolio selection."""
+
+# Copyright (c) 2025
+# Author: Carlo Nicolini <nicolini.carlo@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
+
 from enum import auto
 from numbers import Real
 from typing import ClassVar
 
-import numpy as np
-from sklearn.utils._param_validation import Interval, StrOptions
+from sklearn.utils._param_validation import Interval
 
 from skfolio.utils.tools import AutoEnum
 

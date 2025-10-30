@@ -1,3 +1,9 @@
+"""Prediction strategies for online portfolio selection."""
+
+# Copyright (c) 2025
+# Author: Carlo Nicolini <nicolini.carlo@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
+
 import numpy as np
 
 from skfolio.optimization.online._utils import CLIP_EPSILON

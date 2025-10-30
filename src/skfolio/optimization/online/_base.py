@@ -1,3 +1,11 @@
+"""Base Online Portfolio Selection estimator."""
+
+# Copyright (c) 2025
+# Author: Carlo Nicolini <nicolini.carlo@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
+
 import warnings
 from typing import Any
 

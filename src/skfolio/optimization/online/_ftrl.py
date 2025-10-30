@@ -1,3 +1,9 @@
+"""First-order Follow The Regularized Leader (FTRL) engine."""
+
+# Copyright (c) 2025
+# Author: Carlo Nicolini <nicolini.carlo@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
+
 from __future__ import annotations
 
 from collections.abc import Callable

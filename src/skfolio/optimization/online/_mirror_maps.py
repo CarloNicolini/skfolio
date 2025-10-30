@@ -1,11 +1,8 @@
-# _mirror_maps.py
-"""
-Mirror maps for online convex optimization.
+"""Mirror maps for online convex optimization."""
 
-Implements Legendre-type mirror potentials and their forward/inverse mappings
-for use in mirror descent and FTRL algorithms.
-Mirror maps play the rôle of the 'composite regulariser' ψ in COMID.
-"""
+# Copyright (c) 2025
+# Author: Carlo Nicolini <nicolini.carlo@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
 
@@ -213,7 +210,7 @@ class BaseMirrorMap(ABC):
     ----------
     .. [1] Rockafellar, R. T. (1970). Convex Analysis. Princeton University Press.
     .. [2] Beck, A., & Teboulle, M. (2003). Mirror Descent and Nonlinear Projected
-       Subgradient Methods for Convex Optimization. SIAM J. Optim., 13(1), 188–205.
+       Subgradient Methods for Convex Optimization. SIAM J. Optim., 13(1), 188-205.
     """
 
     @abstractmethod
@@ -1047,7 +1044,7 @@ class FullQuadraticMap(DynamicMirrorMap):
     ----------
     .. [1] Hazan, E., Agarwal, A., & Kale, S. (2007).
        Logarithmic regret algorithms for online convex optimization.
-       Machine Learning, 69, 169–192.
+       Machine Learning, 69, 169-192.
     """
 
     def __init__(self, beta: float = 0.1, eps: float = 1e-12):
@@ -1352,7 +1349,7 @@ class AdaBarronsBarrierMap(DynamicMirrorMap):
         self._proximity_sum += 1.0 - w
 
     def _get_D(self) -> np.ndarray:
-        """Current barrier coefficients: D_i = barrier_coef + α * proximity_sum_i."""
+        """Current barrier coefficients: D_i = barrier_coef + alpha * proximity_sum_i."""
         return self.barrier_coef + self.alpha * self._proximity_sum
 
     def grad_psi(self, w: np.ndarray) -> np.ndarray:

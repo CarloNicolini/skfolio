@@ -56,14 +56,16 @@ References
 See OCO/gradients_risk_metrics.md for detailed mathematical formulations.
 """
 
-# Copyright (c) 2023
-# Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# Copyright (c) 2025
+# Author: Carlo Nicolini <nicolini.carlo@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
+from __future__ import annotations
 
-from typing import Any
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import partial
+from typing import Any
 
 import autograd.numpy as anp
 import numpy as np
@@ -75,7 +77,9 @@ from skfolio.measures import (
     edar,
     evar,
     first_lower_partial_moment,
+    get_cumulative_returns,
     gini_mean_difference,
+    log_wealth,
     mean,
     mean_absolute_deviation,
     semi_deviation,
@@ -83,10 +87,7 @@ from skfolio.measures import (
     standard_deviation,
     variance,
     worst_realization,
-    log_wealth,
-    get_cumulative_returns,
 )
-from functools import partial
 from skfolio.measures._enums import BaseMeasure, PerfMeasure, RiskMeasure
 from skfolio.optimization.online._utils import CLIP_EPSILON
 
@@ -908,7 +909,6 @@ def _analytical_cdar_gradient(
 
     # Sort by drawdown (descending, largest first)
     order = np.argsort(D)[::-1]
-    D_sorted = D[order]
     dD_sorted = dD[order]
 
     m = (1.0 - beta) * T

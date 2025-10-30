@@ -1,3 +1,8 @@
+"""Follow-The-Winner online portfolio selection."""
+
+# Copyright (c) 2025
+# Author: Carlo Nicolini <nicolini.carlo@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
 from collections.abc import Callable
 from numbers import Real
 from typing import Any, ClassVar, Literal
