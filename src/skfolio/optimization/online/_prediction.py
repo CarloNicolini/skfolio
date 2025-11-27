@@ -4,6 +4,9 @@
 # Author: Carlo Nicolini <nicolini.carlo@gmail.com>
 # SPDX-License-Identifier: BSD-3-Clause
 
+from abc import ABC, abstractmethod
+from typing import Any
+
 import numpy as np
 
 from skfolio.optimization.online._utils import CLIP_EPSILON
@@ -202,7 +205,34 @@ class RMRPredictor(BaseReversionPredictor):
         return phi
 
 
-class LastGradPredictor:
+class OMDPredictor(ABC):
+    @abstractmethod
+    def __call__(self, *args: Any, **kwds: Any) -> Any:
+        pass
+
+
+class ZeroPredictor(OMDPredictor):
+    """Predictor that always returns zero - should match vanilla OMD."""
+
+    def __call__(self, t, x, g):
+        if x is not None:
+            return np.zeros_like(x)
+        if g is not None:
+            return np.zeros_like(g)
+        return np.array([])
+
+
+class ConstantPredictor(OMDPredictor):
+    """Predictor that returns a constant vector."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __call__(self, t, x, g):
+        return self.value.copy()
+
+
+class LastGradPredictor(OMDPredictor):
     """Predictor that returns the last observed gradient.
 
     This implements the "smooth prediction" strategy from online learning theory,
@@ -229,7 +259,7 @@ class LastGradPredictor:
         return np.array([])
 
 
-class SmoothPredictor:
+class SmoothPredictor(OMDPredictor):
     """Predictor that returns clipped last gradient for bounded variation.
 
     This implements optimistic prediction with bounded variation assumptions,

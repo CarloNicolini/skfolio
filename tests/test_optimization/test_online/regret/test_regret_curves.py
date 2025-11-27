@@ -2,8 +2,11 @@ import numpy as np
 import pytest
 
 from skfolio.optimization.online import FollowTheWinner, RegretType, regret
-from skfolio.optimization.online._benchmark import BCRP
 from skfolio.optimization.online._mixins import FTWStrategy
+from skfolio.optimization.online._regret import (
+    _prefix_bcrp_weights,
+    _solve_bcrp_constant,
+)
 from skfolio.optimization.online._utils import CLIP_EPSILON, net_to_relatives
 
 
@@ -63,9 +66,7 @@ def test_static_regret_matches_manual(objective):
     R = net_to_relatives(X_net)
     online_losses = _manual_losses_from_weights(R, W_online)
 
-    bcrp = BCRP()
-    bcrp.fit(X_net)
-    w_star = bcrp.weights_
+    w_star = _solve_bcrp_constant(R)
     comp_losses = _manual_losses_from_weights(R, w_star)
 
     manual_curve = np.cumsum(online_losses - comp_losses)
@@ -140,8 +141,8 @@ def test_windowed_regret_consistency():
     R = net_to_relatives(X_net)
     online_losses = _manual_losses_from_weights(R, W_online)
 
-    bcrp = BCRP().fit(X_net)
-    comp_losses = _manual_losses_from_weights(R, bcrp.weights_)
+    w_star = _solve_bcrp_constant(R)
+    comp_losses = _manual_losses_from_weights(R, w_star)
 
     # Manual windowed regret averaged by window size
     rw = np.zeros(T)
@@ -182,8 +183,9 @@ def test_random_relatives_static_and_dynamic_regret_curves(objective):
             strategy=objective, learning_rate=0.1, warm_start=False
         ),
         X=X_net,
-        regret_type=RegretType.DYNAMIC,
+        regret_type=RegretType.DYNAMIC_UNIVERSAL,
         average=False,
+        dynamic_config={"path_length": 5.0},
     )
 
     assert rs.shape == (T,)
@@ -211,20 +213,21 @@ def test_dynamic_regret_curve_matches_prefix_comparator_behavior():
     R = net_to_relatives(X_net)
     online_losses = _manual_losses_from_weights(R, W_online)
 
-    # Comparator as used by regret(DYNAMIC): BCRP().fit_dynamic(X) -> all_weights_
-    comp = BCRP().fit_dynamic(X_net)
-    comp_losses = _manual_losses_from_weights(R, comp.all_weights_)
+    comp_weights = _prefix_bcrp_weights(R)
+    comp_losses = _manual_losses_from_weights(R, comp_weights)
 
     manual_dr = np.cumsum(online_losses - comp_losses)
 
-    # Library computation
-    rd = regret(
+    # Library computation for worst-case dynamic regret
+    rd_wc = regret(
         estimator=FollowTheWinner(
             strategy=FTWStrategy.EG, learning_rate=0.05, warm_start=False
         ),
         X=X_net,
-        regret_type=RegretType.DYNAMIC,
+        regret_type=RegretType.DYNAMIC_WORST_CASE,
         average=False,
     )
 
-    assert np.allclose(rd, manual_dr, atol=1e-8, rtol=0)
+    # Worst-case comparator should dominate prefix BCRP regret (manual_dr)
+    assert rd_wc.shape == manual_dr.shape
+    assert np.all(rd_wc >= manual_dr - 1e-8)

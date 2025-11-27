@@ -84,10 +84,6 @@ class OLMARPredictor(AutoEnum):
     EWMA = "ewma"  # Exponentially Weighted Moving Average
 
 
-class OnlineMixin:
-    n_features_in_: int
-
-
 class OnlineParameterConstraintsMixin:
     _parameter_constraints: ClassVar[dict] = {
         "warm_start": ["boolean"],
@@ -105,7 +101,7 @@ class OnlineParameterConstraintsMixin:
             "array-like",
         ],
         "management_fees": [
-            Interval(Real, 0, None, closed="left"),
+            Interval(Real, 0, 1, closed="left"),
             dict,
             "array-like",
         ],

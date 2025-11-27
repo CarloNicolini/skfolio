@@ -38,8 +38,6 @@ class ProjectionConfig:
         Variance-style quadratic bound.
     previous_weights, max_turnover : array-like or float or None
         Turnover information for L1 cap.
-    solver : str or None
-        Optional cvxpy solver name.
     """
 
     lower: Any | None = 0.0
@@ -60,7 +58,7 @@ class ProjectionConfig:
     variance_bound: float | None = None
     previous_weights: Any | None = None
     max_turnover: float | None = None
-    solver: str | None = None
+    solver_params: dict[str, Any] | None = None
 
 
 class BaseProjector:
@@ -126,7 +124,7 @@ class ConvexProjector(BaseProjector):
             variance_bound=self.config.variance_bound,
             previous_weights=self.config.previous_weights,
             max_turnover=self.config.max_turnover,
-            solver=self.config.solver,
+            solver_params=self.config.solver_params,
         )
 
 
@@ -337,8 +335,7 @@ def project_convex(
     # turnover
     previous_weights: ArrayLike | None = None,
     max_turnover: float | None = None,
-    # solver
-    solver: str | None = None,
+    solver_params: dict[str, Any] | None = None,
 ) -> np.ndarray:
     r"""
     Convex projection with advanced constraints using cvxpy.
@@ -443,14 +440,14 @@ def project_convex(
         constraints.append(cp.norm1(w - w_prev) <= float(max_turnover))
 
     prob = cp.Problem(objective, constraints)
-    if solver is None:
-        try:
-            prob.solve(solver=cp.CLARABEL, verbose=False)
-        except Exception:
-            prob.solve(verbose=False)
-    else:
-        prob.solve(solver=solver, verbose=False)
+    if solver_params is None:
+        solver_params = dict(solver=cp.CLARABEL, verbose=False)
+
+    try:
+        prob.solve(**solver_params)
+    except Exception:
+        prob.solve(verbose=False)
 
     if w.value is None:
         raise RuntimeError("Convex projection failed to converge.")
-    return np.asarray(w.value, dtype=float)
+    return w.value

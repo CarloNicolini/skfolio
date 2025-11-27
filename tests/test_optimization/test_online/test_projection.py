@@ -99,3 +99,37 @@ def test_project_with_turnover_cap_against_previous():
     # L1 distance to previous must be within cap
     l1 = float(np.sum(np.abs(w - prev)))
     assert l1 <= cap + 1e-9
+
+
+def test_project_with_turnover_l1_cap_respected():
+    prev = np.array([0.4, 0.3, 0.3], dtype=float)
+    y = np.array([0.1, 0.8, 0.1], dtype=float)
+    max_turn = 0.2
+
+    w = project_with_turnover(
+        w_raw=y,
+        previous_weights=prev,
+        max_turnover=max_turn,
+        lower=0.0,
+        upper=1.0,
+        budget=1.0,
+    )
+    l1 = float(np.sum(np.abs(w - prev)))
+    assert l1 <= max_turn + 1e-12
+    assert np.isclose(np.sum(w), 1.0)
+    assert np.all((w >= -1e-12) & (w <= 1.0 + 1e-12))
+
+
+def test_project_with_turnover_zero_freezes_weights():
+    prev = np.array([0.2, 0.5, 0.3], dtype=float)
+    y = np.array([0.9, 0.05, 0.05], dtype=float)
+
+    w = project_with_turnover(
+        w_raw=y,
+        previous_weights=prev,
+        max_turnover=0.0,
+        lower=0.0,
+        upper=1.0,
+        budget=1.0,
+    )
+    assert np.allclose(w, prev)

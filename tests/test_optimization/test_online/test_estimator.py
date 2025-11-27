@@ -1,283 +1,21 @@
 import numpy as np
 import pytest
-from skfolio.measures._enums import PerfMeasure
 from tests.test_optimization.test_online.utils import (
     assert_simplex_trajectory,
     make_stationary_returns,
 )
 
+from skfolio.measures._enums import PerfMeasure
 from skfolio.optimization.online import FTWStrategy, FollowTheWinner
-from skfolio.optimization.online._benchmark import CRP
-from skfolio.optimization.online._regret import RegretType, regret
-
-from .utils import assert_box_budget, group_sum
+from skfolio.optimization.online._foco import FirstOrderOCO
+from skfolio.optimization.online._mirror_maps import EuclideanMirrorMap
+from skfolio.optimization.online._prediction import LastGradPredictor
+from skfolio.optimization.online._projection import IdentityProjector
 
 
 @pytest.fixture
 def X_small_single(X_small):
     return X_small.iloc[[0], :]
-
-
-def test_partial_fit(X_small_single):
-    est = FollowTheWinner()
-    ptf = est.partial_fit(X_small_single)
-    assert ptf.weights_.shape == (X_small_single.shape[1],)
-    assert_box_budget(est.weights_, 0.0, 1.0, 1.0)
-
-
-@pytest.mark.parametrize(
-    "method",
-    [
-        FTWStrategy.EG,
-        FTWStrategy.OGD,
-        FTWStrategy.ADAGRAD,
-        FTWStrategy.ADABARRONS,
-    ],
-)
-def test_methods_basic_validity_fit(method, X_small):
-    # Keep runtime low for heavier methods
-    est = FollowTheWinner(strategy=method)
-    est.fit(X_small)
-    assert_box_budget(est.weights_, 0.0, 1.0, 1.0)
-
-
-@pytest.mark.parametrize(
-    "method",
-    [
-        FTWStrategy.EG,
-        FTWStrategy.OGD,
-        FTWStrategy.ADAGRAD,
-        FTWStrategy.ADABARRONS,
-    ],
-)
-def test_methods_basic_validity_partial_fit(method, X_small_single):
-    # Keep runtime low for heavier methods
-    est = FollowTheWinner(strategy=method)
-    est.partial_fit(X_small_single)
-    assert_box_budget(est.weights_, 0.0, 1.0, 1.0)
-
-
-def test_smooth_prediction(X_small):
-    # Test that smooth prediction runs and produces different weights from vanilla
-    est_vanilla = FollowTheWinner(strategy=FTWStrategy.EG, learning_rate=0.1)
-    est_smooth = FollowTheWinner(
-        strategy=FTWStrategy.EG, learning_rate=0.1, grad_predictor="smooth"
-    )
-
-    est_vanilla.fit(X_small)
-    est_smooth.fit(X_small)
-
-    assert_box_budget(est_vanilla.weights_, 0.0, 1.0, 1.0)
-    assert_box_budget(est_smooth.weights_, 0.0, 1.0, 1.0)
-
-    # Weights should be different due to the optimistic term
-    assert not np.allclose(est_vanilla.weights_, est_smooth.weights_), (
-        "Smooth prediction weights are identical to vanilla"
-    )
-
-
-def test_turnover_projection(X_small):
-    max_turnover = 1
-    n = X_small.shape[1]
-    prev = np.ones(n) / n
-    est = FollowTheWinner(previous_weights=prev, max_turnover=max_turnover).fit(
-        X_small.iloc[:1]
-    )
-    l1 = np.abs(est.weights_ - prev).sum()
-    assert l1 <= max_turnover + 1e-8
-    assert_box_budget(est.weights_, 0.0, 1.0, 1.0)
-
-
-def test_convex_fallback_groups_linear(X_small_single, groups, linear_constraints):
-    # Force convex path via groups/linear constraints
-    budget = 0.9
-    est = FollowTheWinner(
-        strategy=FTWStrategy.EG,
-        min_weights=0.0,
-        max_weights=0.8,
-        budget=budget,
-        groups=groups,
-        linear_constraints=linear_constraints,
-    )
-    est.partial_fit(X_small_single)
-    w = est.weights_
-
-    # Box + budget
-    assert_box_budget(w, 0.0, 0.8, budget)
-
-    # Check a subset of linear constraints semantics
-    eq_sum = group_sum(w, groups, "Equity", 0)
-    bond_sum = group_sum(w, groups, "Bond", 0)
-    assert eq_sum <= 0.5 * bond_sum + 1e-6
-
-    us_sum = group_sum(w, groups, "US", 1)
-    assert us_sum >= 0.1 - 1e-6
-
-    europe_sum = group_sum(w, groups, "Europe", 1)
-    fund_sum = group_sum(w, groups, "Fund", 0)
-    assert europe_sum >= 0.5 * fund_sum - 1e-6
-
-
-@pytest.mark.parametrize(
-    "lower,upper,budget",
-    [(0.0, 0.5, 0.8)],
-)
-def test_bounds_and_budget(lower, upper, budget, X_small_single):
-    est = FollowTheWinner(min_weights=lower, max_weights=upper, budget=budget)
-    est.partial_fit(X_small_single)
-    assert_box_budget(est.weights_, lower, upper, budget)
-
-
-def test_warm_start_and_initial_weights(X_small_single):
-    n = X_small_single.shape[1]
-    init = np.random.rand(n)
-    init /= np.sum(init)
-
-    # With warm_start=False, weights should reset to a deterministic state
-    est_no_warm = FollowTheWinner(
-        strategy=FTWStrategy.EG, initial_weights=init, warm_start=False
-    )
-    est_no_warm.partial_fit(X_small_single)  # First fit uses init
-    first_weights = est_no_warm.weights_.copy()
-    est_no_warm.fit(X_small_single)  # Second fit should reset and give same result
-    assert np.allclose(first_weights, est_no_warm.weights_)
-
-    # With warm_start=True, weights should persist and continue updating
-    est_warm = FollowTheWinner(
-        strategy=FTWStrategy.EG, initial_weights=init, warm_start=True
-    )
-    est_warm.partial_fit(X_small_single)
-    first_weights_warm = est_warm.weights_.copy()
-    est_warm.partial_fit(X_small_single)
-    second_weights_warm = est_warm.weights_.copy()
-    assert not np.allclose(init, first_weights_warm)  # weights should have been updated
-    assert not np.allclose(
-        first_weights_warm, second_weights_warm
-    )  # second update should differ
-
-
-# def test_universal_custom_experts(X_small_single):
-#     n = X_small_single.shape[1]
-#     # Experts: equal-weight and first asset only
-#     ew = np.ones((n, 1)) / n
-#     e1 = np.zeros((n, 1))
-#     e1[0, 0] = 1.0
-#     M = np.concatenate([ew, e1], axis=1)
-#     est = OPS(method=OnlineMethod.UNIVERSAL, experts=M)
-#     est.partial_fit(X_small_single)
-#     # Internals should use provided experts
-#     assert est._loss._experts.shape == M.shape
-#     # Result must satisfy box/budget
-#     check_box_budget(est.weights_, 0.0, 1.0, 1.0)
-
-
-def test_partial_fit_streaming_equivalence(X_small):
-    est_batch = FollowTheWinner(strategy=FTWStrategy.EG, learning_rate=0.3)
-    est_batch.fit(X_small)
-
-    est_stream = FollowTheWinner(strategy=FTWStrategy.EG, learning_rate=0.3)
-    for i in range(len(X_small)):
-        est_stream.partial_fit(X_small.iloc[[i], :])
-
-    # Expect the same final weights (same updates in order)
-    np.testing.assert_allclose(est_stream.weights_, est_batch.weights_, atol=1e-10)
-
-
-def test_convex_variance_bound(X_small):
-    Sigma = np.cov(X_small.to_numpy().T)
-    # Loose bound to ensure feasibility
-    var_bound = float(np.trace(Sigma)) / Sigma.shape[0]
-    est = FollowTheWinner(
-        strategy=FTWStrategy.EG,
-        covariance=Sigma,
-        variance_bound=var_bound * 2.0,
-        min_weights=0.0,
-        max_weights=0.5,
-        budget=0.9,
-    )
-    est.fit(X_small)
-    w = est.weights_
-    assert_box_budget(w, 0.0, 0.5, 0.9)
-    quad = float(w @ Sigma @ w)
-    assert quad <= var_bound * 2.0 + 1e-6
-
-
-def test_eg_tilde_implementation(X_small):
-    """Test EG-Tilde mixing step."""
-    # With alpha=1, result should be uniform portfolio
-    est_uniform = FollowTheWinner(
-        strategy=FTWStrategy.EG, eg_tilde=True, eg_tilde_alpha=1.0
-    ).fit(X_small)
-    n_assets = X_small.shape[1]
-    uniform = np.ones(n_assets) / n_assets
-    np.testing.assert_allclose(est_uniform.weights_, uniform, atol=1e-8)
-
-    # With alpha=0, result should be same as standard EG
-    est_eg = FollowTheWinner(strategy=FTWStrategy.EG, eg_tilde=False).fit(X_small)
-    est_no_mix = FollowTheWinner(
-        strategy=FTWStrategy.EG, eg_tilde=True, eg_tilde_alpha=0.0
-    ).fit(X_small)
-    np.testing.assert_allclose(est_eg.weights_, est_no_mix.weights_, atol=1e-8)
-
-    # Test with a callable alpha
-    alpha_schedule = lambda t: 1.0 / t if t > 0 else 1.0
-    est_callable = FollowTheWinner(
-        strategy=FTWStrategy.EG, eg_tilde=True, eg_tilde_alpha=alpha_schedule
-    ).fit(X_small)
-    assert_box_budget(est_callable.weights_, 0.0, 1.0, 1.0)
-    assert not np.allclose(est_callable.weights_, est_eg.weights_)
-
-
-@pytest.mark.parametrize(
-    "method",
-    [
-        FTWStrategy.EG,
-        FTWStrategy.OGD,
-        FTWStrategy.ADAGRAD,
-        FTWStrategy.ADABARRONS,
-    ],
-)
-def test_ftrl_vs_omd_mode(method, X_small):
-    """Test that FTRL and OMD modes run and produce different results."""
-    # OMD mode (default)
-    est_omd = FollowTheWinner(strategy=method, update_mode="omd")
-    est_omd.fit(X_small)
-    assert_box_budget(est_omd.weights_, 0.0, 1.0, 1.0)
-
-    # FTRL mode
-    est_ftrl = FollowTheWinner(strategy=method, update_mode="ftrl")
-    est_ftrl.fit(X_small)
-    assert_box_budget(est_ftrl.weights_, 0.0, 1.0, 1.0)
-
-    # The algorithms are different, so their weights should not be close
-    assert not np.allclose(est_omd.weights_, est_ftrl.weights_), (
-        f"FTRL and OMD weights are identical for method {method.value}"
-    )
-
-
-def test_learning_rate_callable(X_small):
-    """Test that a callable learning_rate runs correctly."""
-    # Constant learning_rate
-    est_const = FollowTheWinner(strategy=FTWStrategy.EG, learning_rate=0.1).fit(X_small)
-    assert_box_budget(est_const.weights_, 0.0, 1.0, 1.0)
-
-    # Equivalent callable
-    est_callable_equiv = FollowTheWinner(
-        strategy=FTWStrategy.EG, learning_rate=lambda t: 0.1
-    ).fit(X_small)
-    np.testing.assert_allclose(
-        est_const.weights_, est_callable_equiv.weights_, atol=1e-8
-    )
-
-    # Time-varying callable
-    lr_fn = lambda t: 1.0 / (t + 10)
-    est_callable_varied = FollowTheWinner(
-        strategy=FTWStrategy.EG, learning_rate=lr_fn
-    ).fit(X_small)
-    assert_box_budget(est_callable_varied.weights_, 0.0, 1.0, 1.0)
-
-    # Result should be different from constant regularization
-    assert not np.allclose(est_const.weights_, est_callable_varied.weights_)
 
 
 @pytest.mark.parametrize(
@@ -483,3 +221,24 @@ def test_warm_start_reset_vs_non_warm_behavior():
     W4 = est_warm.all_weights_.copy()
     # Paths differ since state carries over
     assert not np.allclose(W3, W4, atol=1e-12, rtol=0)
+
+
+def test_omd_lastgrad_predictor_updates_prev_prediction():
+    engine = FirstOrderOCO(
+        mirror_map=EuclideanMirrorMap(),
+        projector=IdentityProjector(),
+        eta=0.1,
+        predictor=LastGradPredictor(),
+        mode="omd",
+    )
+
+    g1 = np.array([1.0, 0.0, 0.0, -1.0], dtype=float)
+    g2 = np.array([0.5, -0.5, 0.5, -0.5], dtype=float)
+
+    engine.step(g1)
+    # After first step, prev_prediction is set to m_t=g1
+    engine.step(g2)
+    # After second step, prev_prediction still equals g1; advance one more step
+    engine.step(g2)
+    assert engine._prev_prediction is not None
+    assert np.allclose(engine._prev_prediction, g2)

@@ -3,7 +3,6 @@ import pytest
 
 from skfolio.optimization.online import FollowTheWinner, RegretType, regret
 from skfolio.optimization.online._mixins import FTWStrategy
-from skfolio.optimization.online._utils import net_to_relatives
 
 
 def _iid_relatives(T, n, seed=42, sigma=0.02):

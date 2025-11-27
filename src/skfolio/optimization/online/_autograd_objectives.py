@@ -1049,13 +1049,6 @@ MEASURE_PROPERTIES = {
         "sign": -1,  # maximize wealth = minimize negative log
         "notes": "1-exp-concave, O(log T) regret. Analytical gradient available.",
     },
-    # Performance measures (maximize = minimize negative)
-    PerfMeasure.MEAN: {
-        "measure_func": mean,
-        "convexity": "linear",
-        "sign": -1,  # maximize
-        "notes": "Linear, smooth. Analytical gradient available.",
-    },
     # Risk measures (minimize)
     RiskMeasure.VARIANCE: {
         "measure_func": variance,
@@ -1551,7 +1544,7 @@ class MeasureObjective(BaseObjective):
 
     Parameters
     ----------
-    measure : RiskMeasure | PerfMeasure | str | None
+    measure : RiskMeasure | PerfMeasure | None
         The measure to optimize. If None, uses log-wealth objective.
     use_autograd : bool, default=True
         Whether to use autograd for gradient computation. If False, uses analytical
@@ -1570,7 +1563,7 @@ class MeasureObjective(BaseObjective):
         Confidence level for EDaR.
     """
 
-    measure: RiskMeasure | PerfMeasure | str | None = None
+    measure: RiskMeasure | PerfMeasure | None = None
     use_autograd: bool = True
     risk_free_rate: float = 0.0
     min_acceptable_return: float = 0.0

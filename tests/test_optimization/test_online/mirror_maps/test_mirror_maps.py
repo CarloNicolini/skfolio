@@ -7,6 +7,7 @@ from skfolio.optimization.online._mirror_maps import (
     AdaptiveLogBarrierMap,
     AdaptiveMahalanobisMap,
     AdaptiveVariationMap,
+    BurgMirrorMap,
     EntropyMirrorMap,
     EuclideanMirrorMap,
     LogBarrierMap,
@@ -423,3 +424,29 @@ def test_adaptive_variation_map_invertibility_and_update():
 
     assert np.all(h2 >= h1 - 1e-15)  # monotone nondecreasing
     assert np.any(h2 > h1 + 1e-12)  # at least one coordinate increased
+
+
+def test_prod_mirror_map_interface():
+    """Test that BurgMirrorMap works correctly within FOCO engine."""
+    d = 3
+    mirror_map = BurgMirrorMap()
+    engine = FirstOrderOCO(
+        mirror_map=mirror_map,
+        projector=IdentityProjector(),
+        eta=0.1,
+        mode="omd",
+    )
+
+    # Simulate a few steps
+    grads = [
+        np.array([0.1, -0.05, 0.02]),
+        np.array([-0.03, 0.08, -0.01]),
+        np.array([0.05, -0.02, 0.03]),
+    ]
+
+    for g in grads:
+        w = engine.step(g)
+        # Verify valid weights
+        assert np.all(w >= 0)
+        assert np.isclose(np.sum(w), 1.0, atol=1e-10)
+        assert np.all(np.isfinite(w))

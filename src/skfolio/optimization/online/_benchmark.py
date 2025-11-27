@@ -15,26 +15,10 @@ from skfolio.measures import PerfMeasure, RiskMeasure
 from skfolio.optimization._base import BaseOptimization
 from skfolio.optimization.convex._base import ObjectiveFunction
 from skfolio.optimization.convex._mean_risk import MeanRisk
-from skfolio.optimization.online._mixins import OnlineMixin
 from skfolio.optimization.online._utils import net_to_relatives
 
 
-class _OnceFittable:
-    """Mixin ensuring one-shot fitting semantics.
-
-    Subsequent calls to fit/partial_fit return immediately without modifying state.
-    """
-
-    _finalized: bool
-
-    def _mark_finalized(self) -> None:
-        self._finalized = True
-
-    def _is_finalized(self) -> bool:
-        return getattr(self, "_finalized", False)
-
-
-class CRP(BaseOptimization, _OnceFittable):
+class CRP(BaseOptimization):
     """Constant Rebalanced Portfolio (CRP).
 
     Keeps a fixed portfolio w and rebalances to it every period.
@@ -66,7 +50,7 @@ class CRP(BaseOptimization, _OnceFittable):
 
     def __init__(
         self,
-        weights: npt.ArrayLike | None = None,
+        weights: npt.ArrayLike | None,
         portfolio_params: dict | None = None,
     ) -> None:
         super().__init__(portfolio_params=portfolio_params)
@@ -129,10 +113,13 @@ class CRP(BaseOptimization, _OnceFittable):
 
 # utility class for UCRP
 class UCRP(CRP):
-    pass
+    def __init__(
+        self, weights: npt.ArrayLike | None = None, portfolio_params: dict | None = None
+    ) -> None:
+        super().__init__(weights, portfolio_params)
 
 
-class BestStock(BaseOptimization, _OnceFittable):
+class BestStock(BaseOptimization):
     """Best Stock (ex-post).
 
     Invests all capital in the single asset with highest cumulative log-return.
@@ -210,7 +197,7 @@ class BestStock(BaseOptimization, _OnceFittable):
         return self
 
 
-class BCRP(MeanRisk, OnlineMixin):
+class BCRP(MeanRisk):
     """Best Constant Rebalanced Portfolio (BCRP) in hindsight.
 
     Optimizes portfolio weights on historical data using any convex objective:
@@ -368,8 +355,10 @@ class BCRP(MeanRisk, OnlineMixin):
     def __init__(
         self,
         objective_measure: RiskMeasure | PerfMeasure = PerfMeasure.LOG_WEALTH,
+        *,
         objective_function: ObjectiveFunction = ObjectiveFunction.MAXIMIZE_RETURN,
         risk_aversion: float = 1.0,
+        initial_wealth: float | npt.ArrayLike | None = None,
         l2_coef: float = 0.0,
         transaction_costs: skt.MultiInput = 0.0,
         management_fees: skt.MultiInput = 0.0,
@@ -402,12 +391,12 @@ class BCRP(MeanRisk, OnlineMixin):
         # Determine configuration based on objective_measure
         if objective_measure == PerfMeasure.LOG_WEALTH:
             # Log-wealth maximization: override expected return with log-sum
-            risk_measure = RiskMeasure.VARIANCE  # Placeholder, not used
+            risk_measure = RiskMeasure.VARIANCE
             obj_func = ObjectiveFunction.MAXIMIZE_RETURN
             overwrite_expected_return = BCRP._log_wealth_expr
         else:
             # Standard risk measure optimization
-            if not isinstance(objective_measure, RiskMeasure):
+            if not isinstance(objective_measure, RiskMeasure | PerfMeasure):
                 raise ValueError(
                     f"objective_measure must be RiskMeasure or PerfMeasure.LOG_WEALTH, "
                     f"got {type(objective_measure).__name__}"
@@ -448,6 +437,7 @@ class BCRP(MeanRisk, OnlineMixin):
             min_acceptable_return=min_acceptable_return,
             risk_free_rate=risk_free_rate,
         )
+        self.initial_wealth = initial_wealth
         self.max_turnover = max_turnover
         self.objective_measure = objective_measure
 
@@ -480,7 +470,7 @@ class BCRP(MeanRisk, OnlineMixin):
         T = relatives.shape[0]
 
         # Initialize wealth tracking
-        self.wealth_ = 1.0
+        self.wealth_ = self.initial_wealth or 1.0
         wealth_history = [self.wealth_]
         weight_history = []
 

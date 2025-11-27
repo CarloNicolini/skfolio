@@ -14,7 +14,7 @@ from scipy.stats import norm  # mypy: ignore
 
 from skfolio.optimization.online import _cwmr
 from skfolio.optimization.online._autograd_objectives import BaseObjective
-from skfolio.optimization.online._ftrl import FirstOrderOCO
+from skfolio.optimization.online._foco import FirstOrderOCO
 from skfolio.optimization.online._mirror_maps import EuclideanMirrorMap
 from skfolio.optimization.online._mixins import PAMRVariant, UpdateMode
 from skfolio.optimization.online._prediction import BaseReversionPredictor
@@ -66,6 +66,7 @@ class PAMRStrategy(BaseStrategy):
         )
         self.pamr_C = pamr_C
         self.transaction_costs_arr = transaction_costs_arr
+        self._turnover_penalty_disabled_warned = False
 
     def reset(self, d: int) -> None:
         pass  # PAMR has no state
@@ -121,19 +122,35 @@ class PAMRStrategy(BaseStrategy):
             getattr(self, "penalize_turnover", False)
             and self.transaction_costs_arr is not None
         ):
-            prev = projector.config.previous_weights
-            if prev is not None:
-                prev_arr = np.asarray(prev, dtype=float)
-                if prev_arr.shape == trade_w.shape:
-                    rel = x_t
-                    denom = float(np.dot(prev_arr, rel))
-                    if denom <= 0:
-                        denom = 1e-16
-                    prev_drifted = (prev_arr * rel) / denom
-                    delta = trade_w - prev_drifted
-                    tc_grad = self.transaction_costs_arr * np.sign(delta)
-                    c = c + tc_grad
-                    c = c - np.mean(c)
+            # Avoid double counting: if costs are active in wealth, skip gradient penalty
+            tc = self.transaction_costs_arr
+            costs_active = bool(np.isscalar(tc) and float(tc) > 0.0) or (
+                (not np.isscalar(tc))
+                and bool(np.any(np.asarray(tc, dtype=float) > 0.0))
+            )
+            if costs_active:
+                if not self._turnover_penalty_disabled_warned:
+                    warnings.warn(
+                        "penalize_turnover is enabled but transaction_costs are nonzero; "
+                        "disabling gradient turnover penalty to avoid double counting costs.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    self._turnover_penalty_disabled_warned = True
+            else:
+                prev = projector.config.previous_weights
+                if prev is not None:
+                    prev_arr = np.asarray(prev, dtype=float)
+                    if prev_arr.shape == trade_w.shape:
+                        rel = x_t
+                        denom = float(np.dot(prev_arr, rel))
+                        if denom <= 0:
+                            denom = 1e-16
+                        prev_drifted = (prev_arr * rel) / denom
+                        delta = trade_w - prev_drifted
+                        tc_grad = self.transaction_costs_arr * np.sign(delta)
+                        c = c + tc_grad
+                        c = c - np.mean(c)
 
         c_norm_sq = float(np.dot(c, c))
 
@@ -194,17 +211,32 @@ class PAMRStrategy(BaseStrategy):
             getattr(self, "penalize_turnover", False)
             and self.transaction_costs_arr is not None
         ):
-            prev = projector.config.previous_weights
-            if prev is not None:
-                prev_arr = np.asarray(prev, dtype=float)
-                if prev_arr.shape == trade_w.shape:
-                    rel = x_t
-                    denom = float(np.dot(prev_arr, rel))
-                    if denom <= 0:
-                        denom = 1e-16
-                    prev_drifted = (prev_arr * rel) / denom
-                    delta = trade_w - prev_drifted
-                    g += self.transaction_costs_arr * np.sign(delta)
+            tc = self.transaction_costs_arr
+            costs_active = bool(np.isscalar(tc) and float(tc) > 0.0) or (
+                (not np.isscalar(tc))
+                and bool(np.any(np.asarray(tc, dtype=float) > 0.0))
+            )
+            if costs_active:
+                if not self._turnover_penalty_disabled_warned:
+                    warnings.warn(
+                        "penalize_turnover is enabled but transaction_costs are nonzero; "
+                        "disabling gradient turnover penalty to avoid double counting costs.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    self._turnover_penalty_disabled_warned = True
+            else:
+                prev = projector.config.previous_weights
+                if prev is not None:
+                    prev_arr = np.asarray(prev, dtype=float)
+                    if prev_arr.shape == trade_w.shape:
+                        rel = x_t
+                        denom = float(np.dot(prev_arr, rel))
+                        if denom <= 0:
+                            denom = 1e-16
+                        prev_drifted = (prev_arr * rel) / denom
+                        delta = trade_w - prev_drifted
+                        g += self.transaction_costs_arr * np.sign(delta)
 
         projector.config.previous_weights = trade_w
         return self.engine.step(g)
@@ -349,6 +381,7 @@ class OLMARStrategy(BaseStrategy):
         self.olmar_order = olmar_order
         self.transaction_costs_arr = transaction_costs_arr
         self._t = 0
+        self._turnover_penalty_disabled_warned = False
 
     def reset(self, d: int) -> None:
         self.predictor.reset(d)
@@ -410,19 +443,34 @@ class OLMARStrategy(BaseStrategy):
             getattr(self, "penalize_turnover", False)
             and self.transaction_costs_arr is not None
         ):
-            prev = projector.config.previous_weights
-            if prev is not None:
-                prev_arr = np.asarray(prev, dtype=float)
-                if prev_arr.shape == trade_w.shape:
-                    rel = phi_eff
-                    denom = float(np.dot(prev_arr, rel))
-                    if denom <= 0:
-                        denom = 1e-16
-                    prev_drifted = (prev_arr * rel) / denom
-                    delta = trade_w - prev_drifted
-                    tc_grad = self.transaction_costs_arr * np.sign(delta)
-                    c = c + tc_grad
-                    c = c - np.mean(c)
+            tc = self.transaction_costs_arr
+            costs_active = bool(np.isscalar(tc) and float(tc) > 0.0) or (
+                (not np.isscalar(tc))
+                and bool(np.any(np.asarray(tc, dtype=float) > 0.0))
+            )
+            if costs_active:
+                if not self._turnover_penalty_disabled_warned:
+                    warnings.warn(
+                        "penalize_turnover is enabled but transaction_costs are nonzero; "
+                        "disabling gradient turnover penalty to avoid double counting costs.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    self._turnover_penalty_disabled_warned = True
+            else:
+                prev = projector.config.previous_weights
+                if prev is not None:
+                    prev_arr = np.asarray(prev, dtype=float)
+                    if prev_arr.shape == trade_w.shape:
+                        rel = phi_eff
+                        denom = float(np.dot(prev_arr, rel))
+                        if denom <= 0:
+                            denom = 1e-16
+                        prev_drifted = (prev_arr * rel) / denom
+                        delta = trade_w - prev_drifted
+                        tc_grad = self.transaction_costs_arr * np.sign(delta)
+                        c = c + tc_grad
+                        c = c - np.mean(c)
 
         c_norm_sq = float(np.dot(c, c))
         if c_norm_sq <= 1e-16:
@@ -453,17 +501,32 @@ class OLMARStrategy(BaseStrategy):
             getattr(self, "penalize_turnover", False)
             and self.transaction_costs_arr is not None
         ):
-            prev = projector.config.previous_weights
-            if prev is not None:
-                prev_arr = np.asarray(prev, dtype=float)
-                if prev_arr.shape == trade_w.shape:
-                    rel = phi_eff
-                    denom = float(np.dot(prev_arr, rel))
-                    if denom <= 0:
-                        denom = 1e-16
-                    prev_drifted = (prev_arr * rel) / denom
-                    delta = trade_w - prev_drifted
-                    g += self.transaction_costs_arr * np.sign(delta)
+            tc = self.transaction_costs_arr
+            costs_active = bool(np.isscalar(tc) and float(tc) > 0.0) or (
+                (not np.isscalar(tc))
+                and bool(np.any(np.asarray(tc, dtype=float) > 0.0))
+            )
+            if costs_active:
+                if not self._turnover_penalty_disabled_warned:
+                    warnings.warn(
+                        "penalize_turnover is enabled but transaction_costs are nonzero; "
+                        "disabling gradient turnover penalty to avoid double counting costs.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    self._turnover_penalty_disabled_warned = True
+            else:
+                prev = projector.config.previous_weights
+                if prev is not None:
+                    prev_arr = np.asarray(prev, dtype=float)
+                    if prev_arr.shape == trade_w.shape:
+                        rel = phi_eff
+                        denom = float(np.dot(prev_arr, rel))
+                        if denom <= 0:
+                            denom = 1e-16
+                        prev_drifted = (prev_arr * rel) / denom
+                        delta = trade_w - prev_drifted
+                        g += self.transaction_costs_arr * np.sign(delta)
 
         projector.config.previous_weights = trade_w
         return self.engine.step(g)

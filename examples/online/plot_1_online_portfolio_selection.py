@@ -81,7 +81,8 @@ population.append(
     ).fit_predict(X)
 )
 
-# Here we create a Population of the three portfolios and plot the cumulative returns. To better show the performance of the strategies, we use a log scale and set the compounded parameter to True since typically in online portfolio selection, the returns are compounded (the objective function is cumulative wealth maximization).
+# Here we create a Population of the three portfolios and plot the cumulative returns.
+# To better show the performance of the strategies, we use a log scale and set the compounded parameter to True since typically in online portfolio selection, the returns are compounded (the objective function is cumulative wealth maximization).
 population = Population(population)
 population.set_portfolio_params(compounded=True)
 fig = population.plot_cumulative_returns(log_scale=True)

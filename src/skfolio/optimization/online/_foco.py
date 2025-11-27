@@ -1,4 +1,4 @@
-"""First-order Follow The Regularized Leader (FTRL) engine."""
+"""First-order Online Convex Optimization engine."""
 
 # Copyright (c) 2025
 # Author: Carlo Nicolini <nicolini.carlo@gmail.com>
@@ -66,8 +66,10 @@ class FirstOrderOCO:
                    through cumulative gradient tracking
 
     See Orabona (2020+), "A Modern Introduction to Online Learning", Chapter 6,
-    Section 6.9 for detailed analysis. Also see Joulani et al. (2017) "A modular
-    analysis of adaptive (non-)convex optimization: Optimism, composite objectives, and variational bounds" for the original algorithm.
+    Section 6.9 for detailed analysis.
+    See also Joulani et al. (2017) "A modular analysis of adaptive (non-)convex
+    optimization: Optimism, composite objectives, and variational bounds"
+    for the original algorithm.
 
     Learning Rate Schedule
     ----------------------

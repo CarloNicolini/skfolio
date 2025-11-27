@@ -12,7 +12,6 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from skfolio.optimization._base import BaseOptimization
-from skfolio.optimization.online._benchmark import BCRP
 from skfolio.optimization.online._mixins import RegretType as LegacyRegretType
 from skfolio.optimization.online._utils import CLIP_EPSILON, net_to_relatives
 
@@ -171,13 +170,69 @@ def _worst_case_dynamic_weights(relatives: np.ndarray) -> np.ndarray:
     return W
 
 
+def _solve_bcrp_constant(
+    relatives: np.ndarray,
+    *,
+    init: np.ndarray | None = None,
+    tol: float = 1e-9,
+    max_iter: int = 2000,
+) -> np.ndarray:
+    r"""Compute best constant rebalanced portfolio (BCRP) for log wealth."""
+    R = np.asarray(relatives, dtype=float)
+    if R.ndim != 2:
+        raise ValueError("relatives must have shape (T, n)")
+    T, n = R.shape
+    if T == 0 or n == 0:
+        return np.zeros(n, dtype=float)
+
+    if init is None:
+        w = np.full(n, 1.0 / n, dtype=float)
+    else:
+        w = np.asarray(init, dtype=float).copy()
+        if w.shape != (n,):
+            raise ValueError("init must have shape (n_assets,)")
+        w = np.maximum(w, 1e-18)
+        w /= np.sum(w)
+
+    for _ in range(max_iter):
+        denom = np.maximum(R @ w, CLIP_EPSILON)
+        grad = np.sum(R / denom[:, None], axis=0)
+        grad = np.maximum(grad, 1e-18)
+        grad /= np.sum(grad)
+
+        w_next = w * grad
+        w_next = np.maximum(w_next, 1e-18)
+        w_next /= np.sum(w_next)
+
+        if np.linalg.norm(w_next - w, 1) <= tol:
+            w = w_next
+            break
+        w = w_next
+
+    return w
+
+
+def _prefix_bcrp_weights(relatives: np.ndarray) -> np.ndarray:
+    r"""Compute BCRP weights on each prefix of ``relatives`` for legacy dynamic regret."""
+    R = np.asarray(relatives, dtype=float)
+    if R.ndim != 2:
+        raise ValueError("relatives must have shape (T, n)")
+    T, n = R.shape
+    weights = np.zeros((T, n), dtype=float)
+    init = None
+    for t in range(1, T + 1):
+        init = _solve_bcrp_constant(R[:t, :], init=init)
+        weights[t - 1] = init
+    return weights
+
+
 def _universal_dynamic_weights(
     relatives: np.ndarray,
     *,
     path_length: float | None = None,
     path_penalty: float | None = None,
     norm: str = "l1",
-    solver: str | None = "CLARABEL",
+    solver: str = "CLARABEL",
     solver_params: dict | None = None,
 ) -> np.ndarray:
     r"""
@@ -193,7 +248,11 @@ def _universal_dynamic_weights(
 
     This implements the canonical universal dynamic regret comparator used in OCO,
     where non-stationarity is captured by the path-length PT, a key regularity in
-    dynamic regret bounds for OGD and SWORD families 【dynamic-regret.pdf】.
+    dynamic regret bounds for OGD and SWORD families.
+
+    See Also
+    --------
+    Zhao, Peng et al, "Adaptivity and Non-stationarity: Problem-dependent Dynamic Regret for Online Convex Optimization", JMLR 25 (2024), Eq. 2
     """
     R = np.asarray(relatives, dtype=float)
     if R.ndim != 2:
@@ -214,14 +273,7 @@ def _universal_dynamic_weights(
 
     # Special case: path_length == 0 -> STATIC comparator (one constant u) = BCRP
     if path_length is not None and path_length <= 1e-18:
-        # Equivalent to maximizing sum_t log(R[t]^T u) with u constant
-        # Solve with a single vector u via BCRP on the whole sample
-        # But here we return constant weights across time (project BCRP to all rows).
-        # We reuse BCRP for exactness and robustness.
-        # Note: fits on net returns, so we convert back to net here
-        X_net = R - 1.0
-        bcrp = BCRP().fit(X_net)
-        w = np.asarray(bcrp.weights_, dtype=float)
+        w = _solve_bcrp_constant(R)
         return np.repeat(w[None, :], T, axis=0)
 
     # Decision variable: one weight vector per t
@@ -361,23 +413,29 @@ def regret(
         rt = RegretType.DYNAMIC_LEGACY
 
     if rt == RegretType.STATIC:
-        comp = comparator if comparator is not None else BCRP()
-        comp.fit(X)
-        w_star = np.asarray(comp.weights_, dtype=float)
+        if comparator is not None:
+            comp = comparator.fit(X)
+            w_star = np.asarray(comp.weights_, dtype=float)
+        else:
+            w_star = _solve_bcrp_constant(relatives)
         comp_losses = _losses_from_weights(relatives, w_star)
 
     elif rt == RegretType.DYNAMIC_LEGACY:
-        comp = comparator if comparator is not None else BCRP()
-        if not hasattr(comp, "fit_dynamic"):
-            raise ValueError(
-                "Legacy dynamic regret requested but comparator has no fit_dynamic method"
+        if comparator is not None:
+            comp = comparator
+            if not hasattr(comp, "fit_dynamic"):
+                raise ValueError(
+                    "Legacy dynamic regret requested but comparator has no fit_dynamic method"
+                )
+            comp.fit_dynamic(X)
+            if not hasattr(comp, "all_weights_"):
+                raise RuntimeError("comparator.fit_dynamic must set all_weights_")
+            comp_losses = _losses_from_weights(
+                relatives, np.asarray(comp.all_weights_, dtype=float)
             )
-        comp.fit_dynamic(X)
-        if not hasattr(comp, "all_weights_"):
-            raise RuntimeError("comparator.fit_dynamic must set all_weights_")
-        comp_losses = _losses_from_weights(
-            relatives, np.asarray(comp.all_weights_, dtype=float)
-        )
+        else:
+            dyn_weights = _prefix_bcrp_weights(relatives)
+            comp_losses = _losses_from_weights(relatives, dyn_weights)
 
     elif rt == RegretType.DYNAMIC_WORST_CASE:
         W_wc = _worst_case_dynamic_weights(relatives)
@@ -385,13 +443,18 @@ def regret(
 
     elif rt == RegretType.DYNAMIC_UNIVERSAL:
         cfg = dynamic_config or {}
+        solver = cfg.get("solver", None)
+        if solver is None:
+            solver_params = None
+        else:
+            solver_params = cfg.get("solver_params", None)
         W_ud = _universal_dynamic_weights(
             relatives,
             path_length=cfg.get("path_length", None),
             path_penalty=cfg.get("path_penalty", None),
             norm=cfg.get("norm", "l1"),
-            solver=cfg.get("solver", "CLARABEL"),
-            solver_params=cfg.get("solver_params", None),
+            solver=solver,
+            solver_params=solver_params,
         )
         comp_losses = _losses_from_weights(relatives, W_ud)
 

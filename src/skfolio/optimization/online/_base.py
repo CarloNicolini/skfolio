@@ -16,7 +16,6 @@ from sklearn.utils.validation import _check_sample_weight, validate_data
 import skfolio.typing as skt
 from skfolio.optimization._base import BaseOptimization
 from skfolio.optimization.online._mixins import (
-    OnlineMixin,
     OnlineParameterConstraintsMixin,
 )
 from skfolio.optimization.online._projection import (
@@ -27,9 +26,7 @@ from skfolio.optimization.online._utils import net_to_relatives
 from skfolio.utils.tools import input_to_array
 
 
-class OnlinePortfolioSelection(
-    BaseOptimization, OnlineMixin, OnlineParameterConstraintsMixin
-):
+class OnlinePortfolioSelection(BaseOptimization, OnlineParameterConstraintsMixin):
     """Online Portfolio Selection (OPS) base class.
 
     This class serves as a foundation for implementing various online portfolio
@@ -252,12 +249,23 @@ class OnlinePortfolioSelection(
         if np.isscalar(self._management_fees_arr):
             if self._management_fees_arr <= 0:
                 return gross_relatives
+            if self._management_fees_arr >= 1.0:
+                warnings.warn(
+                    "management_fees >= 1.0 encountered; effective relatives may collapse.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             return gross_relatives * (1.0 - self._management_fees_arr)
 
         # Array of fees: element-wise multiplication
-        return gross_relatives * (
-            1.0 - np.asarray(self._management_fees_arr, dtype=float)
-        )
+        fees = np.asarray(self._management_fees_arr, dtype=float)
+        if np.any(fees >= 1.0):
+            warnings.warn(
+                "Some management_fees >= 1.0 encountered; effective relatives may collapse.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return gross_relatives * (1.0 - fees)
 
     def _validate_and_preprocess_partial_fit_input(
         self,
@@ -276,7 +284,7 @@ class OnlinePortfolioSelection(
         self._validate_params()
 
         # Check if this is the first call to partial_fit
-        first_call = not hasattr(self, "n_features_in_")
+        first_call = not hasattr(self, "wealth_")
 
         # Validate input data - reset=True only on first call
         X = validate_data(
@@ -294,7 +302,7 @@ class OnlinePortfolioSelection(
         if sample_weight is not None:
             sample_weight = _check_sample_weight(sample_weight, X)
             warnings.warn(
-                "sample_weight is ignored in OPS.partial_fit (online convex optimization).",
+                "sample_weight is ignored for online estimators.",
                 UserWarning,
                 stacklevel=3,
             )
@@ -334,7 +342,7 @@ class OnlinePortfolioSelection(
         X: npt.ArrayLike,
         y: npt.ArrayLike | None = None,
         **fit_params: Any,
-    ) -> "OnlinePortfolioSelection":
+    ) -> OnlinePortfolioSelection:
         """Iterate over rows and call partial_fit for each period.
 
         In OCO, ``fit`` is a convenience wrapper. It does not aggregate gradients or
@@ -383,7 +391,7 @@ class OnlinePortfolioSelection(
 
         # Store wealth history (only if wealth tracking was enabled)
         if wealth_list:
-            self.all_wealth_ = np.array(wealth_list, dtype=float)
+            self.all_wealth_ = np.array(wealth_list)
 
         return self
 
@@ -398,8 +406,11 @@ class OnlinePortfolioSelection(
         if value is None:
             return fill_value
         if np.isscalar(value):
-            return float(value)
-        return input_to_array(
+            v = float(value)
+            if name == "management_fees" and v >= 1.0:
+                raise ValueError("management_fees must be < 1.0 per period")
+            return v
+        arr = input_to_array(
             items=value,
             n_assets=n_assets,
             fill_value=fill_value,
@@ -409,3 +420,6 @@ class OnlinePortfolioSelection(
             ),
             name=name,
         )
+        if name == "management_fees" and np.any(np.asarray(arr, dtype=float) >= 1.0):
+            raise ValueError("All management_fees values must be < 1.0 per period")
+        return arr

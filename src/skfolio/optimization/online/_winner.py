@@ -3,6 +3,10 @@
 # Copyright (c) 2025
 # Author: Carlo Nicolini <nicolini.carlo@gmail.com>
 # SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
+
+import warnings
 from collections.abc import Callable
 from numbers import Real
 from typing import Any, ClassVar, Literal
@@ -15,7 +19,7 @@ import skfolio.typing as skt
 from skfolio.measures._enums import ExtraRiskMeasure, PerfMeasure, RiskMeasure
 from skfolio.optimization.online._autograd_objectives import create_objective
 from skfolio.optimization.online._base import OnlinePortfolioSelection
-from skfolio.optimization.online._ftrl import (
+from skfolio.optimization.online._foco import (
     FirstOrderOCO,
     Predictor,
     SwordMeta,
@@ -74,7 +78,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
            PMLR 76:73-90.
     """
 
-    _ftrl_engine: FirstOrderOCO
+    _foco_engine: FirstOrderOCO
     cumulative_loss_: float
 
     _parameter_constraints: ClassVar[dict] = {
@@ -106,7 +110,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
 
     def __init__(
         self,
-        strategy: FTWStrategy | str = FTWStrategy.EG,
+        strategy: FTWStrategy = FTWStrategy.EG,
         *,
         objective: RiskMeasure | ExtraRiskMeasure | PerfMeasure | None = None,
         learning_rate: float | Callable[[int], float] = "auto",
@@ -153,7 +157,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
 
         Parameters
         ----------
-        strategy : FTWStrategy | str, default=FTWStrategy.EG
+        strategy : FTWStrategy,  default=FTWStrategy.EG
             Follow-the-Winner strategy to use. Available strategies:
 
             - 'ogd': Online Gradient Descent (Euclidean geometry)
@@ -400,7 +404,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
         self.use_autograd = use_autograd
 
         # Internal state (initialized deterministically)
-        self._ftrl_engine: FirstOrderOCO | None = None
+        self._foco_engine: FirstOrderOCO | None = None
         self.cumulative_loss_: float = 0.0
 
     def _ensure_initialized(self, gross_relatives: np.ndarray) -> None:
@@ -433,7 +437,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
                 self.objective, use_autograd=self.use_autograd
             )
 
-        if self._ftrl_engine is None:
+        if self._foco_engine is None:
             mirror_map: BaseMirrorMap | None = None
             predictor: Predictor | None = None
 
@@ -521,7 +525,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
                         experts.append(eg_engine)
                     # specific case treating SwordMeta differently
                     # we initialize it here because it needs to be initialized with the experts (only for SwordMeta)
-                    self._ftrl_engine = SwordMeta(
+                    self._foco_engine = SwordMeta(
                         experts=experts,
                         projector=self._projector,
                         eta_meta=effective_learning_rate,  # tie meta-eta to learning_rate
@@ -529,13 +533,13 @@ class FollowTheWinner(OnlinePortfolioSelection):
                 case _:
                     raise ValueError(f"Unknown strategy provided {self.strategy}")
 
-            # Finally initialize the FTRL engine to be used in the fit method
-            if self._ftrl_engine is None:
+            # Finally initialize the FOCO engine to be used in the fit method
+            if self._foco_engine is None:
                 skip_auto_update = self.strategy in (
                     FTWStrategy.ADABARRONS,
                     "adabarrons",
                 )
-                self._ftrl_engine = FirstOrderOCO(
+                self._foco_engine = FirstOrderOCO(
                     mirror_map=mirror_map,
                     projector=self._projector,
                     eta=effective_learning_rate,
@@ -552,9 +556,9 @@ class FollowTheWinner(OnlinePortfolioSelection):
             # Initialize wealth tracking
             if not self._wealth_initialized:
                 self._initialize_wealth(num_assets)
-            if self._ftrl_engine is not None and hasattr(self._ftrl_engine, "_x_t"):
-                if self._ftrl_engine._x_t is None:
-                    self._ftrl_engine._x_t = self.weights_.copy()
+            if self._foco_engine is not None and hasattr(self._foco_engine, "_x_t"):
+                if self._foco_engine._x_t is None:
+                    self._foco_engine._x_t = self.weights_.copy()
 
         # Mark overall init complete
         self._is_initialized = True
@@ -581,25 +585,51 @@ class FollowTheWinner(OnlinePortfolioSelection):
         # Compute gradient using objective function (log-wealth by default, or custom risk/perf measure)
         gradient = self._objective_fn.grad(self.weights_, effective_net_returns)
 
-        # Optional: add L1 turnover subgradient (gated by flag penalize_turnover)
+        # Optional: add L1 turnover subgradient (gated by flag penalize_turnover).
+        # Avoid double-counting: if transaction_costs are applied in wealth accounting,
+        # skip gradient-side penalty and warn once.
         if (
             getattr(self, "penalize_turnover", False)
-            and self.transaction_costs
             and self.previous_weights is not None
         ):
+            tc = getattr(self, "_transaction_costs_arr", None)
             prev = np.asarray(self.previous_weights, dtype=float)
             if prev.shape == self.weights_.shape:
-                # Drift-aware delta: w_t - \tilde w_{t-1}
-                denom = float(np.dot(prev, effective_relatives))
-                if denom <= 0:
-                    denom = 1e-16
-                prev_drifted = (prev * effective_relatives) / denom
-                delta = self.weights_ - prev_drifted
-                gradient += self._transaction_costs_arr * np.sign(delta)
+                costs_active = False
+                if tc is not None:
+                    if np.isscalar(tc):
+                        costs_active = bool(float(tc) > 0.0)
+                    else:
+                        costs_active = bool(np.any(np.asarray(tc, dtype=float) > 0.0))
+
+                if costs_active:
+                    # Warn once and skip penalty to avoid double counting
+                    if (
+                        not hasattr(self, "_turnover_penalty_disabled_warned")
+                        or not self._turnover_penalty_disabled_warned
+                    ):
+                        warnings.warn(
+                            "penalize_turnover is enabled but transaction_costs are nonzero; "
+                            "disabling gradient turnover penalty to avoid double counting costs.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                        self._turnover_penalty_disabled_warned = True
+                else:
+                    # Apply subgradient penalty when no wealth-side costs are configured
+                    denom = float(np.dot(prev, effective_relatives))
+                    if denom <= 0:
+                        denom = 1e-16
+                    prev_drifted = (prev * effective_relatives) / denom
+                    delta = self.weights_ - prev_drifted
+                    if np.isscalar(tc):
+                        gradient += float(tc) * np.sign(delta)
+                    elif tc is not None:
+                        gradient += np.asarray(tc, dtype=float) * np.sign(delta)
 
         return gradient
 
-    def _execute_ftrl_step(self, gradient: np.ndarray) -> np.ndarray:
+    def _execute_foco_step(self, gradient: np.ndarray) -> np.ndarray:
         """Execute the FTRL optimization step.
 
         Parameters
@@ -612,19 +642,19 @@ class FollowTheWinner(OnlinePortfolioSelection):
         np.ndarray
             New portfolio weights from FTRL step.
         """
-        if self._ftrl_engine:
-            w_ftrl = self._ftrl_engine.step(gradient)
+        if self._foco_engine:
+            w_foco = self._foco_engine.step(gradient)
         else:
             raise RuntimeError("FTRL Engine not initialized")
-        return w_ftrl
+        return w_foco
 
-    def _apply_weights_mixing(self, w_ftrl: np.ndarray) -> np.ndarray:
+    def _apply_weights_mixing(self, w_foco: np.ndarray) -> np.ndarray:
         """Apply weights mixing (only for EG-tilde mixing).
 
         Parameters
         ----------
-        w_ftrl : np.ndarray
-            Weights from FTRL step.
+        w_foco : np.ndarray
+            Weights from FOCO step.
 
         Returns
         -------
@@ -632,19 +662,19 @@ class FollowTheWinner(OnlinePortfolioSelection):
             Final weights.
         """
         if not (self.eg_tilde and self.strategy == FTWStrategy.EG):
-            return w_ftrl
+            return w_foco
 
         alpha_t = (
-            self.eg_tilde_alpha(self._ftrl_engine._t)
+            self.eg_tilde_alpha(self._foco_engine._t)
             if callable(self.eg_tilde_alpha)
             else self.eg_tilde_alpha
         )
 
         if alpha_t <= 0:
-            return w_ftrl
+            return w_foco
 
-        n = w_ftrl.shape[0]
-        mixed = (1.0 - alpha_t) * w_ftrl + alpha_t / n
+        n = w_foco.shape[0]
+        mixed = (1.0 - alpha_t) * w_foco + alpha_t / n
         return self._projector.project(mixed)
 
     def _update_adabarrons_components(
@@ -664,13 +694,13 @@ class FollowTheWinner(OnlinePortfolioSelection):
             Portfolio gradient vector.
         """
         if self.strategy == FTWStrategy.ADABARRONS and isinstance(
-            self._ftrl_engine.map, CompositeMirrorMap
+            self._foco_engine.map, CompositeMirrorMap
         ):
             # Access the components of the Ada-BARRONS mirror map:
             # [0] = AdaBarronsBarrierMap (weight-proximity adaptive)
             # [1] = EuclideanMap (static, no update needed)
             # [2] = FullQuadraticMap (gradient-based second-order)
-            components = self._ftrl_engine.map.components_
+            components = self._foco_engine.map.components_
 
             # Update barrier with weights (NOT gradients)
             components[0].update_state(weights)
@@ -700,7 +730,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
         y: npt.ArrayLike | None = None,
         sample_weight: npt.ArrayLike | None = None,
         **fit_params: Any,
-    ) -> "FollowTheWinner":
+    ) -> FollowTheWinner:
         """Perform one online update with a single period of net returns.
 
         In OCO, ``partial_fit`` is the core update and must receive exactly one
@@ -739,7 +769,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
         gradient = self._compute_portfolio_gradient(effective_relatives)
 
         # Step 5: Execute FTRL optimization step
-        w_ftrl = self._execute_ftrl_step(gradient)
+        w_ftrl = self._execute_foco_step(gradient)
 
         # Step 5.5: Store trading weights before update
         self._last_trade_weights_ = self.weights_.copy()
@@ -773,5 +803,5 @@ class FollowTheWinner(OnlinePortfolioSelection):
     def _reset_state_for_fit(self) -> None:
         """Reset internal state when warm_start=False."""
         super()._reset_state_for_fit()
-        self._ftrl_engine = None
+        self._foco_engine = None
         self.cumulative_loss_ = 0.0

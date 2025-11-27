@@ -8,12 +8,8 @@ from skfolio.optimization.online._mixins import RegretType
 from skfolio.optimization.online._regret import _running_regret, regret
 
 
-@pytest.mark.parametrize(
-    "avg_flag",
-    [False, True, "running", "final", "none"],
-)
-@pytest.mark.parametrize("regret_type", [RegretType.STATIC, RegretType.DYNAMIC])
-def test_shapes_and_finiteness(X_small, avg_flag, regret_type):
+@pytest.mark.parametrize("avg_flag", [False, True, "running", "final", "none"])
+def test_shapes_and_finiteness_static(X_small, avg_flag):
     est = FollowTheWinner(
         strategy=FTWStrategy.EG, learning_rate="auto", warm_start=False
     )
@@ -22,7 +18,25 @@ def test_shapes_and_finiteness(X_small, avg_flag, regret_type):
         X=X_small,
         comparator=BCRP(),
         average=avg_flag,
-        regret_type=regret_type,
+        regret_type=RegretType.STATIC,
+    )
+    assert isinstance(r, np.ndarray)
+    assert r.ndim == 1
+    assert r.size == X_small.shape[0]
+    assert np.all(np.isfinite(r))
+
+
+@pytest.mark.parametrize("avg_flag", [False, True, "running", "final", "none"])
+def test_shapes_and_finiteness_dynamic_universal(X_small, avg_flag):
+    est = FollowTheWinner(
+        strategy=FTWStrategy.EG, learning_rate="auto", warm_start=False
+    )
+    r = regret(
+        estimator=est,
+        X=X_small,
+        average=avg_flag,
+        regret_type=RegretType.DYNAMIC_UNIVERSAL,
+        dynamic_config={"path_length": 5.0},
     )
     assert isinstance(r, np.ndarray)
     assert r.ndim == 1
@@ -102,7 +116,7 @@ class DummyEstimator(BaseOptimization):
         super().__init__()
         self._weights_seq = np.asarray(weights_seq)
 
-    def fit(self, X):
+    def fit(self, X, y, **fit_params):
         self.all_weights_ = self._weights_seq
         self.weights_ = self._weights_seq[-1]
         return self
@@ -113,7 +127,7 @@ class DummyComparator(BaseOptimization):
         super().__init__()
         self._w = np.asarray(w_star)
 
-    def fit(self, X):
+    def fit(self, X, y, **fit_params):
         self.weights_ = self._w
         return self
 

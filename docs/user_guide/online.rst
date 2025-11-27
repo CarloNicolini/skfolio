@@ -221,10 +221,69 @@ The module provides comprehensive regret computation via :func:`regret`:
 
 **Regret Types**:
 
-- **Static**: Compare to fixed best portfolio in hindsight
-- **Dynamic**: Compare to time-varying portfolios with bounded path length (e.g., sparse portfolio swaps)
-- **Dynamic Worst-Case**: Compare to per-round optimal (most stringent, typically :math:`> 0`)
-- **Dynamic Universal**: Compare to time-varying with explicit budget on cumulative drift
+- **Static Regret**:
+  Compares the online strategy against the **Best Constant Rebalanced Portfolio (BCRP)** in hindsight.
+  This is the standard metric in OCO. A sublinear static regret :math:`O(\sqrt{T})` or :math:`O(\log T)` implies that the algorithm performs as well as the best fixed strategy in the long run.
+
+- **Dynamic Regret**:
+  Compares against a sequence of portfolios :math:`\mathbf{u}_1, \dots, \mathbf{u}_T` that can change over time.
+  Since it is impossible to compete with the optimal strategy at every step (which would require perfect foresight), dynamic regret is usually bounded in terms of the **path length** (variability) of the comparator sequence.
+
+- **Dynamic Universal Regret**:
+  This is a more robust measure that compares against all possible dynamic strategies that satisfy a certain "complexity" constraint (e.g., limited turnover).
+  Universal portfolios guarantee a certain performance level relative to *any* sequence of stock prices, often by averaging over a large class of experts.
+
+- **Dynamic Worst-Case Regret**:
+  The difference between the algorithm's return and the return of the best possible asset at *each* time step. This is typically linear in :math:`T` (unless the market is trivial), but useful for analyzing worst-case scenarios.
+
+Understanding Predictors
+------------------------
+
+For **Follow-The-Loser (FTL)** strategies like OLMAR and RMR, the choice of **predictor** is crucial. The predictor estimates the next period's relative price vector :math:`\hat{\mathbf{x}}_{t+1}` based on historical data.
+
+- **Simple Moving Average (SMA)** (``olmar_predictor="sma"``):
+  Calculates the average price relative over a fixed window.
+  
+  *   **Pros**: Simple, smooths out noise.
+  *   **Cons**: Lags behind trends. If the window is too large, it misses quick reversals.
+
+- **Exponential Weighted Moving Average (EWMA)** (``olmar_predictor="ewma"``):
+  Gives more weight to recent observations.
+  
+  *   **Pros**: Reacts faster to recent price changes than SMA.
+  *   **Cons**: More sensitive to recent noise.
+
+- **Robust Median Reversion (RMR)** (``strategy=FTLStrategy.RMR``):
+  Uses the **L1-median** (spatial median) of recent price relatives.
+  
+  *   **Pros**: Extremely robust to outliers. If a stock crashes or spikes due to an error or flash crash, the median is unaffected, whereas the mean would be skewed.
+  *   **Cons**: Computationally more expensive (requires iterative Weiszfeld's algorithm).
+
+- **Gradient Predictors** (for FTW strategies):
+  Strategies like EG and OGD can use a gradient predictor (e.g., ``grad_predictor="last"``) to anticipate the next gradient.
+  
+  *   **Idea**: If the loss function is smooth, the gradient at :math:`t` is a good guess for :math:`t+1`.
+  *   **Benefit**: Can achieve "optimistic" regret bounds that depend on the path length of gradients rather than time :math:`T`.
+
+Common Pitfalls
+---------------
+
+1.  **Overfitting Learning Rate**:
+    Tuning the ``learning_rate`` to maximize backtest performance on a specific historical period is a common mistake. Financial markets are non-stationary. A high learning rate that worked during a bull market might cause massive drawdowns in a volatile sideways market.
+    *Recommendation*: Use ``learning_rate="auto"`` or adaptive methods like AdaGrad/Ada-BARRONS which adjust their own rates.
+
+2.  **Ignoring Transaction Costs**:
+    Mean-reversion strategies (PAMR, OLMAR) often have very high turnover, trading significantly every day. Without modeling transaction costs, their theoretical returns can be astronomical but realistic returns negative.
+    *Recommendation*: Always set ``transaction_costs`` (e.g., 0.0005 for 5bps) and check ``max_turnover`` constraints.
+
+3.  **Data Quality**:
+    Online algorithms operate on **price relatives** (:math:`P_t / P_{t-1}`).
+    
+    *   **Zeros**: If a price is 0, the relative is 0 or undefined. Log-wealth becomes :math:`-\infty`. Ensure data is cleaned.
+    *   **Splits/Dividends**: Ensure data is adjusted. A 2-for-1 split looks like a 50% crash to the algorithm if unadjusted, triggering a massive "buy the dip" signal (for mean reversion) which is false.
+
+4.  **Look-Ahead Bias**:
+    Ensure that the data passed to ``partial_fit`` for time :math:`t` was actually available at time :math:`t`. The ``skfolio`` design prevents this within the estimator, but the user must ensure the input data stream is valid.
 
 Getting Started
 ================

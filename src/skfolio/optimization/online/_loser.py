@@ -20,7 +20,7 @@ from skfolio.optimization.online._autograd_objectives import (
     create_mean_reversion_objective,
 )
 from skfolio.optimization.online._base import OnlinePortfolioSelection
-from skfolio.optimization.online._ftrl import FirstOrderOCO
+from skfolio.optimization.online._foco import FirstOrderOCO
 from skfolio.optimization.online._mirror_maps import (
     BaseMirrorMap,
     EntropyMirrorMap,
@@ -74,14 +74,14 @@ class FollowTheLoser(OnlinePortfolioSelection):
 
     Parameters
     ----------
-    strategy : str | FTLStrategy
+    strategy : FTLStrategy
         Mean-reversion strategy: 'olmar', 'pamr', or 'cwmr'.
 
         - OLMAR: Online Moving Average Reversion
         - PAMR: Passive-Aggressive Mean Reversion
         - CWMR: Confidence-Weighted Mean Reversion
 
-    olmar_predictor : OLMARPredictor | str, default=OLMARPredictor.SMA
+    olmar_predictor : OLMARPredictor, default=OLMARPredictor.SMA
         OLMAR reversion predictor type. Only used with ``strategy="olmar"``.
 
         - "sma": Simple Moving Average (OLMAR-1 from Li & Hoi 2012)
@@ -108,7 +108,7 @@ class FollowTheLoser(OnlinePortfolioSelection):
         Only used with ``strategy="rmr"``. This parameter follows sklearn
         convention for iterative convergence (similar to other estimators' tol).
 
-    pamr_variant : PAMRVariant | str, default="simple"
+    pamr_variant : PAMRVariant, default="simple"
         PAMR variant. Only used with ``strategy="pamr"``.
 
         - "simple": Original PAMR (PAMR-0)
@@ -309,8 +309,8 @@ class FollowTheLoser(OnlinePortfolioSelection):
     def __init__(
         self,
         *,
-        strategy: str | FTLStrategy,
-        olmar_predictor: OLMARPredictor | str = OLMARPredictor.SMA,
+        strategy: FTLStrategy,
+        olmar_predictor: OLMARPredictor = OLMARPredictor.SMA,
         olmar_window: int = 5,
         olmar_alpha: float = 0.5,
         pamr_variant: PAMRVariant = "simple",
@@ -587,6 +587,52 @@ class FollowTheLoser(OnlinePortfolioSelection):
         # PAMR and CWMR use x_t directly
         return x_t
 
+    def _compute_drifted_weights(
+        self, trade_w: np.ndarray, effective_relatives: np.ndarray
+    ) -> np.ndarray | None:
+        r"""Compute drifted holdings after observing ``effective_relatives``."""
+        denom = float(np.dot(trade_w, effective_relatives))
+        if denom <= 0.0:
+            return None
+        return (trade_w * effective_relatives) / denom
+
+    def _apply_transaction_cost_regularization(
+        self,
+        candidate_w: np.ndarray,
+        trade_w: np.ndarray,
+        drifted_w: np.ndarray,
+    ) -> np.ndarray:
+        r"""Shrink candidate weights toward drifted holdings using soft threshold."""
+        tc = getattr(self, "_transaction_costs_arr", None)
+        if tc is None:
+            return candidate_w
+
+        if np.isscalar(tc):
+            tc_arr = np.full_like(candidate_w, float(tc), dtype=float)
+        else:
+            tc_arr = np.asarray(tc, dtype=float)
+        if tc_arr.shape != candidate_w.shape:
+            tc_arr = np.broadcast_to(tc_arr, candidate_w.shape)
+
+        if not np.any(tc_arr > 0):
+            return candidate_w
+
+        delta = candidate_w - drifted_w
+        shrunk_delta = np.sign(delta) * np.maximum(np.abs(delta) - tc_arr, 0.0)
+        adjusted = drifted_w + shrunk_delta
+
+        if self._projector is None:
+            return adjusted
+
+        original_prev = self._projector.config.previous_weights
+        self._projector.config.previous_weights = trade_w
+        try:
+            adjusted = self._projector.project(adjusted)
+        finally:
+            self._projector.config.previous_weights = original_prev
+
+        return adjusted
+
     def _execute_strategy_update(
         self, trade_w: np.ndarray, x_t: np.ndarray, phi_eff: np.ndarray
     ) -> np.ndarray:
@@ -633,10 +679,17 @@ class FollowTheLoser(OnlinePortfolioSelection):
         # Initial checking and parameters validation
         self._validate_params()
         first_call = not hasattr(self, "n_features_in_")
-        X = validate_data(self, X=X, y=y, reset=first_call, dtype=float, ensure_2d=True)
+        X = validate_data(
+            self, X=X, y=y, reset=first_call, dtype=float, ensure_2d=False
+        )
 
-        # Convert to relatives
-        x_t_gross = np.asarray(net_to_relatives(X).squeeze(), dtype=float)
+        # Convert to relatives and ensure a single period
+        X_rel = net_to_relatives(X)
+        if X_rel.shape[0] > 1:
+            raise ValueError(
+                "partial_fit expects a single period (1D or single-row 2D). Use fit for multiple rows."
+            )
+        x_t_gross = np.asarray(X_rel.squeeze(), dtype=float)
         d = int(x_t_gross.shape[0])
 
         # Initialize components
@@ -660,6 +713,19 @@ class FollowTheLoser(OnlinePortfolioSelection):
 
         # Execute strategy update
         next_w = self._execute_strategy_update(trade_w, x_t, phi)
+
+        # Apply transaction cost regularization (PA style shrink toward drifted holdings)
+        if self._transaction_costs_arr is not None and self._t >= 0:
+            drifted = self._compute_drifted_weights(trade_w, x_t)
+            if drifted is not None:
+                next_w = self._apply_transaction_cost_regularization(
+                    candidate_w=next_w,
+                    trade_w=trade_w,
+                    drifted_w=drifted,
+                )
+        else:
+            if self._projector is not None:
+                self._projector.config.previous_weights = trade_w
 
         # Update state
         self.weights_ = next_w
