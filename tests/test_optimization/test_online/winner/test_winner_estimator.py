@@ -213,12 +213,12 @@ class TestFollowTheWinnerConstraints:
         "lower,upper,budget",
         [(0.0, 0.5, 0.8)],
     )
-    def test_bounds_and_budget(lower, upper, budget, X_small_single):
+    def test_bounds_and_budget(self, lower, upper, budget, X_small_single):
         est = FollowTheWinner(min_weights=lower, max_weights=upper, budget=budget)
         est.partial_fit(X_small_single)
         assert_box_budget(est.weights_, lower, upper, budget)
 
-    def test_turnover_projection(X_small):
+    def test_turnover_projection(self, X_small):
         max_turnover = 0.5
         n = X_small.shape[1]
         prev = np.ones(n) / n
@@ -228,7 +228,7 @@ class TestFollowTheWinnerConstraints:
         assert l1 <= max_turnover + 1e-8
         assert_box_budget(est.weights_, 0.0, 1.0, 1.0)
 
-    def test_convex_fallback_groups_linear(X_small_single, groups, linear_constraints):
+    def test_convex_fallback_groups_linear(self, X_small_single, groups, linear_constraints):
         # Force convex path via groups/linear constraints
         budget = 0.9
         est = FollowTheWinner(
@@ -257,7 +257,7 @@ class TestFollowTheWinnerConstraints:
         fund_sum = group_sum(w, groups, "Fund", 0)
         assert europe_sum >= 0.5 * fund_sum - 1e-6
 
-    def test_convex_variance_bound(X_small):
+    def test_convex_variance_bound(self, X_small):
         Sigma = np.cov(X_small.to_numpy().T)
         # Loose bound to ensure feasibility
         var_bound = float(np.trace(Sigma)) / Sigma.shape[0]

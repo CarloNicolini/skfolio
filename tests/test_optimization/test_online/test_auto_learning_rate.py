@@ -233,3 +233,45 @@ def test_t_zero_safe():
     eta_eg_0 = compute_eg_learning_rate(0, 10)
     eta_eg_1 = compute_eg_learning_rate(1, 10)
     assert eta_eg_0 > eta_eg_1  # η(0) > η(1)
+
+
+@pytest.mark.parametrize("n_assets", [4, 16, 64])
+def test_gradient_bound_logwealth_l2_scales_with_sqrt_n(n_assets):
+    """For OGD (Euclidean geometry), the L2 gradient bound must grow with sqrt(n).
+
+    The gradient of log-wealth is g = -r / (1 + w^T r). Its L2 norm
+    is ||r||_2 / |1 + w^T r| which scales as sqrt(n) * max|r_i| / min_denom.
+    """
+    G = estimate_gradient_bound(objective=None, n_assets=n_assets, norm="l2")
+    # Must grow with sqrt(n): G(64) > G(16) > G(4) > 0
+    assert G > 0
+    G_small = estimate_gradient_bound(objective=None, n_assets=4, norm="l2")
+    if n_assets > 4:
+        assert G > G_small
+
+
+def test_gradient_bound_logwealth_linf_does_not_scale():
+    """For EG (entropy geometry), the L-inf gradient bound is O(1), no sqrt(n)."""
+    G4 = estimate_gradient_bound(objective=None, n_assets=4, norm="linf")
+    G64 = estimate_gradient_bound(objective=None, n_assets=64, norm="linf")
+    assert G4 > 0
+    # L-inf bound should be the same regardless of n
+    assert abs(G4 - G64) < 1e-10
+
+
+def test_eg_empirical_rate_no_warning():
+    """EG with scale='empirical' should NOT warn — it is now a mild √2 boost
+    over theory, preserving O(√(T log n)) regret guarantees."""
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        eta_fn = get_auto_learning_rate(
+            strategy=FTWStrategy.EG,
+            n_assets=10,
+            scale="empirical",
+        )
+    # Empirical rate is √2 times the theory rate
+    eta_emp = eta_fn(99)
+    eta_theory = np.sqrt(np.log(10) / 100)
+    np.testing.assert_allclose(eta_emp, eta_theory * np.sqrt(2), rtol=1e-10)

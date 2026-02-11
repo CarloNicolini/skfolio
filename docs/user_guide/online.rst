@@ -2,738 +2,454 @@
 
 .. currentmodule:: skfolio.optimization.online
 
-=============================
-Online Portfolio Selection
-=============================
+=================================
+Online Portfolio Selection (OLPS)
+=================================
 
-Online Portfolio Selection (OPS) is a sequential decision-making framework where an investor must allocate wealth to a set of assets at each period without knowledge of future returns. Unlike traditional portfolio optimization, which solves a single static problem over historical data, OPS algorithms face a stream of price observations and must continuously rebalance to maximize cumulative wealth or minimize risk.
+Traditional portfolio optimization methods (Mean-Variance, Risk Parity, HRP, etc.)
+are **offline**: they process an entire historical window at once, estimate moments,
+solve a convex program, and output a fixed allocation. Whenever new data arrives the
+model must be completely re-fitted.
 
-This module implements state-of-the-art online learning algorithms grounded in `Online Convex Optimization (OCO) <https://arxiv.org/abs/1912.13213>`_ theory. The framework unifies two competing paradigms:
+**Online Portfolio Selection** takes a fundamentally different approach. The investor
+chooses portfolio weights *before* observing each period's returns, then updates the
+weights incrementally as new data streams in. No distributional assumption is made
+about the market -- the framework provides rigorous **regret** guarantees that hold
+even against an adversarial sequence of returns.
 
-- **Follow-The-Winner (FTW)**: Momentum-based strategies that exploit trending asset performance (e.g., Exponentiated Gradient, AdaGrad)
-- **Follow-The-Loser (FTL)**: Mean-reversion strategies that bet on underperformers recovering (e.g., OLMAR, PAMR, CWMR)
+This module implements the major families of Online Portfolio Selection algorithms
+from the Online Convex Optimization (OCO) literature, using the same scikit-learn
+``fit`` / ``partial_fit`` API as the rest of skfolio.
 
-All algorithms follow the sklearn estimator API and support flexible constraints, transaction costs, and custom objectives, in the same way they are supported in the MeanRisk estimator.
-Important: The online learning algorithms are designed to work with gross returns or price relatives, which are the prices of the assets at the end of the period divided by the prices at the beginning of the period, in other words :math:`P_t/P_{t-1}`, differently from the standard net returns (or linear returns). Nonetheless all the estimators exposed in the skfolio online module accept net returns and convert to gross returns internally.
+.. note::
 
-Another observation: in skfolio when one is using a convex optimization, one is implicitly impliying continuous rebalancing. In other words any strategy fitted on past data is called in online learning literature a "static" strategy or "hindsight" strategy as it would require maintaing the predicted, unique weights over the entire period of estimation and inference.
-This is instead the basic assumption of the online learning framework, where the algorithm is expected to make decisions in a sequential manner, one at a time, and not to maintain a static portfolio over the entire period of estimation and inference, but to change them dynamically at each time step. This is why the online estimators have post-fit attribute :math:`all_weights_` that contains the weights at each time step.
+   **Offline vs Online -- when to use which?**
 
-**Key References:**
+   * Use :ref:`offline optimization <optimization>` (``MeanRisk``, ``RiskBudgeting``,
+     etc.) when you have a representative training set and want to solve a
+     single-period or multi-period allocation with rich risk constraints.
+   * Use **online optimization** (``FollowTheWinner``, ``FollowTheLoser``) when you
+     need a streaming, assumption-free rebalancing policy with formal regret
+     guarantees -- for example in high-frequency rebalancing, live trading systems,
+     or as robust baselines for backtesting studies.
 
-- Li, B., & Hoi, S. C. H. (2018). Online Portfolio Selection: A Survey. *ACM Computing Surveys*, 49(2), 1-36.
-- Hazan, E. (2023). Introduction to Online Convex Optimization (2nd ed.). MIT Press.
-- Orabona, F. (2020+). A Modern Introduction to Online Learning. MIT Press (draft).
 
-Introduction
-============
+Quick Start
+***********
 
-The Online Portfolio Selection Problem
----------------------------------------
+Every online estimator follows the standard skfolio API: call ``fit(X)`` with a
+matrix of **net returns** (not prices). The estimator internally converts to gross
+relatives, sequentially updates weights, and exposes the final weights in
+``weights_`` and the full trajectory in ``all_weights_``.
 
-At each time step :math:`t = 1, 2, \ldots, T`, an investor must:
+.. code-block:: python
 
-1. Choose a portfolio weight vector :math:`\mathbf{b}_t \in \Delta^n` (sum to 1, non-negative)
-2. Observe the gross return vector :math:`\mathbf{x}_t \in \mathbb{R}^n_+` (price relatives from yesterday's close to today's)
-3. Realize log-wealth: :math:`\log(\mathbf{b}_t^\top \mathbf{x}_t)`
+    from skfolio.datasets import load_sp500_dataset
+    from skfolio.optimization.online import FollowTheWinner
+    from skfolio.preprocessing import prices_to_returns
 
-The cumulative log-wealth after :math:`T` periods is:
+    prices = load_sp500_dataset()
+    X = prices_to_returns(prices)
 
-.. math::
+    model = FollowTheWinner(strategy="eg")
+    model.fit(X)
+    print(model.weights_)
 
-    S_T = \sum_{t=1}^T \log(\mathbf{b}_t^\top \mathbf{x}_t)
+    portfolio = model.predict(X)
+    print(portfolio.annualized_sharpe_ratio)
 
-The learner's performance is evaluated using **regret** against a comparator strategy:
+For incremental (streaming) usage, use ``partial_fit`` one row at a time:
 
-.. math::
+.. code-block:: python
 
-    \text{Regret}_T = \max_{\mathbf{u} \in \mathcal{U}} \sum_{t=1}^T \log(\mathbf{u}^\top \mathbf{x}_t) - \sum_{t=1}^T \log(\mathbf{b}_t^\top \mathbf{x}_t)
+    model = FollowTheWinner(strategy="eg", warm_start=True)
+    for t in range(len(X)):
+        model.partial_fit(X.iloc[[t]])
+    print(model.weights_)
 
-- **Static Regret**: :math:`\mathcal{U} = \Delta^n` (Best Constant Rebalanced Portfolio in hindsight)
-- **Dynamic Regret**: :math:`\mathcal{U}` allows time-varying portfolios with controlled complexity
 
-Theoretical Framework: Online Convex Optimization
----------------------------------------------------
+Benchmarks
+**********
 
-The module unifies OPS algorithms under a single OCO framework. At each round, the algorithm solves:
+The module provides hindsight benchmarks commonly used in the OLPS literature for
+performance comparison and regret calculation:
 
-.. math::
+    * :class:`CRP` -- Constant Rebalanced Portfolio (fixed user-supplied weights)
+    * :class:`UCRP` -- Uniform CRP (equal-weighted, also known as :math:`1/n`)
+    * :class:`BestStock` -- Best single asset in hindsight
+    * :class:`BCRP` -- Best Constant Rebalanced Portfolio in hindsight
 
-    \mathbf{w}_{t+1} = \arg\min_{\mathbf{w} \in \mathcal{K}} \left\langle \mathbf{g}_{1:t}, \mathbf{w} \right\rangle + \lambda R(\mathbf{w}) + C(\mathbf{w}, \mathbf{w}_{t-1})
+The :class:`BCRP` is the standard comparator for **static regret**: it finds the single fixed allocation that would have maximized log-wealth over the entire history.
+Any online algorithm with sublinear regret is guaranteed to approach BCRP performance as the horizon grows.
 
-where:
+**Example:**
 
-- :math:`\mathbf{g}_{1:t}` = cumulative loss gradients
-- :math:`R(\mathbf{w})` = convex regularizer (KL divergence, squared norm, entropy barrier)
-- :math:`C(\mathbf{w}, \mathbf{w}_{t-1})` = turnover/cost penalties
-- :math:`\mathcal{K}` = feasible set (simplex, box bounds, groups, tracking error)
+.. code-block:: python
 
-**Regularizer Choices Determine Algorithm:**
+    from skfolio.optimization.online import BCRP, UCRP
 
-- KL divergence → Exponentiated Gradient (EG) / Entropic Mirror Descent
-- Euclidean norm → Online Gradient Descent (OGD)
-- Adaptive squared norm → AdaGrad (element-wise adaptive learning rates)
-- Barrier + Euclidean + adaptive → Ada-BARRONS
+    ucrp = UCRP()
+    ucrp.fit(X)
 
-**Key Theoretical Result:** Convexity of the loss determines regret rate:
+    bcrp = BCRP()
+    bcrp.fit(X)
 
-- **Exp-concave losses** (e.g., :math:`-\log(\mathbf{b}^\top \mathbf{x})`): :math:`O(\log T)` regret
-- **Strongly convex losses**: :math:`O(\log T)` regret
-- **Convex losses** (e.g., hinge loss for mean reversion): :math:`O(\sqrt{T})` regret
+    print(f"UCRP final wealth: {ucrp.wealth_:.4f}")
+    print(f"BCRP final wealth: {bcrp.wealth_:.4f}")
 
-Data Format: Net Returns to Gross Relatives
---------------------------------------------
 
-The module expects **net returns** as input (e.g., arithmetic returns in :math:`[-1, +\infty)`), which are automatically converted to **gross relatives** (price ratios) for algorithm computations:
+Follow-the-Winner Strategies
+*****************************
 
-.. math::
+:class:`FollowTheWinner` implements a unified engine for **first-order Online Convex
+Optimization** algorithms. These methods allocate more to assets that have recently
+performed well by following the gradient of the log-wealth objective.
 
-    \mathbf{x}_t = 1 + \mathbf{r}_t
+The family is parameterized by a ``strategy``:
 
-This ensures proper log-wealth calculations and simplifies gradient derivations. See :func:`~skfolio.preprocessing.prices_to_returns` for data preparation.
+    * ``"eg"`` -- **Exponentiated Gradient** (entropy mirror map, multiplicative updates)
+    * ``"ogd"`` -- **Online Gradient Descent** (Euclidean mirror map)
+    * ``"prod"`` -- **PROD / Soft-Bayes** (Burg log-barrier mirror map)
+    * ``"adagrad"`` -- **AdaGrad** (adaptive diagonal preconditioning)
+    * ``"adabarrons"`` -- **Ada-BARRONS** (adaptive barrier + Online Newton Step)
+    * ``"sword_var"`` -- **SWORD-Var** (variation-adaptive, dynamic regret)
+    * ``"sword_small"`` -- **SWORD-Small** (small-loss adaptive)
+    * ``"sword_best"`` -- **SWORD-Best** (meta-aggregation of SWORD experts)
+    * ``"sword_pp"`` -- **SWORD++** (meta with EG expert)
 
-Algorithms Overview
-====================
+Under the hood, the engine supports both **Online Mirror Descent (OMD)** and
+**Follow-the-Regularized-Leader (FTRL)** update modes, configurable through
+``update_mode``.
 
-Follow-The-Winner (FTW): Momentum-Based Strategies
----------------------------------------------------
+**Example -- Exponentiated Gradient:**
 
-These algorithms exploit trend-following behavior by increasing allocations to recent outperformers.
+.. code-block:: python
 
-**Exponentiated Gradient (EG)**
-  - **Paradigm**: Follow-the-winner via entropy regularization
-  - **Update**: :math:`\mathbf{b}_t \propto \mathbf{b}_{t-1} \odot \exp(-\eta \mathbf{g}_t)` (multiplicative)
-  - **Regret**: :math:`O(\log T)` (optimal for exp-concave losses)
-  - **Use when**: Markets trend strongly, portfolio turnover acceptable
-  - **Drawback**: Can become concentration-risk heavy over time
+    from skfolio.datasets import load_sp500_dataset
+    from skfolio.optimization.online import FollowTheWinner
+    from skfolio.preprocessing import prices_to_returns
 
-**Online Gradient Descent (OGD)**
-  - **Paradigm**: Follow-the-winner via Euclidean regularization
-  - **Update**: :math:`\mathbf{b}_t = \text{Proj}_{\mathcal{K}}(\mathbf{b}_{t-1} - \eta \mathbf{g}_t)` (additive)
-  - **Regret**: :math:`O(\sqrt{T})` generically, :math:`O(\log T)` for strongly convex
-  - **Use when**: Diversification important, want to avoid concentration
-  - **Advantage**: Works for any convex loss, not just exp-concave
+    prices = load_sp500_dataset()
+    X = prices_to_returns(prices)
 
-**AdaGrad**
-  - **Paradigm**: Follow-the-winner with adaptive per-asset learning rates
-  - **Geometry**: :math:`H_i = \sqrt{\sum_{s=1}^t g_{s,i}^2}` (element-wise squared-gradient accumulation)
-  - **Update**: :math:`b_{t,i} = \text{Proj}_{\Delta}(b_{t-1,i} - \eta g_{t,i} / H_i)`
-  - **Regret**: :math:`O(\log T)` for strongly convex, universal dimension-free bounds
-  - **Use when**: Asset volatilities vary dramatically, need acceleration on large-gradient assets
+    model = FollowTheWinner(
+        strategy="eg",
+        learning_rate="auto",
+    )
+    model.fit(X)
+    print(model.weights_)
 
-**Ada-BARRONS (Damped Online Newton Step for Portfolio Selection)**
-  - **Paradigm**: Composite geometry combining entropy barrier, Euclidean, and adaptive quadratic terms
-  - **Advantages**: Balances adaptivity, numerical stability, and concentration control
-  - **Regret**: :math:`O(\log T)` with dimension-independent constants
-  - **Use when**: Extreme market conditions, need state-of-the-art stability
+**Example -- AdaGrad with optimistic predictions:**
 
-**SWORD Variants (Stochastic Variance Reduction and Optimistic Online Learning)**
-  - **Paradigm**: Meta-learning over multiple expert specialists
-  - **Use when**: Uncertain which base strategy (EG, OGD, AdaGrad) will perform best
-  - **Advantage**: Automatic expert mixing, can switch between paradigms in hindsight
+Optimistic OMD uses a predictor for the next gradient. When gradients are temporally
+smooth (common in financial data), this can significantly reduce regret.
 
-**PROD (Soft-Bayes Prod)**
-  - **Paradigm**: Multiplicative weights over a grid of constant expert strategies
-  - **Use when**: Need probabilistic hedge over a pre-defined set of expert portfolios
+.. code-block:: python
 
-**Optimistic Updates (Smooth Prediction)**
-  - **Idea**: Predict next gradient as a smooth function of past gradients
-  - **Benefit**: Faster adaptation to trending markets, :math:`O(\text{path-length})` adaptive regret
-  - **Example**: :math:`\hat{g}_t = g_{t-1}` (assume smooth gradient evolution)
+    model = FollowTheWinner(
+        strategy="adagrad",
+        grad_predictor="last",   # predict next gradient = last gradient
+    )
+    model.fit(X)
+    print(model.weights_)
 
-Follow-The-Loser (FTL): Mean-Reversion Strategies
----------------------------------------------------
+Learning Rates
+==============
 
-These algorithms exploit mean reversion by betting against recent winners.
+When ``learning_rate="auto"``, the module selects a learning rate based on:
 
-**OLMAR (Online Moving Average Reversion)**
-  - **Idea**: Maintain a moving average of price relatives, bet on reverting to mean
-  - **Predictors**:
-    
-    - **OLMAR-1 (SMA)**: Simple moving average of inverse cumulative products (window-based)
-    - **OLMAR-2 (EWMA)**: Exponentially weighted moving average, recursive update
-  
-  - **Update**: Passive-aggressive margin constraint or mirror descent
-  - **Regret**: :math:`O(\sqrt{T})`
-  - **Use when**: Strong mean reversion signal, e.g., cryptocurrency, high-frequency trading
-  - **Drawback**: Slow drift recovery in trending markets
+    * **Strategy geometry** (entropy for EG, Euclidean for OGD, adaptive for AdaGrad)
+    * **Domain diameter** (computed from box and budget constraints)
+    * **Gradient bound** (estimated from the objective's convexity class)
 
-**PAMR (Passive-Aggressive Mean Reversion)**
-  - **Idea**: Enforce a margin constraint on current price relatives, be aggressive when violated
-  - **Variants**:
-    
-    - **PAMR-0 (Simple)**: Lagrange multiplier set exactly to constraint violation
-    - **PAMR-1 (Linear slack)**: Allow slack with linear penalty
-    - **PAMR-2 (Quadratic slack)**: Allow slack with quadratic regularization
-  
-  - **Parameter**: Aggressiveness :math:`C` (larger = more aggressive reversion)
-  - **Regret**: :math:`O(\sqrt{T})`
-  - **Use when**: Explicit threshold-based reversion control needed
+The ``learning_rate_scale`` parameter controls the aggressiveness:
 
-**CWMR (Confidence-Weighted Mean Reversion)**
-  - **Idea**: Maintain Gaussian belief over portfolio weights, enforce probabilistic margin constraint
-  - **Updates**: KL-proximal with second-order statistics (:math:`\mu`, :math:`\Sigma`)
-  - **Parameter**: Confidence level :math:`\eta` (higher = tighter constraint)
-  - **Regret**: :math:`O(\sqrt{T})`, but with tighter constants for smooth data
-  - **Advantage**: Second-order information reduces variance, better for choppy markets
-  - **Use when**: Have limited budget and need robust uncertainty quantification
+    * ``"theory"`` (default) -- Worst-case OCO rate :math:`\sqrt{\log n / (t+1)}`
+      for EG.  Safe on all datasets, never more than 1% worse than UCRP.
+    * ``"moderate"`` -- :math:`2\sqrt{2}` boost (Hazan's book constant).
+    * ``"empirical"`` -- :math:`\sqrt{2}` boost over theory.  All three scales
+      preserve the same :math:`O(\sqrt{T \log n})` regret guarantee.
 
-**RMR (Robust Median Reversion)**
-  - **Idea**: Use L1-median of recent price relatives instead of mean, robust to outliers
-  - **Algorithm**: Weiszfeld's algorithm for L1-median computation
-  - **Regret**: :math:`O(\sqrt{T})`, with improved constants under outlier presence
-  - **Use when**: Data has significant outliers (flash crashes, gaps, data errors)
+Gradient Enhancements
+=====================
 
-Benchmark Comparators
-----------------------
+Two optional parameters can improve FTW performance on real financial data:
 
-To evaluate online algorithms, the module provides reference baselines for computing regret.
+**Discounted FTRL** (``discount``): replaces the cumulative gradient sum with an
+exponentially decaying sum :math:`G_t = \gamma G_{t-1} + g_t`, giving recent
+observations more influence. Useful for non-stationary markets.
 
-**Uniform Constant Rebalanced Portfolio (UCRP)**
-  - **Weights**: :math:`\mathbf{b} = (1/n, \ldots, 1/n)`
-  - **Purpose**: Naive diversification baseline
-  - **Regret computation**: Often called "Buy-and-Hold"
+**Momentum lookback** (``gradient_lookback``): averages the last *W* gradients
+before passing them to the OCO engine, capturing medium-term momentum signals
+(Jegadeesh & Titman, 1993).
 
-**Constant Rebalanced Portfolio (CRP)**
-  - **Weights**: Fixed user-specified or optimized
-  - **Purpose**: Fixed-portfolio reference
-  - **Use case**: Compare against manually tuned allocations
+.. code-block:: python
 
-**Best Constant Rebalanced Portfolio (BCRP) in Hindsight**
-  - **Optimization**: Solves a static convex problem over all :math:`T` periods
-  - **Objectives**: Log-wealth (Kelly criterion), variance minimization, CVaR, etc.
-  - **Purpose**: Strongest baseline for static regret (lower bound on achievable performance)
-  - **Regret formula**: :math:`\text{Regret}_T = \sum_t \log(u^\top x_t) - \sum_t \log(b_t^\top x_t)`
+    # Momentum-enhanced EG with 60-day lookback
+    model = FollowTheWinner(
+        strategy="eg",
+        gradient_lookback=60,
+    )
+    model.fit(X)
 
-**BestStock**
-  - **Strategy**: Allocate 100% to the single best-performing asset
-  - **Purpose**: Detect if market has a clear trend (best-stock wins easily)
-  - **Use case**: Diagnostic for market regime detection
+.. note::
+
+   ``gradient_lookback`` in [60, 120] consistently turns EG from a UCRP-equivalent
+   into a modest momentum strategy on real datasets.  ``discount`` on its own
+   compresses weights toward 1/n; combine it with a constant ``learning_rate``
+   for best results.
+
+
+Supported Constraints
+=====================
+
+All online estimators support the same rich constraint set as offline methods:
+
+    * Weight Bounds (``min_weights``, ``max_weights``)
+    * Budget Constraint (``budget``)
+    * Turnover Constraint (``max_turnover``)
+    * Group Constraints (``groups``, ``linear_constraints``)
+    * Transaction Costs (``transaction_costs``)
+    * Management Fees (``management_fees``)
+
+Constraints are enforced at every rebalancing via projection. Simple constraints
+(box + budget + turnover) use a fast bisection projector; complex constraints
+(groups, linear, variance bounds) automatically fall back to a ``cvxpy`` solver.
+
+
+Follow-the-Loser Strategies (Mean Reversion)
+*********************************************
+
+:class:`FollowTheLoser` implements **mean-reversion** strategies that bet on
+short-term price reversals. These methods move wealth from recent winners to recent
+losers, exploiting the empirical observation that asset prices often revert toward
+their moving averages.
+
+The family is parameterized by a ``strategy``:
+
+    * ``"olmar"`` -- **Online Moving Average Reversion**. Uses a moving-average
+      predictor to estimate next-period relatives and tilts the portfolio toward
+      undervalued assets with a passive-aggressive update.
+    * ``"pamr"`` -- **Passive-Aggressive Mean Reversion**. Enforces a margin
+      constraint :math:`w^\top x_t \leq \varepsilon` and finds the minimum-change
+      portfolio that satisfies it.
+    * ``"cwmr"`` -- **Confidence-Weighted Mean Reversion**. Maintains a Gaussian
+      distribution over weights and updates it via a KL-proximal step under a
+      probabilistic margin constraint.
+    * ``"rmr"`` -- **Robust Median Reversion**. Like OLMAR but uses the L1-median
+      (geometric median) for outlier-robust price prediction.
+
+Each strategy supports two ``update_mode`` values:
+
+    * ``"pa"`` -- The original **passive-aggressive** closed-form update from
+      Li and Hoi (2012). Reproduces the OLPS reference implementation.
+    * ``"md"`` -- A modern **mirror descent** formulation using surrogate convex
+      losses (hinge, squared hinge, or softplus) and a configurable mirror map.
+
+**Example -- OLMAR with SMA predictor:**
+
+.. code-block:: python
+
+    from skfolio.datasets import load_sp500_dataset
+    from skfolio.optimization.online import FollowTheLoser
+    from skfolio.preprocessing import prices_to_returns
+
+    prices = load_sp500_dataset()
+    X = prices_to_returns(prices)
+
+    model = FollowTheLoser(
+        strategy="olmar",
+        olmar_predictor="sma",
+        olmar_window=5,
+        epsilon=10.0,
+    )
+    model.fit(X)
+    print(model.weights_)
+
+**Example -- PAMR with slack:**
+
+.. code-block:: python
+
+    model = FollowTheLoser(
+        strategy="pamr",
+        pamr_variant="slack_quadratic",
+        pamr_C=500.0,
+        epsilon=0.5,
+    )
+    model.fit(X)
+    print(model.weights_)
+
+**Example -- CWMR (second-order, distributional):**
+
+CWMR maintains a full covariance belief over portfolio weights and provides
+confidence-weighted updates -- a natural second-order extension of PAMR.
+
+.. code-block:: python
+
+    model = FollowTheLoser(
+        strategy="cwmr",
+        cwmr_eta=0.95,        # confidence level
+        cwmr_sigma0=1.0,      # initial variance
+        epsilon=1.0,
+    )
+    model.fit(X)
+    print(model.weights_)
+
 
 Regret Analysis
----------------
+***************
 
-The module provides comprehensive regret computation via :func:`regret`:
+The :func:`regret` function computes **regret curves** that measure how an online
+strategy compares to a benchmark over time. Regret is the core performance metric
+in Online Convex Optimization:
 
 .. math::
 
-    \text{Regret}_T(b) = \sum_{t=1}^T \log(\mathbf{u}^\top \mathbf{x}_t) - \sum_{t=1}^T \log(\mathbf{b}_t^\top \mathbf{x}_t)
+   R_T = \sum_{t=1}^{T} \ell_t(w_t) - \sum_{t=1}^{T} \ell_t(w^*)
 
-**Regret Types**:
+where :math:`\ell_t(w) = -\log(w^\top x_t)` is the per-period log-wealth loss and
+:math:`w^*` is the comparator (e.g., the best fixed portfolio in hindsight).
 
-- **Static Regret**:
-  Compares the online strategy against the **Best Constant Rebalanced Portfolio (BCRP)** in hindsight.
-  This is the standard metric in OCO. A sublinear static regret :math:`O(\sqrt{T})` or :math:`O(\log T)` implies that the algorithm performs as well as the best fixed strategy in the long run.
+Sublinear regret (:math:`R_T / T \to 0`) means the online strategy asymptotically
+matches the comparator's performance.
 
-- **Dynamic Regret**:
-  Compares against a sequence of portfolios :math:`\mathbf{u}_1, \dots, \mathbf{u}_T` that can change over time.
-  Since it is impossible to compete with the optimal strategy at every step (which would require perfect foresight), dynamic regret is usually bounded in terms of the **path length** (variability) of the comparator sequence.
+The module supports several regret types:
 
-- **Dynamic Universal Regret**:
-  This is a more robust measure that compares against all possible dynamic strategies that satisfy a certain "complexity" constraint (e.g., limited turnover).
-  Universal portfolios guarantee a certain performance level relative to *any* sequence of stock prices, often by averaging over a large class of experts.
+    * ``RegretType.STATIC`` -- Against the best fixed portfolio (BCRP). This is the
+      standard regret notion in universal portfolio theory.
+    * ``RegretType.DYNAMIC_UNIVERSAL`` -- Against the best *changing* portfolio
+      sequence with bounded path length. Captures non-stationarity.
+    * ``RegretType.DYNAMIC_WORST_CASE`` -- Against the per-round best asset. The
+      strongest (and hardest to beat) benchmark.
 
-- **Dynamic Worst-Case Regret**:
-  The difference between the algorithm's return and the return of the best possible asset at *each* time step. This is typically linear in :math:`T` (unless the market is trivial), but useful for analyzing worst-case scenarios.
-
-Understanding Predictors
-------------------------
-
-For **Follow-The-Loser (FTL)** strategies like OLMAR and RMR, the choice of **predictor** is crucial. The predictor estimates the next period's relative price vector :math:`\hat{\mathbf{x}}_{t+1}` based on historical data.
-
-- **Simple Moving Average (SMA)** (``olmar_predictor="sma"``):
-  Calculates the average price relative over a fixed window.
-  
-  *   **Pros**: Simple, smooths out noise.
-  *   **Cons**: Lags behind trends. If the window is too large, it misses quick reversals.
-
-- **Exponential Weighted Moving Average (EWMA)** (``olmar_predictor="ewma"``):
-  Gives more weight to recent observations.
-  
-  *   **Pros**: Reacts faster to recent price changes than SMA.
-  *   **Cons**: More sensitive to recent noise.
-
-- **Robust Median Reversion (RMR)** (``strategy=FTLStrategy.RMR``):
-  Uses the **L1-median** (spatial median) of recent price relatives.
-  
-  *   **Pros**: Extremely robust to outliers. If a stock crashes or spikes due to an error or flash crash, the median is unaffected, whereas the mean would be skewed.
-  *   **Cons**: Computationally more expensive (requires iterative Weiszfeld's algorithm).
-
-- **Gradient Predictors** (for FTW strategies):
-  Strategies like EG and OGD can use a gradient predictor (e.g., ``grad_predictor="last"``) to anticipate the next gradient.
-  
-  *   **Idea**: If the loss function is smooth, the gradient at :math:`t` is a good guess for :math:`t+1`.
-  *   **Benefit**: Can achieve "optimistic" regret bounds that depend on the path length of gradients rather than time :math:`T`.
-
-Common Pitfalls
----------------
-
-1.  **Overfitting Learning Rate**:
-    Tuning the ``learning_rate`` to maximize backtest performance on a specific historical period is a common mistake. Financial markets are non-stationary. A high learning rate that worked during a bull market might cause massive drawdowns in a volatile sideways market.
-    *Recommendation*: Use ``learning_rate="auto"`` or adaptive methods like AdaGrad/Ada-BARRONS which adjust their own rates.
-
-2.  **Ignoring Transaction Costs**:
-    Mean-reversion strategies (PAMR, OLMAR) often have very high turnover, trading significantly every day. Without modeling transaction costs, their theoretical returns can be astronomical but realistic returns negative.
-    *Recommendation*: Always set ``transaction_costs`` (e.g., 0.0005 for 5bps) and check ``max_turnover`` constraints.
-
-3.  **Data Quality**:
-    Online algorithms operate on **price relatives** (:math:`P_t / P_{t-1}`).
-    
-    *   **Zeros**: If a price is 0, the relative is 0 or undefined. Log-wealth becomes :math:`-\infty`. Ensure data is cleaned.
-    *   **Splits/Dividends**: Ensure data is adjusted. A 2-for-1 split looks like a 50% crash to the algorithm if unadjusted, triggering a massive "buy the dip" signal (for mean reversion) which is false.
-
-4.  **Look-Ahead Bias**:
-    Ensure that the data passed to ``partial_fit`` for time :math:`t` was actually available at time :math:`t`. The ``skfolio`` design prevents this within the estimator, but the user must ensure the input data stream is valid.
-
-Getting Started
-================
-
-Gallery Examples
-----------------
-
-For comprehensive tutorials with visualizations and detailed explanations, see the
-:ref:`online_examples` section in the examples gallery:
-
-- **Introduction to Online Portfolio Selection**: Compare Follow-the-Winner (momentum)
-  vs Follow-the-Loser (mean reversion) strategies, understand regret analysis, and
-  explore wealth evolution on real datasets.
-
-- **Advanced Strategies Comparison**: Examine adaptive methods (AdaGrad, AdaBARRONS),
-  analyze transaction cost impact, compare performance across different market regimes,
-  and evaluate PAMR variants.
-
-Basic Example: Follow-The-Winner (Momentum)
---------------------------------------------
+**Example -- static regret curve:**
 
 .. code-block:: python
 
-    from skfolio.datasets import load_sp500_relatives_dataset
-    from skfolio.optimization.online import FollowTheWinner, FTWStrategy, BCRP, regret, RegretType
-    import numpy as np
+    from skfolio.optimization.online import FollowTheWinner, regret, RegretType
 
-    # Load data (net returns)
-    X = load_sp500_relatives_dataset(net_returns=True)
-    print(f"Data shape: {X.shape}")  # (T, n) = (periods, assets)
+    model = FollowTheWinner(strategy="eg")
+    r = regret(model, X, regret_type=RegretType.STATIC, average=True)
 
-    # 1. Train a momentum (EG) strategy
-    model = FollowTheWinner(strategy=FTWStrategy.EG, learning_rate="auto")
-    model.fit(X)
-    print(f"Final weights shape: {model.weights_.shape}")
-    print(f"Final weights (top 5): {np.sort(model.weights_)[-5:]}")
+    # Plot with plotly
+    from skfolio.optimization.online._regret import plot_regret_curve
+    fig = plot_regret_curve(r, average=True, label="EG vs BCRP")
+    fig.show()
 
-    # 2. Evaluate regret against BCRP
-    comparator = BCRP()  # Best Constant Rebalanced Portfolio
-    regret_array = regret(model, X, comparator=comparator, regret_type=RegretType.STATIC)
-    print(f"Final static regret: {regret_array[-1]:.4f} nats")
-
-    # 3. Inspect wealth trajectory
-    print(f"Initial wealth: {model.all_wealth_[0]:.2f}")
-    print(f"Final wealth: {model.wealth_:.2f}")
-    print(f"Cumulative return: {model.wealth_ / model.all_wealth_[0] - 1:.2%}")
-
-Mean Reversion Example: PAMR
------------------------------
+**Example -- dynamic regret with path-length budget:**
 
 .. code-block:: python
 
-    from skfolio.optimization.online import FollowTheLoser, FTLStrategy, BCRP
-    from skfolio.measures import PerfMeasure
-
-    # 1. Train a mean-reversion strategy
-    model = FollowTheLoser(
-        strategy=FTLStrategy.PAMR,
-        pamr_variant="slack_quadratic",  # More stable PAMR-2
-        pamr_C=500.0,  # Aggressiveness parameter
-        epsilon=1.0,   # Margin threshold
-        update_mode="pa"  # Passive-Aggressive (original algorithm)
+    r_dyn = regret(
+        model, X,
+        regret_type=RegretType.DYNAMIC_UNIVERSAL,
+        dynamic_config={"path_length": 5.0, "norm": "l1"},
+        average=True,
     )
-    model.fit(X)
 
-    # 2. Compare weights evolution
-    print(f"Weights shape over time: {model.all_weights_.shape}")  # (T, n)
-    print(f"Average turnover per period: {np.mean(np.abs(np.diff(model.all_weights_, axis=0)), axis=1).mean():.4f}")
 
-    # 3. Analyze portfolio metrics
-    portfolio = model.predict(X)
-    print(f"Annualized Sharpe ratio: {portfolio.annualized_sharpe_ratio:.3f}")
-    print(f"Max drawdown: {portfolio.max_drawdown:.2%}")
+Comparing Online and Offline Strategies
+***************************************
 
-Comparing Strategies
----------------------
+One of the strengths of the skfolio API is that online and offline estimators share
+the same interface. You can directly compare them using the :ref:`Population <population>`
+tools:
 
 .. code-block:: python
 
-    from skfolio.optimization.online import (
-        FollowTheWinner, FollowTheLoser, FTWStrategy, FTLStrategy,
-        BCRP, CRP, UCRP, regret, RegretType
-    )
-    import pandas as pd
+    from skfolio.datasets import load_sp500_dataset
+    from skfolio.optimization import MeanRisk
+    from skfolio.optimization.online import FollowTheWinner, FollowTheLoser
+    from skfolio.population import Population
+    from skfolio.preprocessing import prices_to_returns
 
-    # Define strategies to compare
-    strategies = {
-        "EG": FollowTheWinner(strategy=FTWStrategy.EG),
-        "OGD": FollowTheWinner(strategy=FTWStrategy.OGD),
-        "AdaGrad": FollowTheWinner(strategy=FTWStrategy.ADAGRAD),
-        "OLMAR-1": FollowTheLoser(strategy=FTLStrategy.OLMAR, olmar_predictor="sma"),
-        "PAMR": FollowTheLoser(strategy=FTLStrategy.PAMR, update_mode="pa"),
-        "CWMR": FollowTheLoser(strategy=FTLStrategy.CWMR, update_mode="pa"),
-    }
+    prices = load_sp500_dataset()
+    X = prices_to_returns(prices)
+    X_train, X_test = X["2014":"2019"], X["2020":]
 
-    # Fit each strategy
-    comparator = BCRP()
-    results = {}
+    # Offline: Mean-Variance on training set, predict on test set
+    mv = MeanRisk()
+    mv.fit(X_train)
+    ptf_mv = mv.predict(X_test)
 
-    for name, model in strategies.items():
-        model.fit(X)
-        regrets = regret(model, X, comparator=comparator, regret_type=RegretType.STATIC)
-        results[name] = {
-            "final_wealth": model.wealth_,
-            "cumulative_return": model.wealth_ / model.all_wealth_[0] - 1,
-            "final_regret": regrets[-1],
-            "max_drawdown": model.predict(X).max_drawdown,
-        }
+    # Online: fit on full test set (streaming)
+    eg = FollowTheWinner(strategy="eg")
+    eg.fit(X_test)
+    ptf_eg = eg.predict(X_test)
 
-    df = pd.DataFrame(results).T
-    print(df)
+    olmar = FollowTheLoser(strategy="olmar")
+    olmar.fit(X_test)
+    ptf_olmar = olmar.predict(X_test)
 
-Advanced Features
-=================
+    pop = Population([ptf_mv, ptf_eg, ptf_olmar])
+    pop.plot_cumulative_returns()
 
-Transaction Costs and Turnover Control
----------------------------------------
+.. note::
 
-Real-world trading incurs costs. The module supports:
+   Offline methods use a **train/test split** and predict on unseen data. Online
+   methods process data sequentially -- each period's weights are chosen *before*
+   seeing that period's returns, so there is no look-ahead bias even when
+   ``fit`` and ``predict`` use the same ``X``.
 
-- **Proportional transaction costs**: Fixed fee per unit of traded volume
-- **Turnover constraints**: Cap the L1 distance between consecutive weight vectors
-- **Adaptive fee scaling**: Apply fees only to mean-reversion predictors
+
+Wealth Tracking and Transaction Costs
+**************************************
+
+All online estimators track cumulative wealth via ``wealth_`` and ``all_wealth_``,
+accounting for transaction costs and management fees:
 
 .. code-block:: python
 
     model = FollowTheWinner(
-        strategy=FTWStrategy.EG,
-        transaction_costs=0.001,  # 10 bps per trade
-        max_turnover=0.1,         # Max 10% turnover per period
+        strategy="eg",
+        transaction_costs=0.001,     # 10 bps per trade
+        management_fees=0.0001,      # 1 bp per period
     )
     model.fit(X)
+    print(f"Final wealth: {model.wealth_:.4f}")
+    print(f"Wealth history shape: {model.all_wealth_.shape}")
 
-    # Compare wealth with/without costs
-    model_free = FollowTheWinner(strategy=FTWStrategy.EG)
-    model_free.fit(X)
-    print(f"Wealth (with costs): {model.wealth_:.2f}")
-    print(f"Wealth (without costs): {model_free.wealth_:.2f}")
-    print(f"Cost drag: {(model_free.wealth_ - model.wealth_) / model_free.wealth_:.2%}")
 
-Multiple Objectives and Risk Measures
---------------------------------------
+Mathematical Background
+***********************
 
-The module supports optimizing various objectives:
+The theoretical foundation draws from two references:
 
-.. code-block:: python
+    * Hazan, E. (2016). *Introduction to Online Convex Optimization.*
+    * Orabona, F. (2023). *A Modern Introduction to Online Learning.*
 
-    from skfolio.measures import RiskMeasure, PerfMeasure
+The key result is that **Follow-the-Regularized-Leader** (FTRL) with an entropy
+regularizer on the simplex gives the Exponentiated Gradient algorithm, achieving
 
-    # Risk minimization (CVaR)
-    model_risk = FollowTheWinner(
-        strategy=FTWStrategy.OGD,
-        objective=RiskMeasure.CVAR,
-        learning_rate=0.1,
-    )
-    model_risk.fit(X)
-    
-    # Log-wealth maximization (default, most theoretical support)
-    model_wealth = FollowTheWinner(
-        strategy=FTWStrategy.EG,
-        objective=PerfMeasure.LOG_WEALTH,
-    )
-    model_wealth.fit(X)
+.. math::
 
-Constraints: Box, Budget, Groups, Tracking Error
--------------------------------------------------
+   R_T \leq O\!\left(\sqrt{T \log n}\right)
 
-Like the convex optimization module, online methods support rich constraints:
+For the log-wealth loss :math:`-\log(w^\top x_t)`, which is *exp-concave*
+(Hazan, Ch. 6), second-order methods such as the **Online Newton Step** can achieve
+the tighter bound
 
-.. code-block:: python
+.. math::
 
-    model = FollowTheWinner(
-        strategy=FTWStrategy.ADAGRAD,
-        min_weights=0.0,           # Long-only
-        max_weights=0.5,           # No position > 50%
-        budget=1.0,                # Fully invested
-        groups={"tech": ["AAPL", "MSFT"], "energy": ["XLE"]},
-        linear_constraints=["tech >= 0.3", "energy <= 0.2"],
-    )
+   R_T \leq O\!\left(n \log T\right)
 
-Warm Start and Sequential Fitting
-----------------------------------
+Adaptive methods (AdaGrad, SWORD) further improve by adapting to the observed
+gradient sequence rather than worst-case assumptions.
 
-For online learning, data often arrives incrementally. Use :meth:`partial_fit`:
+The **mean-reversion** family (OLMAR, PAMR, CWMR) operates outside the pure OCO
+framework: it uses domain-specific predictors based on moving averages and margin
+constraints, which can be formulated as passive-aggressive online learning or,
+equivalently, as convex surrogate losses under mirror descent.
 
-.. code-block:: python
 
-    model = FollowTheWinner(strategy=FTWStrategy.EG, warm_start=True)
+Going Further
+*************
 
-    # Fit incrementally as new data arrives
-    for t in range(len(X)):
-        X_new = X.iloc[[t], :]
-        model.partial_fit(X_new)
+For detailed API documentation, see:
 
-    # Or fit all at once (auto-vectorized):
-    model.fit(X)
+    * :class:`FollowTheWinner` -- Follow-the-Winner strategies
+    * :class:`FollowTheLoser` -- Follow-the-Loser (mean reversion) strategies
+    * :class:`BCRP` -- Best Constant Rebalanced Portfolio
+    * :func:`regret` -- Regret computation
 
-    # Next batch (warm_start=True preserves state)
-    X_new_batch = load_new_data()
-    model.partial_fit(X_new_batch)
-
-Learning Rate Schedules and Auto-Tuning
-----------------------------------------
-
-Learning rates control convergence speed. The module offers:
-
-- **Constant**: :math:`\eta_t = \eta` (simplest, requires manual tuning)
-- **Scheduled**: :math:`\eta_t = \eta / \sqrt{t}` (standard OCO decay)
-- **Callables**: :math:`\eta_t = f(t)` (custom schedules)
-- **Auto**: Automatically tuned based on strategy and data properties
-
-.. code-block:: python
-
-    # Manual constant
-    model1 = FollowTheWinner(strategy=FTWStrategy.EG, learning_rate=0.5)
-
-    # Manual schedule (callable)
-    def my_schedule(t):
-        return 1.0 / np.sqrt(t + 1)
-    model2 = FollowTheWinner(strategy=FTWStrategy.OGD, learning_rate=my_schedule)
-
-    # Auto-tuned (recommended for new users)
-    model3 = FollowTheWinner(strategy=FTWStrategy.ADAGRAD, learning_rate="auto")
-    model3.fit(X)
-
-Mirror Maps and Geometry
--------------------------
-
-The underlying optimization geometry is controlled by mirror maps:
-
-.. code-block:: python
-
-    from skfolio.optimization.online._mirror_maps import (
-        EuclideanMirrorMap, EntropyMirrorMap, BurgMirrorMap, AdaptiveMahalanobisMap
-    )
-
-    # Entropy geometry (EG-style multiplicative updates)
-    model_eg = FollowTheWinner(
-        strategy=FTWStrategy.EG,  # Uses entropy mirror map internally
-    )
-
-    # Euclidean geometry (OGD-style additive updates)
-    model_ogd = FollowTheWinner(
-        strategy=FTWStrategy.OGD,  # Uses Euclidean mirror map internally
-    )
-
-    # Adaptive Mahalanobis geometry (AdaGrad-style)
-    model_ada = FollowTheWinner(
-        strategy=FTWStrategy.ADAGRAD,  # Element-wise adaptive geometry
-    )
-
-Optimistic Predictions for Smooth Markets
--------------------------------------------
-
-When gradients vary slowly (smooth environments), optimistic updates can achieve faster convergence:
-
-.. code-block:: python
-
-    model = FollowTheWinner(
-        strategy=FTWStrategy.EG,
-        grad_predictor="smooth",  # Predict next gradient as smoothly varying
-        smooth_epsilon=1.0,       # Smoothness strength (larger = assume smoother)
-    )
-    model.fit(X)
-
-Practical Guidance
-==================
-
-Which Strategy Should I Use?
-----------------------------
-
-**When markets are trending (momentum dominates):**
-  - Use Follow-The-Winner: EG or AdaGrad
-  - Higher expected log-wealth growth
-  - Watch for trend reversals; consider dynamic regret for market changes
-
-**When markets mean-revert (reversals dominate):**
-  - Use Follow-The-Loser: OLMAR, PAMR, or CWMR
-  - Exploit short-term price overshoots
-  - Choose CWMR for markets with high outlier probability (flash crashes)
-
-**When uncertain about market regime:**
-  - Use SWORD (meta-learner over experts)
-  - Or compare all strategies on historical data and backtest
-  - Adaptive methods (AdaGrad, Ada-BARRONS) often robust across regimes
-
-**When transaction costs are high (>50 bps):**
-  - High-turnover strategies (FTW, PAMR) may be unprofitable
-  - Use low-turnover methods with turnover constraints
-  - Consider CRP (fixed allocation) as strong competitor
-
-**For crypto, commodities, or thin-traded assets:**
-  - Mean reversion often stronger due to lack of fundamental anchoring
-  - CWMR or RMR recommended for outlier resistance
-  - Use management fees parameter to model slippage
-
-**For equity indices (S&P 500, etc.):**
-  - Weak mean reversion, slight momentum trending
-  - EG and AdaGrad often competitive
-  - BCRP strong baseline; hard to beat without excess transaction costs
-
-Parameter Tuning Heuristics
-----------------------------
-
-- **Learning rate** (:math:`\eta`):
-  - Start with "auto" (recommended)
-  - If want faster adaptation: increase :math:`\eta`
-  - If concerned about overfitting: decrease :math:`\eta`
-  - Typical range: 0.01 to 10.0
-
-- **Mean-reversion epsilon** (:math:`\varepsilon`):
-  - Larger → fewer active trades (more conservative)
-  - Smaller → more active mean reversion
-  - Typical range: 0.5 to 2.0
-  - Default: 1.0 (exploit margin up to 100% underperformance)
-
-- **PAMR aggressiveness** (:math:`C`):
-  - Larger → stronger reversion push
-  - Smaller → weaker reversion (closer to EG)
-  - Default: 500.0 (quite aggressive)
-  - Try 100-1000 depending on reversion strength
-
-- **CWMR confidence** (:math:`\eta`):
-  - Larger (closer to 1.0) → tighter probabilistic bounds, stronger reversion
-  - Smaller (closer to 0.5) → looser bounds, milder reversion
-  - Default: 0.95 (95% confidence level)
-
-- **OLMAR window** (OLMAR-1):
-  - Larger → smoother reversion predictor, slower adaptation
-  - Smaller → noisier predictor, faster changes
-  - Typical: 3-10 (default: 5)
-
-- **OLMAR alpha** (OLMAR-2):
-  - Closer to 1.0 → weight recent observations more
-  - Closer to 0.0 → give equal weight to all past
-  - Default: 0.5 (balanced)
-
-Complete Workflow Example
----------------------------
-
-.. code-block:: python
-
-    import numpy as np
-    import pandas as pd
-    from skfolio.datasets import load_sp500_relatives_dataset
-    from skfolio.optimization.online import (
-        FollowTheWinner, FollowTheLoser, FTWStrategy, FTLStrategy,
-        BCRP, UCRP, regret, RegretType
-    )
-    from skfolio.measures import RiskMeasure
-
-    # 1. Load and split data
-    X = load_sp500_relatives_dataset(net_returns=True)
-    split = int(0.7 * len(X))
-    X_train, X_test = X.iloc[:split], X.iloc[split:]
-
-    # 2. Define strategies
-    strategies = {
-        "EG": FollowTheWinner(strategy=FTWStrategy.EG, learning_rate="auto"),
-        "AdaGrad": FollowTheWinner(strategy=FTWStrategy.ADAGRAD, learning_rate="auto"),
-        "OLMAR": FollowTheLoser(strategy=FTLStrategy.OLMAR, update_mode="pa"),
-        "PAMR": FollowTheLoser(strategy=FTLStrategy.PAMR, update_mode="pa"),
-    }
-
-    # 3. Train on train set
-    for name, model in strategies.items():
-        model.fit(X_train)
-        print(f"{name} trained, final weight concentration: {model.weights_.max():.2%}")
-
-    # 4. Evaluate on test set with regret
-    comparator = BCRP()
-    comparator.fit(X_test)
-
-    results = []
-    for name, model in strategies.items():
-        regrets = regret(model, X_test, comparator=comparator, regret_type=RegretType.STATIC)
-        port = model.predict(X_test)
-        results.append({
-            "Strategy": name,
-            "Cumulative Return (%)": 100 * (port.wealth[-1] - 1),
-            "Annualized Sharpe": port.annualized_sharpe_ratio,
-            "Max Drawdown (%)": 100 * port.max_drawdown,
-            "Final Regret (nats)": regrets[-1],
-        })
-
-    df_results = pd.DataFrame(results)
-    print(df_results.to_string(index=False))
-
-    # 5. Deep dive: Analyze best performer
-    best_strategy = strategies["EG"]  # Example
-    print(f"\nBest strategy 'EG':")
-    print(f"  - All weights shape: {best_strategy.all_weights_.shape}")
-    print(f"  - Weight std across time: {best_strategy.all_weights_.std(axis=0).mean():.4f}")
-    print(f"  - Average position concentration: {best_strategy.all_weights_.max(axis=1).mean():.2%}")
-
-References and Further Reading
-===============================
-
-**Core Theory**
-
-- Hazan, E. (2023). *Introduction to Online Convex Optimization* (2nd ed.). MIT Press.
-  `[PDF available at elad.hazan.org] <https://www.cs.princeton.edu/~ehazan/>`_
-
-- Orabona, F. (2020+). *A Modern Introduction to Online Learning* (2nd ed.). MIT Press.
-  `[Draft available at francescorabona.eu] <https://francescorabona.eu/>`_
-
-**OPS Surveys and Foundations**
-
-- Li, B., & Hoi, S. C. H. (2018). Online Portfolio Selection: A Survey.
-  *ACM Computing Surveys*, 49(2), 1-36.
-  `[arXiv:1212.2129] <https://arxiv.org/abs/1212.2129>`_
-
-- Li, B., Hoi, S. C. H., Zhao, P., & Gopalkrishnan, V. (2012). Confidence Weighted
-  Mean Reversion Strategy for Online Portfolio Selection.
-  *In Proceedings of AISTATS*.
-
-**Specific Algorithms**
-
-- Li, B., Zhao, P., Hoi, S. C. H., & Gopalkrishnan, V. (2012). PAMR: Passive Aggressive
-  Mean Reversion strategy for portfolio selection. *Machine Learning*, 87(2), 221-258.
-
-- Huang, D., Zhou, J., Li, B., Hoi, S. C. H., & Zhou, S. (2013). Robust Median Reversion
-  Strategy for Online Portfolio Selection. *In Proceedings of IJCAI*.
-
-- Orseau, L., Lattimore, T., & Legg, S. (2017). Soft-Bayes: Product Rule for Mixtures
-  of Experts with Log-Loss. *In Algorithmic Learning Theory (PMLR 76)*, 73-90.
-
-**OCO and Mirror Descent**
-
-- McMahan, H. B. (2011). Follow-the-Regularized-Leader and Mirror Descent: Equivalence
-  Theorems and L1 Regularization. *In Proceedings of AISTATS*.
-
-- Chiang, C. K., Yang, T., Lee, C. J., Mahdavi, M., & Zhu, C. J. (2012). Online
-  Optimization with Gradual Variations. *In Proceedings of COLT*.
-
-**Regret Analysis**
-
-- Awerbuch, B., & Kleinberg, R. M. (2008). Adaptive Routing with End-to-End
-  Feedback: Distributed Learning and Geometric Approaches.
-  *In Proceedings of STOC*, 45-53.
-
-**Benchmarking Datasets**
-
-- OLPS Codebase: `http://olps.stevenhoi.org <http://olps.stevenhoi.org>`_
-  Includes canonical datasets: NYSE-O, TSE, DJIA, MSCI, S&P 500, CMC20.
-
-See Also
-========
-
-- :ref:`convex` — Batch (offline) portfolio optimization
-- :class:`~skfolio.optimization.RiskBudgeting` — Risk parity methods
-- :class:`~skfolio.optimization.HierarchicalRiskParity` — Clustering-based hierarchical allocation
-- :func:`~skfolio.optimization.online.regret` — Compute regret curves
+For the offline optimization methods, see :ref:`optimization`.

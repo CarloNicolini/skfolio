@@ -95,6 +95,7 @@ class FirstOrderOCO:
         predictor: Predictor | None = None,
         mode: Literal["omd", "ftrl"] = "omd",
         skip_auto_update: bool = False,
+        discount: float | None = None,
     ):
         self.map = mirror_map
         self.projector = projector
@@ -102,6 +103,7 @@ class FirstOrderOCO:
         self.predictor = predictor
         self.mode = mode
         self.skip_auto_update = skip_auto_update
+        self.discount = discount
         self._t = 0
         self._G_sum: np.ndarray | None = None
         self._x_t: np.ndarray | None = None
@@ -166,6 +168,8 @@ class FirstOrderOCO:
                 if m_t.shape != g.shape:
                     raise ValueError("Predictor returned vector with wrong shape.")
 
+        if self.discount is not None:
+            self._G_sum *= self.discount
         self._G_sum += g
 
         # Special handling for BurgMirrorMap (Prod/Soft-Bayes algorithm)

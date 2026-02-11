@@ -208,6 +208,15 @@ def _solve_bcrp_constant(
             w = w_next
             break
         w = w_next
+    else:
+        import warnings
+
+        warnings.warn(
+            f"BCRP solver did not converge after {max_iter} iterations (L1 change = {np.linalg.norm(w_next - w, 1):.2e}, tol = {tol:.2e}). "
+            "Consider increasing max_iter.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     return w
 

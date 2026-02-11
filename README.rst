@@ -168,6 +168,10 @@ Available models
         * Nested Clusters Optimization
     * Ensemble Methods:
         * Stacking Optimization
+    * Online Portfolio Selection:
+        * Follow-the-Winner (EG, OGD, AdaGrad, PROD, SWORD, Ada-BARRONS)
+        * Follow-the-Loser (OLMAR, PAMR, CWMR, RMR)
+        * Benchmarks (BCRP, UCRP, CRP, BestStock)
 
 * Expected Returns Estimator:
     * Empirical
@@ -372,7 +376,18 @@ Predict on Test Set
     print(portfolio.annualized_sharpe_ratio)
     print(portfolio.summary())
 
+Online Portfolio (streaming)
+---------------------------
+.. code-block:: python
 
+    from skfolio.optimization.online import FollowTheWinner
+
+    model = FollowTheWinner(strategy="eg")
+    model.fit(X)
+    # or use partial_fit one row at a time
+    for t in range(len(X)):
+        model.partial_fit(X.iloc[[t]])
+    print(model.weights_)
 
 Maximum Sortino Ratio
 ---------------------

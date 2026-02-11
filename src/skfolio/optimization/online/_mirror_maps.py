@@ -589,70 +589,48 @@ class BurgMirrorMap(BaseMirrorMap):
         >>> eta = 0.1
         >>> w_new, lam = mirror.constrained_inverse(w, eta, g)
         """
-        from scipy.optimize import newton
+        from scipy.optimize import brentq
 
         w_t = np.maximum(w, self.eps)
         eta = float(eta)
 
         def sum_weights_residual(lam: float) -> float:
-            """
-            Residual function: Σ w_i(λ) - 1.
-
-            Returns
-            -------
-            float
-                Sum of weights minus 1 (zero at optimal λ).
-            """
+            """Residual function: Σ w_i(λ) - 1."""
             denom = 1.0 + eta * w_t * (g - lam)
-            # Clamp denominators away from zero for numerical stability
             denom = np.where(np.abs(denom) < self.eps, self.eps, denom)
             w_lam = w_t / denom
             return float(np.sum(w_lam)) - 1.0
 
-        # Initial guess for λ: mean of gradients
-        lam_init = float(np.mean(g))
+        # Bracket λ: denominators must stay positive for all i.
+        # denom_i = 1 + eta * w_i * (g_i - lam) > 0
+        # => lam < g_i + 1/(eta * w_i)  for all i
+        # As lam -> -inf, all denom -> +inf, sum(w) -> 0, residual -> -1
+        # As lam -> upper bound, some denom -> 0+, sum(w) -> +inf, residual -> +inf
+        safe_ub = float(np.min(g + 1.0 / (eta * w_t + self.eps)))
+        lam_high = safe_ub - self.eps  # stay just below singularity
+        lam_low = float(np.min(g)) - 10.0 / (eta + self.eps)
 
-        # Use scipy.optimize.newton with secant method (no derivative needed)
+        # Ensure bracket has opposite signs (widen if needed)
+        f_low = sum_weights_residual(lam_low)
+        f_high = sum_weights_residual(lam_high)
+        # If bracket doesn't straddle zero, expand lower bound
+        for _ in range(20):
+            if f_low * f_high < 0:
+                break
+            lam_low -= 10.0 / (eta + self.eps)
+            f_low = sum_weights_residual(lam_low)
+
         try:
-            lam_opt = newton(
+            lam_opt = brentq(
                 sum_weights_residual,
-                x0=lam_init,
+                lam_low,
+                lam_high,
+                xtol=self.tol,
                 maxiter=self.max_iter,
-                tol=self.tol,
             )
-        except RuntimeError as e:
-            # Fallback to bisection if secant fails
-            import warnings
-
-            warnings.warn(
-                f"Secant method failed for Burg λ solver: {e}. "
-                "Falling back to bisection.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            # Bracket: λ must be in range where all denominators are positive
-            g_min, g_max = float(np.min(g)), float(np.max(g))
-            # Safe upper bound: slightly below min_i(g_i + 1/(eta * w_i))
-            safe_ub = g_min + 0.99 / (eta * float(np.max(w_t)) + self.eps)
-            lam_low = g_min - 10.0 / (eta + self.eps)
-            lam_high = min(safe_ub, g_max + 10.0 / (eta + self.eps))
-
-            # Bisection
-            for _ in range(self.max_iter):
-                lam_mid = 0.5 * (lam_low + lam_high)
-                f_mid = sum_weights_residual(lam_mid)
-
-                if abs(f_mid) < self.tol:
-                    lam_opt = lam_mid
-                    break
-
-                f_low = sum_weights_residual(lam_low)
-                if f_low * f_mid < 0:
-                    lam_high = lam_mid
-                else:
-                    lam_low = lam_mid
-            else:
-                lam_opt = 0.5 * (lam_low + lam_high)
+        except ValueError:
+            # Degenerate case: use midpoint
+            lam_opt = 0.5 * (lam_low + lam_high)
 
         # Compute final weights with optimal λ
         denom = 1.0 + eta * w_t * (g - lam_opt)

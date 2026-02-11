@@ -3,6 +3,7 @@ import pytest
 from numpy.testing import assert_allclose
 from scipy.stats import dirichlet
 
+from skfolio.optimization.online._foco import FirstOrderOCO
 from skfolio.optimization.online._mirror_maps import (
     AdaptiveLogBarrierMap,
     AdaptiveMahalanobisMap,
@@ -13,6 +14,7 @@ from skfolio.optimization.online._mirror_maps import (
     LogBarrierMap,
     TsallisMirrorMap,
 )
+from skfolio.optimization.online._projection import IdentityProjector
 
 
 # Helper functions
@@ -450,3 +452,39 @@ def test_prod_mirror_map_interface():
         assert np.all(w >= 0)
         assert np.isclose(np.sum(w), 1.0, atol=1e-10)
         assert np.all(np.isfinite(w))
+
+
+def test_burg_constrained_inverse_large_eta():
+    """Burg solver must return valid simplex weights even with large eta,
+    without falling back to bisection (no RuntimeWarning).
+    """
+    mirror = BurgMirrorMap()
+    w = np.array([0.5, 0.3, 0.2])
+    g = np.array([2.0, -1.5, 0.5])  # adversarial: large magnitude
+    eta = 5.0  # large step size
+
+    import warnings as _w
+
+    with _w.catch_warnings():
+        _w.simplefilter("error", RuntimeWarning)
+        w_next, lam = mirror.constrained_inverse(w, eta, g)
+    assert np.all(np.isfinite(w_next)), "Non-finite weights from Burg solver"
+    assert np.all(w_next >= 0), "Negative weights from Burg solver"
+    assert np.isclose(np.sum(w_next), 1.0, atol=1e-6), "Weights don't sum to 1"
+
+
+def test_burg_constrained_inverse_singularity_near():
+    """Burg solver must converge when a singularity is near the initial guess, without falling back to bisection (no RuntimeWarning)."""
+    mirror = BurgMirrorMap()
+    w = np.array([0.5, 0.3, 0.2])
+    eta = 4.0
+    g = np.array([-0.5, 0.3, 0.2])  # denom_0 = 1 + 4*0.5*(-0.5) = 0.0!
+
+    import warnings as _w
+
+    with _w.catch_warnings():
+        _w.simplefilter("error", RuntimeWarning)
+        w_next, lam = mirror.constrained_inverse(w, eta, g)
+    assert np.all(np.isfinite(w_next)), "Non-finite weights near singularity"
+    assert np.all(w_next >= 0), "Negative weights near singularity"
+    assert np.isclose(np.sum(w_next), 1.0, atol=1e-6)

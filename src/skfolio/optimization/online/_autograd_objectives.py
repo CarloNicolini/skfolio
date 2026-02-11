@@ -8,9 +8,13 @@ OCO-Compatible Measures
 The following measures are convex (or exp-concave) in portfolio weights and
 suitable for online optimization with regret guarantees:
 
+**Exp-Concave (O(n log T) regret with ONS/second-order methods)**:
+- Log-Wealth (Hazan Ch. 6: rank-1 Hessian)
+- EVaR (Entropic Value at Risk)
+- EDaR (Entropic Drawdown at Risk)
+
 **Strongly Convex (O(log T) regret with appropriate step sizes)**:
-- Variance (quadratic)
-- Log-Wealth (exp-concave)
+- Variance (quadratic, full-rank Hessian)
 
 **Convex (O(√T) regret)**:
 - Standard Deviation
@@ -18,11 +22,9 @@ suitable for online optimization with regret guarantees:
 - Mean Absolute Deviation
 - First Lower Partial Moment
 - CVaR (Conditional Value at Risk)
-- EVaR (Entropic Value at Risk, also exp-concave)
 - Worst Realization
 - Gini Mean Difference
 - CDaR (Conditional Drawdown at Risk)
-- EDaR (Entropic Drawdown at Risk, also exp-concave)
 
 **Linear (O(√T) regret)**:
 - Mean (expected return)
@@ -1048,6 +1050,13 @@ MEASURE_PROPERTIES = {
         "convexity": "exp-concave",
         "sign": -1,  # maximize wealth = minimize negative log
         "notes": "1-exp-concave, O(log T) regret. Analytical gradient available.",
+    },
+    # Performance measures (maximize => sign = -1)
+    PerfMeasure.MEAN: {
+        "measure_func": mean,
+        "convexity": "linear",
+        "sign": -1,  # maximize mean = minimize negative mean
+        "notes": "Linear, O(sqrt(T)) regret. Analytical gradient available.",
     },
     # Risk measures (minimize)
     RiskMeasure.VARIANCE: {

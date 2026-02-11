@@ -126,8 +126,8 @@ class FollowTheLoser(OnlinePortfolioSelection):
     cwmr_sigma0 : float, default=1.0
         CWMR initial diagonal variance. Only used with ``strategy="cwmr"``.
 
-    cwmr_min_var : float | None, default=1e-12
-        CWMR minimum variance bound (prevents numerical underflow).
+    cwmr_min_var : float | None, default=1e-6
+        CWMR minimum variance bound (prevents variance degeneration).
         Only used with ``strategy="cwmr"``.
 
     cwmr_max_var : float | None, default=None
@@ -317,7 +317,7 @@ class FollowTheLoser(OnlinePortfolioSelection):
         pamr_C: float = 500.0,
         cwmr_eta: float = 0.95,
         cwmr_sigma0: float = 1.0,
-        cwmr_min_var: float | None = 1e-12,
+        cwmr_min_var: float | None = 1e-6,
         cwmr_max_var: float | None = None,
         cwmr_mean_lr: float = 1.0,
         cwmr_var_lr: float = 1.0,

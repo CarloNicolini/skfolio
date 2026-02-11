@@ -96,6 +96,8 @@ def estimate_gradient_bound(
     clip_relative_lower: float = 0.6,
     clip_relative_upper: float = 1.4,
     historical_returns: np.ndarray | None = None,
+    n_assets: int | None = None,
+    norm: Literal["linf", "l2"] = "linf",
 ) -> float:
     """Estimate gradient bound for given objective using MEASURE_PROPERTIES.
 
@@ -109,6 +111,15 @@ def estimate_gradient_bound(
         Default [0.6, 1.4] corresponds to ±40% daily returns.
     historical_returns : np.ndarray | None
         Historical returns for data-dependent estimation (variance, mean, etc.).
+    n_assets : int | None
+        Number of assets. Required when ``norm="l2"`` for exp-concave objectives
+        to correctly scale the bound by sqrt(n).
+    norm : {"linf", "l2"}, default="linf"
+        Which norm to compute the gradient bound in:
+
+        - ``"linf"``: L-infinity bound (suitable for entropy / EG geometry).
+        - ``"l2"``: L2 bound (suitable for Euclidean / OGD geometry).
+          For exp-concave objectives this scales the L-inf bound by sqrt(n).
 
     Returns
     -------
@@ -125,8 +136,9 @@ def estimate_gradient_bound(
     Uses MEASURE_PROPERTIES['convexity'] to determine gradient estimation:
 
     **"exp-concave"** (log-wealth):
-    - Gradient: ∇L(w) = -x / (w^T x)
-    - With relatives in [0.6, 1.4]: G ≈ 2.0
+    - Gradient: g = -r / (1 + w^T r) where r are net returns
+    - L-inf bound: max|r_i| / min(1 + w^T r)
+    - L2 bound: sqrt(n) * L-inf bound (Cauchy-Schwarz on simplex)
 
     **"strongly_convex"** (variance):
     - Gradient: ∇Var(w) = 2Σw
@@ -136,17 +148,9 @@ def estimate_gradient_bound(
     **"linear"** (mean):
     - Gradient: ∇Mean(w) = E[X] (constant)
     - Bound: G = ||E[X]||_2, requires data
-    - Typical daily: G ≈ 0.0005-0.001
 
     **"convex"** (cvar, semi-deviation, etc.):
     - Data-dependent, use conservative default G ≈ 1.0
-
-    Examples
-    --------
-    >>> estimate_gradient_bound(None)  # logwealth
-    0.8
-    >>> estimate_gradient_bound("variance", historical_returns=np.random.randn(100, 5) * 0.01)
-    0.01...
     """
     # Normalize objective to measure key
     objective = objective or PerfMeasure.LOG_WEALTH
@@ -166,11 +170,17 @@ def estimate_gradient_bound(
     match convexity:
         case "exp-concave":
             # Log-wealth, EVaR, EDaR
+            # L-inf bound: max|r_i| / min(1 + w^T r) <= max_relative / (1 - max_relative)
+            # Conservative overestimate: max_relative * 2.0
             max_relative = max(
                 abs(clip_relative_lower - 1.0),
                 abs(clip_relative_upper - 1.0),
             )
-            return float(max_relative * 2.0)  # ~0.8 for ±40% moves
+            g_linf = float(max_relative * 2.0)  # ~0.8 for ±40% moves
+            if norm == "l2" and n_assets is not None:
+                # L2 bound: ||g||_2 <= sqrt(n) * ||g||_inf (Cauchy-Schwarz)
+                return g_linf * np.sqrt(n_assets)
+            return g_linf
 
         case "strongly_convex":
             # Variance: G = 2||Σ||_op
@@ -196,9 +206,9 @@ def compute_ogd_learning_rate(
     t: int,
     diameter: float,
     gradient_bound: float,
-    scale: Literal["theory", "moderate", "empirical"] = "empirical",
+    scale: Literal["theory", "moderate", "empirical"] = "theory",
 ) -> float:
-    """Compute OGD learning rate with empirically-validated scaling.
+    """Compute OGD learning rate.
 
     Parameters
     ----------
@@ -208,12 +218,12 @@ def compute_ogd_learning_rate(
         Domain diameter (√2 for standard simplex).
     gradient_bound : float
         Gradient bound G (Lipschitz constant). For log-wealth, G≈0.8.
-    scale : {"theory", "empirical"}, default="empirical"
+    scale : {"theory", "moderate", "empirical"}, default="theory"
         Scaling mode:
 
-        - **"theory"**: D/(G√(t+1)) - Standard OCO bound
-        - **"empirical"**: Boost by √n factor for real financial data
-          η_t ≈ (√n) · D/(G√(t+1))
+        - **"theory"**: D/(G√(t+1)) — Standard OCO bound (Zinkevich 2003)
+        - **"moderate"**: 2√2 · D/(G√(t+1)) — Hazan's constant
+        - **"empirical"**: √2 · D/(G√(t+1)) — Mild boost over theory
 
     Returns
     -------
@@ -223,33 +233,30 @@ def compute_ogd_learning_rate(
     Notes
     -----
     For Online Gradient Descent (OGD) on a convex domain with diameter D
-    and Lipschitz gradients bounded by G, theory gives η_t = D/(G√t).
-
-    - Portfolio variance ∝ 1/n → effective gradient ∝ 1/√n
-    - This allows a √n larger learning rate in practice
+    and Lipschitz gradients bounded by G, the regret-optimal rate is
+    η_t = D/(G√t).
     """
     base_rate = diameter / (gradient_bound * np.sqrt(t + 1))
 
     match scale:
         case "theory":
             return base_rate
-
-        case "empirical" | "moderate":
-            # Empirical boost: approximate √n factor from diversification
-            # For typical portfolios, this is ~8-10x (√64 = 8, √100 = 10)
-            # We use a conservative 6.4x boost (√40) as middle ground
-            empirical_boost = 6.4
-            return base_rate * empirical_boost
+        case "moderate":
+            return base_rate * 2.0 * np.sqrt(2.0)
+        case "empirical":
+            return base_rate * np.sqrt(2.0)
         case _:
-            raise ValueError("Not supported scale")
+            raise ValueError(
+                f"Unknown scale '{scale}'. Choose 'theory', 'moderate', or 'empirical'."
+            )
 
 
 def compute_eg_learning_rate(
     t: int,
     n_assets: int,
-    scale: Literal["theory", "moderate", "empirical"] = "empirical",
+    scale: Literal["theory", "moderate", "empirical"] = "theory",
 ) -> float:
-    """Compute EG learning rate with empirically-validated scaling options.
+    """Compute EG (Exponentiated Gradient) learning rate.
 
     Parameters
     ----------
@@ -257,12 +264,12 @@ def compute_eg_learning_rate(
         Current time step (0-indexed). Internally converted to 1-indexed.
     n_assets : int
         Number of assets (dimension).
-    scale : {"theory", "moderate", "empirical"}, default="empirical"
+    scale : {"theory", "moderate", "empirical"}, default="theory"
         Scaling mode:
 
-        - **"theory"**: √(log(n)/(t+1)) - Hazan's worst-case OCO bound
-        - **"moderate"**: √(8·log(n)/(t+1)) - 2√2 boost (Hazan's book constant)
-        - **"empirical"**: n/√(t+1) - **Validated on 10 real financial datasets**
+        - **"theory"**: √(log(n)/(t+1)) — Hazan's worst-case OCO bound
+        - **"moderate"**: √(8·log(n)/(t+1)) — 2√2 boost (Hazan's book constant)
+        - **"empirical"**: √(2·log(n)/(t+1)) — Mild √2 boost over theory
 
     Returns
     -------
@@ -271,28 +278,23 @@ def compute_eg_learning_rate(
 
     Notes
     -----
-    - **"empirical"**: Recommended for real portfolio selection (90-95% of optimal)
-    - **"moderate"**: Balanced approach (75-85% of optimal)
-    - **"theory"**: Adversarial/worst-case scenarios (70-80% of optimal)
+    All three scales preserve the same O(√(T log n)) regret guarantee
+    (up to constants). The "theory" rate is the most conservative and is
+    recommended as default for general-purpose use.
 
     References
     ----------
-    - Theory: Hazan (2016), "Introduction to Online Convex Optimization", Corollary 7.2
+    - Hazan (2016), "Introduction to Online Convex Optimization", Corollary 7.2
     """
     match scale:
         case "theory":
-            # Hazan's original: sqrt(log(n)/t)
             return np.sqrt(np.log(n_assets) / (t + 1))
 
         case "moderate":
-            # 2*sqrt(2) boost (Hazan's book constant)
             return np.sqrt(8.0 * np.log(n_assets) / (t + 1))
 
         case "empirical":
-            # Validated on real financial data: n/sqrt(t)
-            # Achieves 90-95% of optimal BCRP for moderate-to-large n.
-            # For very small dimensions (n<=4), this can be too timid; use a floor.
-            return n_assets / np.sqrt(t + 1)
+            return np.sqrt(2.0 * np.log(n_assets) / (t + 1))
 
         case _:
             raise ValueError(
@@ -300,10 +302,8 @@ def compute_eg_learning_rate(
             )
 
 
-def compute_prod_learning_rate(
-    t: int, n_assets: int, scale: str = "empirical"
-) -> float:
-    """Compute PROD learning rate with empirically-validated scaling options.
+def compute_prod_learning_rate(t: int, n_assets: int, scale: str = "theory") -> float:
+    """Compute PROD (Soft-Bayes) learning rate.
 
     Parameters
     ----------
@@ -311,11 +311,12 @@ def compute_prod_learning_rate(
         Current time step (0-indexed). Internally converted to 1-indexed.
     n_assets : int
         Number of assets (dimension).
-    scale : {"theory", "moderate", "empirical"}, default="empirical"
+    scale : {"theory", "moderate", "empirical"}, default="theory"
         Scaling mode (same as EG):
-        - **"theory"**: √(log(n)/(t+1)) - Worst-case OCO bound
-        - **"moderate"**: √(8·log(n)/(t+1)) - 2√2 boost
-        - **"empirical"**: n/√(t+1) - Validated on real data
+
+        - **"theory"**: √(log(n)/(t+1)) — Worst-case OCO bound
+        - **"moderate"**: √(8·log(n)/(t+1)) — 2√2 boost
+        - **"empirical"**: √(2·log(n)/(t+1)) — Mild √2 boost over theory
 
     Returns
     -------
@@ -324,22 +325,18 @@ def compute_prod_learning_rate(
 
     Notes
     -----
-    PROD (Soft-Bayes Product algorithm) uses Burg entropy (log-barrier) mirror map.
-    The optimal rate follows the same scaling as EG, with empirical validation
-    showing n/√t achieves 90-95% of optimal BCRP on financial datasets.
+    PROD (Soft-Bayes Product algorithm) uses Burg entropy (log-barrier) mirror
+    map. The optimal rate follows the same scaling as EG.
     """
     match scale:
         case "theory":
-            # Original: sqrt(log(n)/t)
             return np.sqrt(np.log(n_assets) / (t + 1))
 
         case "moderate":
-            # 2*sqrt(2) boost
             return np.sqrt(8.0 * np.log(n_assets) / (t + 1))
 
         case "empirical":
-            # Validated on real financial data: n/sqrt(t)
-            return n_assets / np.sqrt(t + 1)
+            return np.sqrt(2.0 * np.log(n_assets) / (t + 1))
 
         case _:
             raise ValueError(
@@ -391,9 +388,9 @@ def get_auto_learning_rate(
     objective: BaseMeasure | None = None,
     gradient_bound: float | None = None,
     historical_returns: np.ndarray | None = None,
-    scale: str = "empirical",
+    scale: str = "theory",
 ) -> Callable[[int], float]:
-    """Get automatic learning rate for strategy and objective with empirical scaling.
+    """Get automatic learning rate for strategy and objective.
 
     Parameters
     ----------
@@ -410,13 +407,12 @@ def get_auto_learning_rate(
         If provided, use this G directly; else estimate from objective.
     historical_returns : np.ndarray | None
         Historical data for variance/mean gradient estimation.
-    scale : {"theory", "moderate", "empirical"}, default="empirical"
+    scale : {"theory", "moderate", "empirical"}, default="theory"
         Scaling mode for learning rates:
 
-        - **"empirical"**: n/√t for EG/PROD, √n boost for OGD
-          **Validated on 10 real financial datasets, achieves 90-95% of optimal BCRP**
-        - **"moderate"**: √(8·log(n)/t) for EG/PROD (Hazan's book constant)
-        - **"theory"**: √(log(n)/t) for EG/PROD (worst-case OCO bound)
+        - **"theory"**: √(log(n)/(t+1)) for EG/PROD, D/(G√(t+1)) for OGD
+        - **"moderate"**: 2√2 boost over theory (Hazan's book constant)
+        - **"empirical"**: √2 boost over theory (mild increase)
 
     Returns
     -------
@@ -429,12 +425,6 @@ def get_auto_learning_rate(
     ------
     ValueError
         If strategy is unknown or objective cannot be estimated.
-
-    Warnings
-    --------
-    UserWarning
-        If objective is not None/logwealth and gradient_bound is not provided,
-        warn that auto learning rate may be suboptimal.
     """
     if strategy not in FTWStrategy:
         raise ValueError(f"Unknown strategy {strategy}")
@@ -453,11 +443,14 @@ def get_auto_learning_rate(
         budget=budget,
     )
 
-    # Estimate gradient bound
+    # Estimate gradient bound (OGD needs L2 norm; others use L-inf or don't use G)
     if gradient_bound is None:
+        ogd_norm = "l2" if strategy == FTWStrategy.OGD else "linf"
         gradient_bound = estimate_gradient_bound(
             objective=objective,
             historical_returns=historical_returns,
+            n_assets=n_assets,
+            norm=ogd_norm,
         )
         # Warn if using non-default objective without explicit bound
         # Check if objective is logwealth (None, PerfMeasure.LOG_WEALTH, or "logwealth" string)
@@ -470,7 +463,6 @@ def get_auto_learning_rate(
 
     match strategy:
         case FTWStrategy.OGD:
-            # Time-varying: η(t) = D/(G√t) with optional empirical boost
             return lambda t: compute_ogd_learning_rate(
                 t, diameter, gradient_bound, scale=scale
             )

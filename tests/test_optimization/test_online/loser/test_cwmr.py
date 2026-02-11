@@ -169,3 +169,21 @@ def test_cwmr_state_persists_between_modes():
     sigma_md = model._cwmr_Sdiag.copy()
     assert np.allclose(mu_pa.shape, mu_md.shape)
     assert np.all(sigma_md > 0.0)
+
+
+def test_cwmr_variance_does_not_degenerate_after_many_rounds(X_small):
+    """CWMR variance must stay above a sensible floor after many rounds.
+
+    Without a reasonable min_var, the variance can shrink to machine epsilon, making CWMR unable to adapt.
+    The OLPS reference implementation always clips.
+    """
+    model = _make_cwmr(cwmr_eta=0.95, cwmr_sigma0=1.0)
+    model.fit(X_small)  # ~250 rounds of SP500 data
+
+    diag = model._cwmr_Sdiag
+    assert diag is not None, "CWMR variance not initialized"
+    # After many rounds, variance should stay above 1e-6 (not degenerate to ~0)
+    assert np.all(diag >= 1e-6), (
+        f"CWMR variance degenerated: min={diag.min():.2e}. "
+        "Need a higher default cwmr_min_var."
+    )
