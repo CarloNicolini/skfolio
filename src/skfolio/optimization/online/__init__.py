@@ -9,7 +9,7 @@ from skfolio.optimization.online._loser import (
     FTLStrategy,
     FollowTheLoser,
 )
-from skfolio.optimization.online._regret import RegretType, regret
+from skfolio.optimization.online._regret import RegretType, plot_regret_curve, regret
 from skfolio.optimization.online._winner import FTWStrategy, FollowTheWinner
 
 __all__ = [
@@ -21,6 +21,7 @@ __all__ = [
     "FTLStrategy",
     "FTWStrategy",
     "regret",
+    "plot_regret_curve",
     "RegretType",
     "UCRP",
 ]

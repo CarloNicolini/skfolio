@@ -7,10 +7,12 @@
 from __future__ import annotations
 
 import warnings
+from copy import deepcopy
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+from sklearn.base import check_is_fitted
 from sklearn.utils.validation import _check_sample_weight, validate_data
 
 import skfolio.typing as skt
@@ -23,6 +25,7 @@ from skfolio.optimization.online._projection import (
     ProjectionConfig,
 )
 from skfolio.optimization.online._utils import net_to_relatives
+from skfolio.portfolio import MultiPeriodPortfolio, Portfolio
 from skfolio.utils.tools import input_to_array
 
 
@@ -58,8 +61,14 @@ class OnlinePortfolioSelection(BaseOptimization, OnlineParameterConstraintsMixin
         covariance: npt.ArrayLike | None = None,
         variance_bound: float | None = None,
         portfolio_params: dict | None = None,
+        fallback: skt.Fallback = None,
+        raise_on_failure: bool = True,
     ):
-        super().__init__(portfolio_params=portfolio_params)
+        super().__init__(
+            portfolio_params=portfolio_params,
+            fallback=fallback,
+            raise_on_failure=raise_on_failure,
+        )
         self.warm_start = warm_start
         self.initial_weights = initial_weights
         self.initial_wealth = initial_wealth
@@ -86,6 +95,9 @@ class OnlinePortfolioSelection(BaseOptimization, OnlineParameterConstraintsMixin
         self._projector: AutoProjector | None = None
         self._t: int = 0
         self._last_trade_weights_: np.ndarray | None = None
+        self._configured_previous_weights_: np.ndarray | None = None
+        self._current_previous_weights_: np.ndarray | None = None
+        self._previous_weights_state_initialized: bool = False
 
     def _initialize_projector(self):
         projection_config = ProjectionConfig(
@@ -101,10 +113,28 @@ class OnlinePortfolioSelection(BaseOptimization, OnlineParameterConstraintsMixin
             max_tracking_error=self.max_tracking_error,
             covariance=self.covariance,
             variance_bound=self.variance_bound,
-            previous_weights=self.previous_weights,
+            previous_weights=self._current_previous_weights_,
             max_turnover=self.max_turnover,
         )
         return AutoProjector(projection_config)
+
+    def _ensure_previous_weights_state(self, num_assets: int) -> None:
+        """Initialize immutable config and mutable online holdings state."""
+        if self._previous_weights_state_initialized:
+            return
+
+        if self.previous_weights is None:
+            configured = None
+        else:
+            configured = np.asarray(
+                self._clean_previous_weights(num_assets), dtype=float
+            ).copy()
+
+        self._configured_previous_weights_ = configured
+        self._current_previous_weights_ = (
+            None if configured is None else configured.copy()
+        )
+        self._previous_weights_state_initialized = True
 
     def _initialize_weights(self, num_assets: int):
         if self.initial_weights is not None:
@@ -176,8 +206,6 @@ class OnlinePortfolioSelection(BaseOptimization, OnlineParameterConstraintsMixin
         trade_weights: np.ndarray,
         effective_relatives: np.ndarray,
         previous_weights: np.ndarray | None,
-        *,
-        drift_aware: bool = True,
     ) -> None:
         """Update wealth after observing period returns.
 
@@ -192,7 +220,7 @@ class OnlinePortfolioSelection(BaseOptimization, OnlineParameterConstraintsMixin
         effective_relatives : np.ndarray
             Price relatives after management fees.
         previous_weights : np.ndarray | None
-            Weights from previous period (for turnover).
+            Holdings carried into the current rebalance.
         """
         # Gross portfolio return (after management fees)
         gross_return = float(np.dot(trade_weights, effective_relatives))
@@ -202,15 +230,7 @@ class OnlinePortfolioSelection(BaseOptimization, OnlineParameterConstraintsMixin
         if previous_weights is not None and hasattr(self, "_transaction_costs_arr"):
             prev_arr = np.asarray(previous_weights, dtype=float)
             if prev_arr.shape == trade_weights.shape:
-                # Drift-aware previous holdings: \tilde w_{t-1} = (w_{t-1} ⊙ x_t) / (w_{t-1}^T x_t)
-                if drift_aware:
-                    denom = float(np.dot(prev_arr, effective_relatives))
-                    if denom <= 0:
-                        denom = 1e-16
-                    prev_drifted = (prev_arr * effective_relatives) / denom
-                    turnover = np.abs(trade_weights - prev_drifted)
-                else:
-                    turnover = np.abs(trade_weights - prev_arr)
+                turnover = np.abs(trade_weights - prev_arr)
                 # Total cost as fraction of portfolio
                 if np.isscalar(self._transaction_costs_arr):
                     txn_cost = float(self._transaction_costs_arr * np.sum(turnover))
@@ -222,6 +242,25 @@ class OnlinePortfolioSelection(BaseOptimization, OnlineParameterConstraintsMixin
 
         # Update wealth: W_{t+1} = W_t * net_return
         self.wealth_ *= max(net_return, 1e-16)  # Prevent negative/zero wealth
+
+    def _drift_weights(
+        self,
+        trade_weights: np.ndarray,
+        effective_relatives: np.ndarray,
+    ) -> np.ndarray:
+        """Drift trade weights through realized returns."""
+        denom = float(np.dot(trade_weights, effective_relatives))
+        if denom <= 0.0:
+            return trade_weights.copy()
+        return (trade_weights * effective_relatives) / denom
+
+    def _apply_initial_projection(self) -> None:
+        """Project the initial traded portfolio once before the first round."""
+        if self._projector is None or not self._weights_initialized:
+            return
+        if self._t != 0 or self._last_trade_weights_ is not None:
+            return
+        self.weights_ = self._projector.project(self.weights_)
 
     def _compute_effective_relatives(self, gross_relatives: np.ndarray) -> np.ndarray:
         """Apply management fees to gross relatives.
@@ -335,6 +374,9 @@ class OnlinePortfolioSelection(BaseOptimization, OnlineParameterConstraintsMixin
         self._projector = None
         self._t = 0
         self._last_trade_weights_ = None
+        self._configured_previous_weights_ = None
+        self._current_previous_weights_ = None
+        self._previous_weights_state_initialized = False
         # Note: wealth_ is a learned attribute, only created after fit/partial_fit
 
     def fit(
@@ -423,3 +465,112 @@ class OnlinePortfolioSelection(BaseOptimization, OnlineParameterConstraintsMixin
         if name == "management_fees" and np.any(np.asarray(arr, dtype=float) >= 1.0):
             raise ValueError("All management_fees values must be < 1.0 per period")
         return arr
+
+    def fit_predict(
+        self, X: npt.ArrayLike, y: npt.ArrayLike | None = None, **fit_params: Any
+    ) -> MultiPeriodPortfolio:
+        """Fit the model and return the sequential portfolio trajectory.
+
+        Unlike offline optimization where `fit_predict` evaluates the final learned
+        weights uniformly across all periods (look-ahead bias), online optimization
+        processes data sequentially. This method returns a `MultiPeriodPortfolio`
+        representing the true chronological trajectory of the strategy, evaluating
+        each period using the weights computed *prior* to observing that period's returns.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_observations, n_assets)
+            Price returns of the assets.
+        y : Ignored
+            Present for API consistency.
+        **fit_params : Any
+            Additional parameters passed to `fit`.
+
+        Returns
+        -------
+        MultiPeriodPortfolio
+            The sequential trajectory of portfolios over time.
+        """
+        self.fit(X, y, **fit_params)
+
+        if self.portfolio_params is None:
+            ptf_kwargs = {}
+        else:
+            ptf_kwargs = self.portfolio_params.copy()
+
+        for param in [
+            "transaction_costs",
+            "management_fees",
+            "previous_weights",
+            "risk_free_rate",
+        ]:
+            if param not in ptf_kwargs and hasattr(self, param):
+                ptf_kwargs[param] = getattr(self, param)
+
+        name = ptf_kwargs.pop("name", type(self).__name__)
+
+        portfolios = []
+        X_arr = np.asarray(X)
+
+        # We need to construct the previous_weights correctly for the transaction costs
+        # skfolio's Portfolio charges total_cost = (tc * |prev - w|).sum()
+        self._ensure_previous_weights_state(self.n_features_in_)
+        prev_w = (
+            None
+            if self._configured_previous_weights_ is None
+            else self._configured_previous_weights_.copy()
+        )
+
+        for i in range(len(X_arr)):
+            X_i = X_arr[i : i + 1]
+
+            # Create kwargs for this specific portfolio
+            ptf_kwargs_i = ptf_kwargs.copy()
+            ptf_kwargs_i["previous_weights"] = (
+                self.all_weights_[i].copy() if prev_w is None else prev_w
+            )
+
+            ptf = Portfolio(
+                X=X_i, weights=self.all_weights_[i], name=name, **ptf_kwargs_i
+            )
+            portfolios.append(ptf)
+
+            # Drift weights for the NEXT period's previous_weights (if drift_aware logic applies)
+            returns_i = 1.0 + X_arr[i]
+            prev_w = self._drift_weights(self.all_weights_[i], returns_i)
+
+        return MultiPeriodPortfolio(portfolios=portfolios, name=name)
+
+    def predict_online(
+        self, X: npt.ArrayLike, y: npt.ArrayLike | None = None
+    ) -> MultiPeriodPortfolio:
+        """
+        Predict the online learning trajectory on X without mutating state.
+
+        Deep-copies the current fitted estimator and continues the sequential
+        learning process over X.  The original estimator's state is unchanged,
+        making this method safe to call repeatedly or alongside live streaming
+        via ``partial_fit``.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_observations, n_assets)
+            Net returns for the evaluation period.
+        y : Ignored
+            Present for API consistency.
+
+        Returns
+        -------
+        MultiPeriodPortfolio
+            Sequential trajectory over X, starting from the current fitted state.
+        """
+        check_is_fitted(self, "weights_")
+        X_arr = np.asarray(X, dtype=float)
+        if X_arr.ndim < 2 or X_arr.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"X has {X_arr.shape[1] if X_arr.ndim >= 2 else X_arr.shape[0]} features,"
+                f" but {type(self).__name__} was fitted with {self.n_features_in_} features."
+            )
+        other = deepcopy(self)
+        other.warm_start = True
+        return other.fit_predict(X=X_arr, y=y)

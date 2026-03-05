@@ -406,7 +406,10 @@ class FollowTheLoser(OnlinePortfolioSelection):
 
     def _initialize_components(self, d: int) -> None:
         """Initialize all strategy components."""
+        self._ensure_previous_weights_state(d)
         self._projector = self._initialize_projector()
+        if self._engine is not None:
+            self._engine.projector = self._projector
 
         # Initialize fee arrays
         self._transaction_costs_arr = self._clean_input(
@@ -428,6 +431,7 @@ class FollowTheLoser(OnlinePortfolioSelection):
         # Initialize wealth tracking
         if not self._wealth_initialized:
             self._initialize_wealth(d)
+        self._apply_initial_projection()
 
         # Initialize predictor and surrogate
         match self.strategy:
@@ -704,6 +708,12 @@ class FollowTheLoser(OnlinePortfolioSelection):
         # Apply management fees to gross relatives
         x_t = self._compute_effective_relatives(x_t_gross)
 
+        rebalance_from = (
+            None
+            if self._current_previous_weights_ is None
+            else self._current_previous_weights_.copy()
+        )
+
         # Store current weights for trading
         trade_w = self.weights_.copy()
         self._last_trade_weights_ = trade_w
@@ -733,16 +743,14 @@ class FollowTheLoser(OnlinePortfolioSelection):
 
         # Update wealth tracking
         if hasattr(self, "_wealth_initialized") and self._wealth_initialized:
-            # Use the true previous trade weights for cost computation (from last round)
-            prev_weights = self.previous_weights if self._t > 0 else None
             self._update_wealth(
                 trade_weights=trade_w,
                 effective_relatives=x_t,
-                previous_weights=prev_weights,
+                previous_weights=rebalance_from,
             )
 
-        # Record current trade weights as previous for next round
-        self.previous_weights = trade_w.copy()
+        # Drift current trade weights to obtain the next rebalance anchor
+        self._current_previous_weights_ = self._drift_weights(trade_w, x_t)
         self._t += 1
         return self
 

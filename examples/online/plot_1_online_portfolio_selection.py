@@ -1,17 +1,16 @@
 """
 =================================
-Online Portfolio Selection basics
+Online Portfolio Selection Basics
 =================================
 
 This tutorial introduces Online Portfolio Selection (OPS) through practical examples,
-comparing momentum-based (Follow-the-Winner) and mean-reversion (Follow-the-Loser)
-strategies.
+comparing momentum-based (Follow-the-Winner) and constant rebalanced portfolios.
 
 **What is Online Portfolio Selection?**
 
-Unlike traditional portfolio optimization that relies on historical data to compute
-optimal weights once, Online Portfolio Selection updates weights sequentially after
-observing each period's returns. This online learning framework is well-suited for:
+Unlike traditional offline portfolio optimization that relies on a historical training set
+to compute optimal weights once, Online Portfolio Selection updates weights sequentially
+after observing each period's returns. This online learning framework is well-suited for:
 
 - **Non-stationary markets** where distribution of returns changes over time
 - **High-frequency rebalancing** where computation must be fast
@@ -44,54 +43,88 @@ References
 # %%
 # Data Loading
 # ============
-# We use the Toronto Stock Exchange (TSE) dataset from Li & Hoi's OLPS benchmarks. This dataset contains daily price relatives (gross returns) for 88 stocks from 1994 to 1998.
+# We load the S&P 500 :ref:`dataset <datasets>` composed of the daily prices of 20
+# assets from the S&P 500 Index composition. Prices are transformed into linear returns.
+# To keep the example execution fast, we focus on the data from 2010 onwards.
 
 from plotly.io import show
 
 from skfolio.datasets import load_sp500_dataset
 from skfolio.optimization.online import BCRP, UCRP, FTWStrategy, FollowTheWinner
 from skfolio.population import Population
+from skfolio.portfolio import MultiPeriodPortfolio, Portfolio
 from skfolio.preprocessing import prices_to_returns
 
 prices = load_sp500_dataset()
-X = prices_to_returns(prices)
+X = prices_to_returns(prices)["2010":]
 
 # %%
 # Benchmark Portfolios
 # ====================
-# We first establish baseline performance using three classic benchmarks:
+# We first establish baseline performance using two classic benchmarks:
 #
 # 1. **Uniform CRP (UCRP)**: Rebalances to equal weights (1/n) each period
 # 2. **BCRP**: Best Constant Rebalanced Portfolio in hindsight (upper bound)
-# 3. **Exponential Gradient**: A Follow-the-Winner strategy that updates the portfolio weights using an exponential gradient method also called the Hedge algorithm.
 
+ucrp = UCRP()
+ucrp.fit(X)
 
-population = []
-population.append(
-    BCRP(portfolio_params={"name": "Maximum LogWealth in Hindsight"}).fit_predict(X)
-)
-population.append(
-    UCRP(
-        portfolio_params={"name": "Uniform Constant Rebalanced Portfolio"}
-    ).fit_predict(X)
-)
-population.append(
-    FollowTheWinner(
-        strategy=FTWStrategy.EG, portfolio_params={"name": "Exponential Gradient"}
-    ).fit_predict(X)
-)
+bcrp = BCRP()
+bcrp.fit(X)
 
-# Here we create a Population of the three portfolios and plot the cumulative returns.
-# To better show the performance of the strategies, we use a log scale and set the compounded parameter to True since typically in online portfolio selection, the returns are compounded (the objective function is cumulative wealth maximization).
-population = Population(population)
+# %%
+# Online Portfolio Model
+# ======================
+# We then instantiate our online model using the **Exponential Gradient** strategy.
+# It is a Follow-the-Winner strategy that updates the portfolio weights using an
+# exponential gradient method (also known as the Hedge algorithm).
+
+eg = FollowTheWinner(strategy=FTWStrategy.EG)
+eg.fit(X)
+
+# %%
+# Sequential Evaluation
+# =====================
+# In traditional offline optimization, estimators fit on a training set and predict on
+# a test set. Calling `predict` applies the *final* learned weights uniformly across
+# the test periods.
+#
+# In online learning, the model processes data sequentially. To properly evaluate the
+# model without look-ahead bias, the `fit_predict` method in skfolio's online module
+# has been specifically designed to return a :class:`~skfolio.portfolio.MultiPeriodPortfolio`.
+# This object represents the true chronological online performance, evaluating each period
+# using the weights computed *prior* to observing that period's returns.
+
+ptf_ucrp = ucrp.fit_predict(X)
+ptf_ucrp.name = "UCRP (1/n)"
+
+ptf_bcrp = bcrp.fit_predict(X)
+ptf_bcrp.name = "Best In Hindsight (BCRP)"
+
+ptf_eg = eg.fit_predict(X)
+ptf_eg.name = "Exponential Gradient"
+
+# %%
+# Analysis
+# ========
+# We can now group these trajectories into a :class:`~skfolio.population.Population`
+# and analyze their performance. In online portfolio selection, we typically focus on
+# compounded cumulative returns (which measures capital growth).
+
+population = Population([ptf_ucrp, ptf_bcrp, ptf_eg])
 population.set_portfolio_params(compounded=True)
+
 fig = population.plot_cumulative_returns(log_scale=True)
 show(fig)
 
-
-# The important point to note here is that while the Best in Hindsight portfolio (BCRP) outperforms the other two strategies, the Exponential Gradient strategy (EG) did not see all the data, instead returns are revealed sequentially one day at a time.
-# The performance of the EG strategy is therefore expected to be inferior to the BCRP strategy but it's still better than the Uniform Constant Rebalanced Portfolio (UCRP).
+# %%
+# The important point to note here is that while the Best in Hindsight portfolio (BCRP)
+# outperforms the other two strategies, it requires full future knowledge. The Exponential
+# Gradient strategy (EG) did not see all the data in advance; instead, returns were revealed
+# sequentially one day at a time. The performance of the EG strategy is therefore expected
+# to be inferior to the BCRP strategy but often remains competitive or better than the Uniform
+# Constant Rebalanced Portfolio (UCRP).
 
 # %%
-# We print the summary of the population:
+# We print the summary of the population to inspect their metrics:
 print(population.summary())

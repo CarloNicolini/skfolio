@@ -68,6 +68,112 @@ For incremental (streaming) usage, use ``partial_fit`` one row at a time:
     print(model.weights_)
 
 
+Ordering Semantics
+******************
+
+Online portfolio selection is easy to misunderstand because there are really
+*two* different "previous portfolios" in play:
+
+    * the **last traded portfolio** -- the weights you deliberately chose at the
+      start of the previous period,
+    * the **carried holdings** -- the portfolio you physically hold *after* the
+      market has moved those traded weights through realized returns.
+
+The module uses the following chronology:
+
+    1. Start period :math:`t` with the holdings carried over from period :math:`t-1`.
+    2. Rebalance into the traded portfolio :math:`w_t`.
+    3. Apply transaction costs to that rebalance.
+    4. Observe the realized relatives :math:`x_t`.
+    5. Drift :math:`w_t` through :math:`x_t` to obtain the holdings carried into
+       the next rebalance.
+    6. Compute the next traded portfolio :math:`w_{t+1}`.
+
+Two consequences are important in practice:
+
+    * ``all_weights_[t]`` stores the **traded** portfolio used at the start of
+      period :math:`t`.
+    * ``all_wealth_[t+1]`` is updated from that traded portfolio and the rebalance
+      cost from the holdings carried into the same period.
+
+Why turnover and costs are different
+====================================
+
+The turnover constraint ``max_turnover`` and the transaction-cost accounting are
+related, but they are not anchored to the same object:
+
+    * ``max_turnover`` limits how much the *next traded portfolio* may differ
+      from the *last traded portfolio*:
+
+      .. math::
+
+         \|w_{t+1} - w_t\|_1 \le \tau.
+
+    * transaction costs are charged on the rebalance from the *carried holdings*
+      into the *new traded portfolio*:
+
+      .. math::
+
+         \text{cost}_{t+1} \propto \|w_{t+1} - \tilde{w}_t\|_1,
+
+      where :math:`\tilde{w}_t` is the drifted portfolio after period
+      :math:`t` returns.
+
+This distinction is subtle but correct: the market moves your old portfolio
+whether you like it or not, so the portfolio you *carry* into the next rebalance
+is generally not the same as the portfolio you *traded* last time.
+
+Example 1 -- drifted holdings
+=============================
+
+Suppose you trade period :math:`t` with
+
+.. code-block:: text
+
+    w_t = [0.50, 0.50]
+
+and the realized relatives are
+
+.. code-block:: text
+
+    x_t = [1.10, 1.00]
+
+Then your carried holdings at the start of the next rebalance are
+
+.. code-block:: text
+
+    [0.50 * 1.10, 0.50 * 1.00] = [0.55, 0.50]
+
+which normalize to
+
+.. code-block:: text
+
+    \tilde{w}_t = [0.5238, 0.4762]
+
+If you next trade
+
+.. code-block:: text
+
+    w_{t+1} = [0.60, 0.40]
+
+then:
+
+    * the turnover constraint compares ``[0.60, 0.40]`` to ``[0.50, 0.50]``,
+    * the transaction cost compares ``[0.60, 0.40]`` to ``[0.5238, 0.4762]``.
+
+Example 2 -- no initial entry cost
+==================================
+
+If you do **not** provide ``previous_weights``, the first online trade is treated
+as the starting portfolio of the strategy, not as a rebalance from a fictional
+zero-allocation portfolio. In other words, the first period does not pay a fake
+"entry" cost just because the strategy had not traded before.
+
+If you **do** provide ``previous_weights``, that vector is interpreted as the
+actual portfolio already held before the first online rebalance, so first-period
+transaction costs and turnover are measured against it.
+
+
 Benchmarks
 **********
 
@@ -332,7 +438,7 @@ The module supports several regret types:
     r = regret(model, X, regret_type=RegretType.STATIC, average=True)
 
     # Plot with plotly
-    from skfolio.optimization.online._regret import plot_regret_curve
+    from skfolio.optimization.online import plot_regret_curve
     fig = plot_regret_curve(r, average=True, label="EG vs BCRP")
     fig.show()
 
@@ -351,9 +457,7 @@ The module supports several regret types:
 Comparing Online and Offline Strategies
 ***************************************
 
-One of the strengths of the skfolio API is that online and offline estimators share
-the same interface. You can directly compare them using the :ref:`Population <population>`
-tools:
+The online and offline estimators share the same interface. You can directly compare them using the :ref:`Population <population>` tools:
 
 .. code-block:: python
 
@@ -375,21 +479,32 @@ tools:
     # Online: fit on full test set (streaming)
     eg = FollowTheWinner(strategy="eg")
     eg.fit(X_test)
-    ptf_eg = eg.predict(X_test)
+    
+# To evaluate the sequential trajectory in skfolio without look-ahead bias, we use the
+# `fit_predict` method. For online estimators, this method is designed to return a 
+# `MultiPeriodPortfolio` representing the true sequential portfolio trajectory.
 
-    olmar = FollowTheLoser(strategy="olmar")
-    olmar.fit(X_test)
-    ptf_olmar = olmar.predict(X_test)
+ptf_eg = eg.fit_predict(X_test)
+ptf_eg.name = "EG"
 
-    pop = Population([ptf_mv, ptf_eg, ptf_olmar])
-    pop.plot_cumulative_returns()
+olmar = FollowTheLoser(strategy="olmar")
+olmar.fit(X_test)
+
+ptf_olmar = olmar.fit_predict(X_test)
+ptf_olmar.name = "OLMAR"
+
+pop = Population([ptf_mv, ptf_eg, ptf_olmar])
+pop.plot_cumulative_returns()
 
 .. note::
 
    Offline methods use a **train/test split** and predict on unseen data. Online
    methods process data sequentially -- each period's weights are chosen *before*
-   seeing that period's returns, so there is no look-ahead bias even when
-   ``fit`` and ``predict`` use the same ``X``.
+   seeing that period's returns. Because the `predict` method of skfolio estimators 
+   applies the *final* learned weights to the entire dataset (which would introduce 
+   look-ahead bias for online methods evaluated in-sample), we use `fit_predict`
+   to automatically construct a `MultiPeriodPortfolio` that accurately reflects the 
+   true sequential performance without look-ahead bias.
 
 
 Wealth Tracking and Transaction Costs
