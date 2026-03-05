@@ -394,11 +394,19 @@ class BCRP(MeanRisk):
             risk_measure = RiskMeasure.VARIANCE
             obj_func = ObjectiveFunction.MAXIMIZE_RETURN
             overwrite_expected_return = BCRP._log_wealth_expr
+        elif objective_measure == PerfMeasure.MEAN:
+            # Mean maximization uses the standard MeanRisk expected-return objective.
+            # We keep a valid risk measure only to satisfy MeanRisk validation; the
+            # MAXIMIZE_RETURN objective ignores it in the final program.
+            risk_measure = RiskMeasure.VARIANCE
+            obj_func = ObjectiveFunction.MAXIMIZE_RETURN
+            overwrite_expected_return = None
         else:
             # Standard risk measure optimization
-            if not isinstance(objective_measure, RiskMeasure | PerfMeasure):
+            if not isinstance(objective_measure, RiskMeasure):
                 raise ValueError(
-                    f"objective_measure must be RiskMeasure or PerfMeasure.LOG_WEALTH, "
+                    "objective_measure must be RiskMeasure, PerfMeasure.LOG_WEALTH, "
+                    f"or PerfMeasure.MEAN, "
                     f"got {type(objective_measure).__name__}"
                 )
             risk_measure = objective_measure
@@ -511,7 +519,7 @@ class BCRP(MeanRisk):
         X_arr = np.asarray(X, dtype=float)
         if X_arr.ndim != 2:
             raise ValueError("X must be 2D array of shape (T, n_assets)")
-        T, n = X_arr.shape
+        T = X_arr.shape[0]
 
         relatives = net_to_relatives(X_arr)
 

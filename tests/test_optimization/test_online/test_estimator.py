@@ -153,20 +153,25 @@ def test_objective_not_implemented_raises_value_error():
         est.fit(X)
 
 
-@pytest.mark.xfail(
-    reason="AutoProjector configuration captures previous_weights only at init and does not update per round."
-)
 def test_turnover_cap_enforced_each_round():
-    # Expect L1 distance between consecutive weights to be capped by max_turnover.
-    # Current implementation passes previous_weights to ProjectionConfig only once;
-    # if not updated each round inside AutoProjector, this constraint may not be enforced.
-    T = 20
-    X = make_stationary_returns(T=T, gap=0.02, n=3)
+    # The turnover cap is defined on the change between consecutive traded portfolios.
+    # An alternating market forces the target direction to flip every round; if the
+    # projector keeps using a stale anchor, consecutive changes can exceed the cap.
+    X = np.array(
+        [
+            [0.20, -0.20, 0.00],
+            [-0.20, 0.20, 0.00],
+            [0.20, -0.20, 0.00],
+            [-0.20, 0.20, 0.00],
+            [0.20, -0.20, 0.00],
+        ],
+        dtype=float,
+    )
     prev = np.array([1 / 3] * 3)
     est = FollowTheWinner(
         strategy=FTWStrategy.EG,
         update_mode="omd",
-        learning_rate=0.5,
+        learning_rate=5.0,
         warm_start=False,
         previous_weights=prev,
         max_turnover=0.10,  # cap L1 change per round

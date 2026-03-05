@@ -356,7 +356,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
             :math:`W` gradients, capturing medium-term momentum signals.
 
             **Empirically validated**: ``gradient_lookback`` in ``[60, 120]``
-            (3–6 month momentum) consistently turns EG from a UCRP-equivalent
+            (3-6 month momentum) consistently turns EG from a UCRP-equivalent
             into a modest but reliable momentum strategy, achieving decent
             log-wealth above UCRP on average across 7 real datasets.
 
@@ -487,8 +487,11 @@ class FollowTheWinner(OnlinePortfolioSelection):
         )
 
         # Resolve transaction costs and management fees once number of assets is known
+        self._ensure_previous_weights_state(num_assets)
 
         self._projector = self._initialize_projector()
+        if self._foco_engine is not None:
+            self._foco_engine.projector = self._projector
 
         # Initialize objective function
         if not hasattr(self, "_objective_fn"):
@@ -616,6 +619,7 @@ class FollowTheWinner(OnlinePortfolioSelection):
             # Initialize wealth tracking
             if not self._wealth_initialized:
                 self._initialize_wealth(num_assets)
+            self._apply_initial_projection()
             if self._foco_engine is not None and hasattr(self._foco_engine, "_x_t"):
                 if self._foco_engine._x_t is None:
                     self._foco_engine._x_t = self.weights_.copy()
@@ -674,10 +678,10 @@ class FollowTheWinner(OnlinePortfolioSelection):
         # skip gradient-side penalty and warn once.
         if (
             getattr(self, "penalize_turnover", False)
-            and self.previous_weights is not None
+            and self._current_previous_weights_ is not None
         ):
             tc = getattr(self, "_transaction_costs_arr", None)
-            prev = np.asarray(self.previous_weights, dtype=float)
+            prev = np.asarray(self._current_previous_weights_, dtype=float)
             if prev.shape == self.weights_.shape:
                 costs_active = False
                 if tc is not None:
@@ -849,6 +853,14 @@ class FollowTheWinner(OnlinePortfolioSelection):
         # Step 3: Apply management fees to get effective relatives
         effective_relatives = self._compute_effective_relatives(gross_relatives)
 
+        rebalance_from = (
+            None
+            if self._current_previous_weights_ is None
+            else self._current_previous_weights_.copy()
+        )
+        if self._projector is not None and self.max_turnover is not None:
+            self._projector.config.previous_weights = self.weights_.copy()
+
         # Step 4: Compute portfolio gradient (including transaction costs)
         gradient = self._compute_portfolio_gradient(effective_relatives)
 
@@ -865,22 +877,21 @@ class FollowTheWinner(OnlinePortfolioSelection):
         # (barrier with weights, full quadratic with gradients)
         self._update_adabarrons_components(self.weights_, gradient)
 
-        # Capture previous trade weights for cost computation BEFORE we mutate previous_weights
-        prev_for_cost = self.previous_weights if self._t > 0 else None
-
         # Step 7: Update internal state and compute loss
         self._finalize_partial_fit_state(effective_relatives)
 
-        # Step 8: Update wealth tracking (use prev_for_cost from before this step)
+        # Step 8: Update wealth tracking using the holdings carried into this rebalance
         if hasattr(self, "_wealth_initialized") and self._wealth_initialized:
             self._update_wealth(
                 trade_weights=self._last_trade_weights_,
                 effective_relatives=effective_relatives,
-                previous_weights=prev_for_cost,
+                previous_weights=rebalance_from,
             )
 
-        # Step 9: Now record previous trade weights for next round's gradient/cost logic
-        self.previous_weights = self._last_trade_weights_.copy()
+        # Step 9: Drift current trade weights to obtain the next rebalance anchor
+        self._current_previous_weights_ = self._drift_weights(
+            self._last_trade_weights_, effective_relatives
+        )
 
         return self
 
