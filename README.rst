@@ -83,6 +83,11 @@ Important links
 - `GitHub Repo <https://github.com/skfolio/skfolio>`_
 - `Enterprise Support <https://skfoliolabs.com>`_
 
+Featured in
+~~~~~~~~~~~
+
+* `Portfolio Optimization: Theory and Application <https://portfoliooptimizationbook.com/>`_ by Daniel P. Palomar, includes Python code examples using skfolio.
+
 Installation
 ~~~~~~~~~~~~
 
@@ -161,6 +166,7 @@ Available models
         * Risk Budgeting
         * Maximum Diversification
         * Distributionally Robust CVaR
+        * Benchmark Tracker
     * Clustering:
         * Hierarchical Risk Parity
         * Hierarchical Equal Risk Contribution
@@ -748,17 +754,16 @@ Recognition
 ~~~~~~~~~~~
 
 We would like to thank all contributors to our direct dependencies, such as
-`scikit-learn <https://github.com/scikit-learn/scikit-learn>`_ and `cvxpy <https://github.com/cvxpy/cvxpy>`_, as well as the contributors of the following resources that
-served as sources of inspiration:
+`scikit-learn <https://github.com/scikit-learn/scikit-learn>`_ and `cvxpy <https://github.com/cvxpy/cvxpy>`_, as well as the contributors of the following resources:
 
     * PyPortfolioOpt
     * Riskfolio-Lib
     * scikit-portfolio
     * statsmodels
     * rsome
-    * microprediction (Peter Cotton)
-    * danielppalomar.com (Daniel P. Palomar)
-    * quantresearch.org (Marcos López de Prado)
+    * `Microprediction <https://github.com/microprediction>`_ (Peter Cotton)
+    * `Portfolio Optimization Book <https://portfoliooptimizationbook.com/>`_ (Daniel P. Palomar)
+    * `quantresearch.org <https://quantresearch.org>`_ (Marcos López de Prado)
     * gautier.marti.ai (Gautier Marti)
 
 
