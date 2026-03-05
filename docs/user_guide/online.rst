@@ -332,7 +332,7 @@ The module supports several regret types:
     r = regret(model, X, regret_type=RegretType.STATIC, average=True)
 
     # Plot with plotly
-    from skfolio.optimization.online._regret import plot_regret_curve
+    from skfolio.optimization.online import plot_regret_curve
     fig = plot_regret_curve(r, average=True, label="EG vs BCRP")
     fig.show()
 
@@ -351,9 +351,7 @@ The module supports several regret types:
 Comparing Online and Offline Strategies
 ***************************************
 
-One of the strengths of the skfolio API is that online and offline estimators share
-the same interface. You can directly compare them using the :ref:`Population <population>`
-tools:
+The online and offline estimators share the same interface. You can directly compare them using the :ref:`Population <population>` tools:
 
 .. code-block:: python
 
@@ -375,21 +373,32 @@ tools:
     # Online: fit on full test set (streaming)
     eg = FollowTheWinner(strategy="eg")
     eg.fit(X_test)
-    ptf_eg = eg.predict(X_test)
+    
+# To evaluate the sequential trajectory in skfolio without look-ahead bias, we use the
+# `fit_predict` method. For online estimators, this method is designed to return a 
+# `MultiPeriodPortfolio` representing the true sequential portfolio trajectory.
 
-    olmar = FollowTheLoser(strategy="olmar")
-    olmar.fit(X_test)
-    ptf_olmar = olmar.predict(X_test)
+ptf_eg = eg.fit_predict(X_test)
+ptf_eg.name = "EG"
 
-    pop = Population([ptf_mv, ptf_eg, ptf_olmar])
-    pop.plot_cumulative_returns()
+olmar = FollowTheLoser(strategy="olmar")
+olmar.fit(X_test)
+
+ptf_olmar = olmar.fit_predict(X_test)
+ptf_olmar.name = "OLMAR"
+
+pop = Population([ptf_mv, ptf_eg, ptf_olmar])
+pop.plot_cumulative_returns()
 
 .. note::
 
    Offline methods use a **train/test split** and predict on unseen data. Online
    methods process data sequentially -- each period's weights are chosen *before*
-   seeing that period's returns, so there is no look-ahead bias even when
-   ``fit`` and ``predict`` use the same ``X``.
+   seeing that period's returns. Because the `predict` method of skfolio estimators 
+   applies the *final* learned weights to the entire dataset (which would introduce 
+   look-ahead bias for online methods evaluated in-sample), we use `fit_predict`
+   to automatically construct a `MultiPeriodPortfolio` that accurately reflects the 
+   true sequential performance without look-ahead bias.
 
 
 Wealth Tracking and Transaction Costs

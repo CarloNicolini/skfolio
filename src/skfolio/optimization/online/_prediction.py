@@ -12,7 +12,7 @@ import numpy as np
 from skfolio.optimization.online._utils import CLIP_EPSILON
 
 
-def l1median_vazhz_vec(X, maxiter=200, tol=1e-9, zerotol=1e-15, medIn=None):
+def l1median_vazhz_vec(X, max_iter=200, tol=1e-9, zero_tol=1e-15, med_initial=None):
     """
     Compute the L1 (geometric) median of X using the Vardi-Zhang (Weiszfeld-type) algorithm.
     Vectorized implementation (no explicit loop over samples).
@@ -21,13 +21,13 @@ def l1median_vazhz_vec(X, maxiter=200, tol=1e-9, zerotol=1e-15, medIn=None):
     ----------
     X : ndarray of shape (n_samples, n_features)
         Input data points.
-    maxiter : int, optional
+    max_iter : int, optional
         Maximum number of iterations (default: 200).
     tol : float, optional
         Convergence tolerance (default: 1e-9).
-    zerotol : float, optional
+    zero_tol : float, optional
         Distance below which points are considered coincident (default: 1e-15).
-    medIn : ndarray of shape (n_features,), optional
+    med_initial : ndarray of shape (n_features,), optional
         Initial median estimate (default: coordinate-wise median of X).
 
     Returns
@@ -36,15 +36,19 @@ def l1median_vazhz_vec(X, maxiter=200, tol=1e-9, zerotol=1e-15, medIn=None):
         Estimated L1 (geometric) median.
     """
     X = np.asarray(X, dtype=float)
-    n, d = X.shape
-    y = np.median(X, axis=0) if medIn is None else np.asarray(medIn, dtype=float)
+    _, d = X.shape
+    y = (
+        np.median(X, axis=0)
+        if med_initial is None
+        else np.asarray(med_initial, dtype=float)
+    )
 
-    for _ in range(maxiter):
+    for _ in range(max_iter):
         diffs = X - y  # shape: (n, d)
         dists = np.linalg.norm(diffs, axis=1)  # shape: (n,)
 
         # Mask for nonzero distances
-        mask = dists >= zerotol
+        mask = dists >= zero_tol
         if not np.any(mask):
             break
 
@@ -196,7 +200,7 @@ class RMRPredictor(BaseReversionPredictor):
         # Compute L1-median of recent W price vectors
         recent_prices = np.stack(self._price_history[-W:], axis=0)
         median_price = l1median_vazhz_vec(
-            recent_prices, maxiter=self.max_iter, tol=self.tolerance
+            recent_prices, max_iter=self.max_iter, tol=self.tolerance
         )
 
         # Convert to price relative: median_price / current_price

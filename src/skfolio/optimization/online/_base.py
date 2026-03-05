@@ -7,10 +7,12 @@
 from __future__ import annotations
 
 import warnings
+from copy import deepcopy
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+from sklearn.base import check_is_fitted
 from sklearn.utils.validation import _check_sample_weight, validate_data
 
 import skfolio.typing as skt
@@ -23,6 +25,7 @@ from skfolio.optimization.online._projection import (
     ProjectionConfig,
 )
 from skfolio.optimization.online._utils import net_to_relatives
+from skfolio.portfolio import MultiPeriodPortfolio, Portfolio
 from skfolio.utils.tools import input_to_array
 
 
@@ -58,8 +61,14 @@ class OnlinePortfolioSelection(BaseOptimization, OnlineParameterConstraintsMixin
         covariance: npt.ArrayLike | None = None,
         variance_bound: float | None = None,
         portfolio_params: dict | None = None,
+        fallback: skt.Fallback = None,
+        raise_on_failure: bool = True,
     ):
-        super().__init__(portfolio_params=portfolio_params)
+        super().__init__(
+            portfolio_params=portfolio_params,
+            fallback=fallback,
+            raise_on_failure=raise_on_failure,
+        )
         self.warm_start = warm_start
         self.initial_weights = initial_weights
         self.initial_wealth = initial_wealth
@@ -423,3 +432,111 @@ class OnlinePortfolioSelection(BaseOptimization, OnlineParameterConstraintsMixin
         if name == "management_fees" and np.any(np.asarray(arr, dtype=float) >= 1.0):
             raise ValueError("All management_fees values must be < 1.0 per period")
         return arr
+
+    def fit_predict(
+        self, X: npt.ArrayLike, y: npt.ArrayLike | None = None, **fit_params: Any
+    ) -> MultiPeriodPortfolio:
+        """Fit the model and return the sequential portfolio trajectory.
+
+        Unlike offline optimization where `fit_predict` evaluates the final learned
+        weights uniformly across all periods (look-ahead bias), online optimization
+        processes data sequentially. This method returns a `MultiPeriodPortfolio`
+        representing the true chronological trajectory of the strategy, evaluating
+        each period using the weights computed *prior* to observing that period's returns.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_observations, n_assets)
+            Price returns of the assets.
+        y : Ignored
+            Present for API consistency.
+        **fit_params : Any
+            Additional parameters passed to `fit`.
+
+        Returns
+        -------
+        MultiPeriodPortfolio
+            The sequential trajectory of portfolios over time.
+        """
+        self.fit(X, y, **fit_params)
+
+        if self.portfolio_params is None:
+            ptf_kwargs = {}
+        else:
+            ptf_kwargs = self.portfolio_params.copy()
+
+        for param in [
+            "transaction_costs",
+            "management_fees",
+            "previous_weights",
+            "risk_free_rate",
+        ]:
+            if param not in ptf_kwargs and hasattr(self, param):
+                ptf_kwargs[param] = getattr(self, param)
+
+        name = ptf_kwargs.pop("name", type(self).__name__)
+
+        portfolios = []
+        X_arr = np.asarray(X)
+
+        # We need to construct the previous_weights correctly for the transaction costs
+        # skfolio's Portfolio charges total_cost = (tc * |prev - w|).sum()
+        prev_w = self._clean_input(
+            self.previous_weights, self.n_features_in_, 0.0, "previous_weights"
+        )
+
+        for i in range(len(X_arr)):
+            X_i = X_arr[i : i + 1]
+
+            # Create kwargs for this specific portfolio
+            ptf_kwargs_i = ptf_kwargs.copy()
+            ptf_kwargs_i["previous_weights"] = prev_w
+
+            ptf = Portfolio(
+                X=X_i, weights=self.all_weights_[i], name=name, **ptf_kwargs_i
+            )
+            portfolios.append(ptf)
+
+            # Drift weights for the NEXT period's previous_weights (if drift_aware logic applies)
+            returns_i = 1.0 + X_arr[i]
+            denom = float(np.dot(self.all_weights_[i], returns_i))
+            if denom > 0:
+                prev_w = (self.all_weights_[i] * returns_i) / denom
+            else:
+                prev_w = self.all_weights_[i]
+
+        return MultiPeriodPortfolio(portfolios=portfolios, name=name)
+
+    def predict_online(
+        self, X: npt.ArrayLike, y: npt.ArrayLike | None = None
+    ) -> MultiPeriodPortfolio:
+        """
+        Predict the online learning trajectory on X without mutating state.
+
+        Deep-copies the current fitted estimator and continues the sequential
+        learning process over X.  The original estimator's state is unchanged,
+        making this method safe to call repeatedly or alongside live streaming
+        via ``partial_fit``.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_observations, n_assets)
+            Net returns for the evaluation period.
+        y : Ignored
+            Present for API consistency.
+
+        Returns
+        -------
+        MultiPeriodPortfolio
+            Sequential trajectory over X, starting from the current fitted state.
+        """
+        check_is_fitted(self, "weights_")
+        X_arr = np.asarray(X, dtype=float)
+        if X_arr.ndim < 2 or X_arr.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"X has {X_arr.shape[1] if X_arr.ndim >= 2 else X_arr.shape[0]} features,"
+                f" but {type(self).__name__} was fitted with {self.n_features_in_} features."
+            )
+        other = deepcopy(self)
+        other.warm_start = True
+        return other.fit_predict(X=X_arr, y=y)
